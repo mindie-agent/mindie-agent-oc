@@ -62,9 +62,12 @@ def isolated_oc_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
     venv_py = REPO_ROOT / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     env_map = {
         "HOME": str(home),
+        "USERPROFILE": str(home),
         "MINDIE_CONFIG_HOME": str(mindie_cfg),
         "MINDIE_DATA_HOME": str(mindie_data),
         "MINDIE_DIAGNOSTICS_ROOT": str(mindie_diag),
+        "MINDIE_DIAGNOSTICS_CONFIG": str(mindie_cfg / "diagnostics.json"),
+        "MINDIE_DIAGNOSTICS_SERVICE_DIR": str(mindie_diag / "services"),
         "MINDIE_OPENCODE_DB": str(opencode_db),
         "MINDIE_OC_PYTHON": str(venv_py if venv_py.is_file() else Path(sys.executable)),
         "OC_PLUGIN_ROOT": str(REPO_ROOT / "plugins" / "mindie-agent"),
@@ -74,10 +77,19 @@ def isolated_oc_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
     }
     for key, val in env_map.items():
         monkeypatch.setenv(key, val)
-    monkeypatch.delenv("MINDIE_AGENT_CONFIG", raising=False)
-    monkeypatch.delenv("OPENCODE_SESSION_ID", raising=False)
-    monkeypatch.delenv("MINDIE_SUMMARY_ENDPOINT", raising=False)
-    monkeypatch.delenv("MINDIE_SUMMARY_TOKEN", raising=False)
+    for drop_key in (
+        "MINDIE_AGENT_CONFIG",
+        "MINDIE_OC_ALLOW_BG_UPDATE",
+        "MINDIE_OC_INSTALLED_ROOT",
+        "OPENCODE_SESSION_ID",
+        "MINDIE_SUMMARY_ENDPOINT",
+        "MINDIE_SUMMARY_TOKEN",
+        "_MINDIE_OC_PGID_FILE",
+        "_MINDIE_OC_PGID_FILES",
+        "_MINDIE_OC_BG_NO_BREAKAWAY",
+        "_MINDIE_OC_REEXEC",
+    ):
+        monkeypatch.delenv(drop_key, raising=False)
 
     return {
         "root": tmp_path,

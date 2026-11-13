@@ -807,7 +807,7 @@ def test_recheck_cold_stdlib_schema_bind_older_source_streaming_and_1mb_head(
         upd = component_update.check(source=v010, force=True)
     assert upd["status"] == "updated"
     active_cfg = paths.read_json(paths.config_path())
-    assert active_cfg["product_validation"]["native_version"] == "0.1.1"
+    assert active_cfg["product_validation"]["native_version"] == paths.read_json(REPO_ROOT / "product-contract.json")["native_version"]
     assert Path(active_cfg["source_root"]).resolve() != v010.resolve()
 
     # 4. In-flight streaming assistant row stops cursor BEFORE `seq`, then captures full response once `completed` is set; >1 MiB first record parses!

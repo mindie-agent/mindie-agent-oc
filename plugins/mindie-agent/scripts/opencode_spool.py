@@ -279,11 +279,11 @@ def _recover_spool_tail_and_seq(spool_file: Path) -> int:
         last_line = stream.read(size - line_start)
     try:
         record = json.loads(last_line.decode("utf-8"))
-        if isinstance(record, dict) and isinstance(record.get("seq"), int):
-            return int(record["seq"])
-    except (UnicodeDecodeError, ValueError):
-        pass
-    return -1
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"corrupt transcript spool record in {spool_file}: {exc}") from exc
+    if not isinstance(record, dict) or type(record.get("seq")) is not int:
+        raise ValueError(f"corrupt transcript spool record in {spool_file}: missing integer seq")
+    return int(record["seq"])
 
 
 def _read_cursor_seq(cursor_file: Path, *, spool_exists: bool, boundary: float | None) -> int:
@@ -293,23 +293,26 @@ def _read_cursor_seq(cursor_file: Path, *, spool_exists: bool, boundary: float |
         raw = cursor_file.read_text(encoding="utf-8").strip()
     except TimeoutError:
         raise
-    except OSError:
-        return -1
+    except OSError as exc:
+        raise OSError(f"unreadable transcript cursor {cursor_file}: {exc}") from exc
     if not raw:
         return -1
     try:
         if raw.startswith("{"):
             parsed = json.loads(raw)
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("seq"), int):
-                return -1
+            if not isinstance(parsed, dict) or type(parsed.get("seq")) is not int or int(parsed["seq"]) < -1:
+                raise ValueError(f"corrupt transcript cursor: {cursor_file}")
             saved_boundary = parsed.get("not_before")
             if not spool_exists and isinstance(saved_boundary, (int, float)):
                 if boundary is None or boundary + 1e-3 < float(saved_boundary):
                     return -1
             return int(parsed["seq"])
-        return int(raw) if spool_exists else -1
-    except ValueError:
-        return -1
+        seq_val = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"corrupt transcript cursor: {cursor_file}") from exc
+    if seq_val < -1:
+        raise ValueError(f"corrupt transcript cursor: {cursor_file}")
+    return seq_val if spool_exists else -1
 
 
 def _redact_spool_text(text: str, *, private_paths: tuple[str, ...]) -> str:
@@ -496,22 +499,32 @@ def sync_session_spool(
                         "ORDER BY ordinal ASC",
                         (sid, *msg_ids),
                     ):
-                        try:
-                            parsed_part = json.loads(p_data) if isinstance(p_data, str) else {}
-                        except ValueError:
+                        if isinstance(p_data, str) and p_data.strip():
+                            try:
+                                parsed_part = json.loads(p_data)
+                            except ValueError as exc:
+                                raise ValueError(f"corrupt session_part JSON for message {p_mid}: {exc}") from exc
+                            if not isinstance(parsed_part, dict):
+                                raise ValueError(f"corrupt session_part JSON object for message {p_mid}")
+                        else:
                             parsed_part = {}
-                        if isinstance(parsed_part, dict):
+                        if parsed_part:
                             parsed_part.setdefault("type", p_type)
                             parts_by_msg.setdefault(p_mid, []).append(parsed_part)
 
                 stop_at_inflight = False
                 for mid, mtype, seq, msg_created, raw_data in mrows:
                     seq_int = int(seq)
-                    try:
-                        parsed_data = json.loads(raw_data) if isinstance(raw_data, str) else {}
-                    except ValueError:
+                    if isinstance(raw_data, str) and raw_data.strip():
+                        try:
+                            parsed_data = json.loads(raw_data)
+                        except ValueError as exc:
+                            raise ValueError(f"corrupt session_message JSON for message {mid}: {exc}") from exc
+                        if not isinstance(parsed_data, dict):
+                            raise ValueError(f"corrupt session_message JSON object for message {mid}")
+                    else:
                         parsed_data = {}
-                    data_dict = parsed_data if isinstance(parsed_data, dict) else {}
+                    data_dict = parsed_data
                     candidate = dict(
                         schema=SPOOL_SCHEMA,
                         session_id=sid,

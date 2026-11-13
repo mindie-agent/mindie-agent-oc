@@ -103,6 +103,7 @@ def test_component_update_cooldown_backoff_lock_and_atomic_rebind(
 
     class _DummyPopen:
         def __init__(self, cmd, **_kwargs):
+            self.pid = os.getpid()
             spawned.append([str(c) for c in cmd])
 
     monkeypatch.setenv("MINDIE_OC_ALLOW_BG_UPDATE", "1")
@@ -194,7 +195,7 @@ def test_paired_generation_continuity_across_plugin_overwrite_and_failed_cutover
     assert read_json(data_home() / "oc-component-update-status.json")["status"] == "failed"
 
     # Restore compatible_runtime and promote 0.1.1 cleanly.
-    monkeypatch.setattr(component_update, "compatible_runtime", lambda interpreter, **_kw: str(Path(interpreter).resolve()))
+    monkeypatch.setattr(component_update, "compatible_runtime", lambda interpreter, **_kw: component_update._norm_python_path(interpreter))
     monkeypatch.setattr(component_update, "prepare", lambda **_kw: None)
     promoted = component_update.check(config=cfg, source=live_plugin_dir)
     assert promoted["status"] == "updated"

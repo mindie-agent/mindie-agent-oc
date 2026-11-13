@@ -48,16 +48,56 @@ export function configPath(explicit = null) {
     return path.join(configHome(), "oc.json");
 }
 
+export function parseSemverTuple(raw) {
+    if (typeof raw !== "string") return null;
+    const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+export function isNewerSemver(candidate, active) {
+    const c = parseSemverTuple(candidate);
+    const a = parseSemverTuple(active);
+    if (!c) return false;
+    if (!a) return true;
+    for (let i = 0; i < 3; i += 1) {
+        if (c[i] !== a[i]) return c[i] > a[i];
+    }
+    return false;
+}
+
+export function pidAlive(pid) {
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+        return false;
+    }
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        return err?.code === "EPERM";
+    }
+}
+
 export function readJsonSafe(targetPath) {
     try {
-        const stat = fs.statSync(targetPath);
+        const stat = fs.lstatSync(targetPath);
         if (!stat.isFile() || stat.size > MAX_CONFIG_BYTES) {
+            process.stderr.write(`MindIE OpenCode config ignored (non-regular or oversize): ${targetPath}\n`);
             return null;
         }
         const raw = fs.readFileSync(targetPath, "utf8");
         const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
-    } catch {
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            process.stderr.write(`MindIE OpenCode config ignored (not a JSON object): ${targetPath}\n`);
+            return null;
+        }
+        return parsed;
+    } catch (err) {
+        if (err && err.code === "ENOENT") {
+            return null;
+        }
+        process.stderr.write(
+            `MindIE OpenCode config read failed (${targetPath}): ${err instanceof Error ? err.message : String(err)}\n`,
+        );
         return null;
     }
 }
