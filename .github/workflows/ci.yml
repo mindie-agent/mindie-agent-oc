@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install locked runtime and test dependencies
-        run: uv sync --locked --no-editable --no-install-project --extra test
+        run: uv sync --frozen --no-editable --no-install-project --extra test
       - name: Enforce Unix LF line endings
         run: uv run --no-sync python .github/scripts/check_lf_eol.py
       - name: Contract, update, and continuity tests
@@ -42,3 +42,13 @@ jobs:
           node --check plugins/mindie-agent/paths.mjs
           node --check plugins/mindie-agent/opencode_host.mjs
           uv run --no-sync python plugins/mindie-agent/scripts/release_metadata.py --source . --tests tests --revision "${{ github.sha }}" > "${{ runner.temp }}/mindie-plugin-release.json"
+
+  release-ready:
+    name: release-ready
+    needs: [contract]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: python3 -c 'import json,os; assert all(job["result"] == "success" for job in json.loads(os.environ["RESULTS"]).values()), "required CI failed or was skipped"'

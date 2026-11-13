@@ -13,8 +13,8 @@ to `mcp_server.py`.
   arguments (`session_id`, `sessionId`, `sessionID`, `conversation_id`,
   `conversationId` in `arguments` are rejected).
 - `publish_bind` binds `(surface, local_tool, args_digest)` to `(session_id,
-  call_id, workspace_root)` with a 120s TTL; `claim_bind` consumes each bind at
-  most once under `BEGIN IMMEDIATE`.
+  call_id, workspace_root)` with an 1800s TTL (`>= 2 * 660s` queued MCP budget);
+  `claim_bind` consumes each bind at most once under `BEGIN IMMEDIATE`.
 
 [Timeouts & Locks]
 - Opens `mcp-binds.sqlite3` with `PRAGMA journal_mode=WAL` and
@@ -46,7 +46,7 @@ MCP_WIRE_RE = re.compile(
 FORBIDDEN_IDENTITY_ARGS = frozenset(
     {"session_id", "sessionId", "sessionID", "conversation_id", "conversationId", "_session_id"}
 )
-BIND_TTL_SECONDS = 120.0
+BIND_TTL_SECONDS = 1800.0
 MAX_HOOK_BYTES = 16 * 1024 * 1024
 
 
@@ -140,8 +140,10 @@ def parse_oc_mcp_tool(tool_name: str, tool_input: object) -> tuple[str, str, dic
 
 
 def canonical_args(arguments: dict | None) -> str:
+    cleaned = dict(arguments) if isinstance(arguments, dict) else {}
+    cleaned.pop("_mindie_bind_id", None)
     return json.dumps(
-        arguments if isinstance(arguments, dict) else {},
+        cleaned,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -229,9 +231,10 @@ def claim_bind(
     local_tool: str,
     arguments: dict,
     *,
+    bind_id: str | None = None,
     config=None,
 ) -> dict:
-    """Atomically claim the freshest unexpired bind matching `(surface, local_tool, args)`."""
+    """Atomically claim a matching unexpired bind by `bind_id` or unambiguous FIFO `(surface, local_tool, args)`."""
     if surface not in {"remote", "tools"}:
         raise ValueError("unknown MindIE MCP surface")
     reject_forged_identity_args(arguments)
@@ -241,29 +244,50 @@ def claim_bind(
         raise ValueError("no native OpenCode tool bind database exists; call rejected")
     now = time.time()
     cutoff = now - BIND_TTL_SECONDS
+    explicit_bind = bind_id.strip() if isinstance(bind_id, str) and bind_id.strip() else None
     db = _connect(path, create=False)
     try:
         with db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT bind_id, session, workspace_root, call_id "
-                "FROM binds "
-                "WHERE surface=? AND local_tool=? AND args_digest=? AND status='bound' AND created>=? "
-                "ORDER BY created DESC LIMIT 1",
-                (surface, local_tool, adigest, cutoff),
-            ).fetchone()
-            if row is None:
-                raise ValueError(
-                    f"no active execute.before bind found for {surface}.{local_tool}; "
-                    "unauthorized or replayed MCP tool call"
-                )
-            bind_id, session, workspace_root, call_id = row
+            if explicit_bind is not None:
+                row = db.execute(
+                    "SELECT bind_id, session, workspace_root, call_id "
+                    "FROM binds "
+                    "WHERE bind_id=? AND surface=? AND local_tool=? AND args_digest=? AND status='bound' AND created>=?",
+                    (explicit_bind, surface, local_tool, adigest, cutoff),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        f"no active execute.before bind found for {surface}.{local_tool} (bind_id mismatch or expired); "
+                        "unauthorized or replayed MCP tool call"
+                    )
+            else:
+                rows = db.execute(
+                    "SELECT bind_id, session, workspace_root, call_id "
+                    "FROM binds "
+                    "WHERE surface=? AND local_tool=? AND args_digest=? AND status='bound' AND created>=? "
+                    "ORDER BY created ASC, rowid ASC",
+                    (surface, local_tool, adigest, cutoff),
+                ).fetchall()
+                if not rows:
+                    raise ValueError(
+                        f"no active execute.before bind found for {surface}.{local_tool}; "
+                        "unauthorized or replayed MCP tool call"
+                    )
+                identities = {(r[1], r[2] or "") for r in rows}
+                if len(identities) > 1:
+                    raise ValueError(
+                        f"ambiguous concurrent execute.before binds for {surface}.{local_tool} across sessions; "
+                        "correlation token required"
+                    )
+                row = rows[0]
+            claimed_id, session, workspace_root, call_id = row
             db.execute(
                 "UPDATE binds SET status='claimed', updated=? WHERE bind_id=?",
-                (now, bind_id),
+                (now, claimed_id),
             )
             return dict(
-                bind_id=bind_id,
+                bind_id=claimed_id,
                 session=session,
                 workspace_root=workspace_root,
                 call_id=call_id,

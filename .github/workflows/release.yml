@@ -1,25 +1,28 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  actions: read
+  checks: read
+  deployments: read
 
 jobs:
   release:
-    uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@484b80621aaf9293c559786d0ef2174c79a0dbb4
+    uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@main
+    secrets:
+      MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
-      benchmark-ref: 484b80621aaf9293c559786d0ef2174c79a0dbb4
-      release-notes-path: docs/releases/mindie-agent-oc-0.1.0.md
+      release-notes-path: docs/releases/mindie-agent-oc-0.1.1.md
       node: true
       version-files: |
         package.json
         pyproject.toml
         plugins/mindie-agent/plugin.json
       setup-command: |
-        uv sync --locked --no-editable --no-install-project --extra test
+        uv sync --frozen --no-editable --no-install-project --all-extras
       test-command: |
         .venv/bin/python .github/scripts/check_lf_eol.py
         .venv/bin/python -m pytest -q -m "not live_npu and not live_opencode"
@@ -27,6 +30,14 @@ jobs:
         node --check plugins/mindie-agent/paths.mjs
         node --check plugins/mindie-agent/opencode_host.mjs
       build-command: |
+        stamp="$RUNNER_TEMP/diagnostic-build.json"
+        printf '{"version":"%s","revision":"%s"}\n' "$RELEASE_VERSION" "$GITHUB_SHA" > "$stamp"
+        trap 'rm -f plugins/mindie-agent/scripts/diagnostic-build.json' EXIT
+        cp "$stamp" plugins/mindie-agent/scripts/diagnostic-build.json
         npm pack --pack-destination "$RELEASE_ASSETS_DIR"
-        git archive --format=tar.gz --prefix="mindie-agent-oc-$RELEASE_VERSION/" --output="$RELEASE_ASSETS_DIR/mindie-agent-oc-$RELEASE_VERSION.tar.gz" "$GITHUB_SHA"
+        rm -f plugins/mindie-agent/scripts/diagnostic-build.json
+        git archive --format=tar.gz \
+          --prefix="mindie-agent-oc-$RELEASE_VERSION/plugins/mindie-agent/scripts/" --add-file="$stamp" \
+          --prefix="mindie-agent-oc-$RELEASE_VERSION/" \
+          --output="$RELEASE_ASSETS_DIR/mindie-agent-oc-$RELEASE_VERSION.tar.gz" "$GITHUB_SHA"
         .venv/bin/python plugins/mindie-agent/scripts/release_metadata.py --source . --tests tests --revision "$GITHUB_SHA" > "$RELEASE_ASSETS_DIR/mindie-plugin-release.json"

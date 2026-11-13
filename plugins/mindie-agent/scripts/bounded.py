@@ -1,22 +1,24 @@
-"""Bounded subprocess runner with cross-platform process-tree cleanup.
+"""Bounded subprocess runner with cross-platform process-tree cleanup and streaming output cap.
 
 [Role]
 Executes bounded child processes (`run`) for hooks, deterministic component CLIs,
 and summary workers, guaranteeing full process-group (POSIX) or Windows Job
-Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) tree termination on timeout or
-cancellation before draining pipes.
+Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) tree termination and bounded
+in-memory output draining (`O(max_output)`, zero unbounded temp files).
 
 [Invariants]
 - Never calls `subprocess.run(..., timeout=None)`. Every child process has a
   positive finite wall-clock `timeout`.
-- Enforces `outer_timeout >= inner_budget + cleanup_grace`: on timeout or
-  cancellation, kills the entire child process tree first so grandchildren
-  cannot hold stdout/stderr pipes open indefinitely.
+- Kills the entire owned POSIX process group (`os.killpg(proc.pid, SIGKILL)`)
+  unconditionally—even if the direct child already exited—so orphaned
+  grandchildren never survive or hold pipes open.
+- Drains stdout/stderr pipes in 64 KiB chunks while retaining at most
+  `max_output` bytes per stream; preserves `returncode` when
+  `strict_output_limit=False`.
 - Explicitly re-raises `TimeoutError` before any `except OSError:` branch.
 
 [Timeouts & Locks]
-- Default `cleanup_grace = 2.0s` for tree termination and pipe draining.
-- Uses temporary files for stdin/stdout/stderr capture bounded by `max_output`.
+- Default `cleanup_grace = 2.0s` for tree termination and pipe reader join.
 
 [Side-Effect Policy]
 - Spawns and reaps one owned child process tree per `run()` call.
@@ -46,6 +48,8 @@ class ProcessResult:
     stderr: str
     elapsed_ms: int
     cleanup_failed: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
     def checked_stdout(self) -> str:
         if self.returncode != 0:
@@ -66,19 +70,23 @@ def _kill_process_tree(proc: subprocess.Popen, job_handle=None) -> bool:
             job_handle = None
         except Exception:
             cleanup_failed = True
-    if proc.poll() is None:
-        if os.name == "nt":
+    if os.name == "nt":
+        if proc.poll() is None:
             try:
                 proc.kill()
+            except TimeoutError:
+                raise
             except OSError:
                 cleanup_failed = True
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                cleanup_failed = True
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except TimeoutError:
+            raise
+        except ProcessLookupError:
+            pass
+        except OSError:
+            cleanup_failed = True
     try:
         proc.wait(timeout=2.0)
     except subprocess.TimeoutExpired:
@@ -115,14 +123,35 @@ def _attach_windows_job(proc: subprocess.Popen):
         return None
 
 
-def _read_bounded(path: Path, max_bytes: int) -> str:
-    if not path.is_file():
-        return ""
-    with path.open("rb") as stream:
-        raw = stream.read(max_bytes + 1)
-    if len(raw) > max_bytes:
-        raise OutputLimitExceeded(f"process output exceeded {max_bytes} bytes")
-    return raw.decode("utf-8", errors="replace")
+def _drain_pipe_bounded(pipe, max_bytes: int, sink: list) -> None:
+    buf = bytearray()
+    overflow = False
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            remaining = max_bytes - len(buf)
+            if remaining > 0:
+                if len(chunk) <= remaining:
+                    buf.extend(chunk)
+                else:
+                    buf.extend(chunk[:remaining])
+                    overflow = True
+            else:
+                overflow = True
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+    sink.append((bytes(buf), overflow))
 
 
 def run(
@@ -135,6 +164,7 @@ def run(
     cwd: str | Path | None = None,
     cancel: threading.Event | None = None,
     allowed_returncodes: set[int] | None = None,
+    strict_output_limit: bool = True,
 ) -> ProcessResult:
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a positive finite number of seconds")
@@ -147,17 +177,14 @@ def run(
     child_env["PYTHONIOENCODING"] = "utf-8"
 
     with tempfile.TemporaryDirectory(prefix="mindie-oc-proc-") as tmp_dir:
-        tmp_root = Path(tmp_dir)
-        stdin_path = tmp_root / "stdin.txt"
-        stdout_path = tmp_root / "stdout.txt"
-        stderr_path = tmp_root / "stderr.txt"
+        stdin_path = Path(tmp_dir) / "stdin.txt"
         stdin_path.write_bytes((stdin_text or "").encode("utf-8"))
 
-        with stdin_path.open("rb") as fin, stdout_path.open("wb") as fout, stderr_path.open("wb") as ferr:
+        with stdin_path.open("rb") as fin:
             popen_kwargs: dict = dict(
                 stdin=fin,
-                stdout=fout,
-                stderr=ferr,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=child_env,
                 cwd=str(cwd) if cwd is not None else None,
             )
@@ -173,6 +200,16 @@ def run(
             deadline = started + float(timeout)
             proc = subprocess.Popen(argv, **popen_kwargs)
             job_handle = _attach_windows_job(proc)
+            out_sink: list = []
+            err_sink: list = []
+            out_thread = threading.Thread(
+                target=_drain_pipe_bounded, args=(proc.stdout, max_output, out_sink), daemon=True
+            )
+            err_thread = threading.Thread(
+                target=_drain_pipe_bounded, args=(proc.stderr, max_output, err_sink), daemon=True
+            )
+            out_thread.start()
+            err_thread.start()
             cleanup_failed = False
             try:
                 while True:
@@ -190,25 +227,26 @@ def run(
                         raise TimeoutError(f"process timed out after {timeout:.2f}s: {argv[0]}")
                     time.sleep(min(0.02, max(0.001, remaining)))
             finally:
-                if proc.poll() is None:
-                    cleanup_failed = _kill_process_tree(proc, job_handle) or cleanup_failed
-                elif job_handle is not None and os.name == "nt":
-                    try:
-                        import win32api
-
-                        win32api.CloseHandle(job_handle)
-                    except Exception:
-                        pass
+                cleanup_failed = _kill_process_tree(proc, job_handle) or cleanup_failed
+                job_handle = None
+                out_thread.join(timeout=2.0)
+                err_thread.join(timeout=2.0)
+                if out_thread.is_alive() or err_thread.is_alive():
+                    cleanup_failed = True
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        stdout_str = _read_bounded(stdout_path, max_output)
-        stderr_str = _read_bounded(stderr_path, max_output)
+        out_bytes, out_trunc = out_sink[0] if out_sink else (b"", False)
+        err_bytes, err_trunc = err_sink[0] if err_sink else (b"", False)
+        if strict_output_limit and (out_trunc or err_trunc):
+            raise OutputLimitExceeded(f"process output exceeded {max_output} bytes")
         result = ProcessResult(
             returncode=int(proc.returncode or 0),
-            stdout=stdout_str,
-            stderr=stderr_str,
+            stdout=out_bytes.decode("utf-8", errors="replace"),
+            stderr=err_bytes.decode("utf-8", errors="replace"),
             elapsed_ms=elapsed_ms,
             cleanup_failed=cleanup_failed,
+            stdout_truncated=out_trunc,
+            stderr_truncated=err_trunc,
         )
         if allowed_returncodes is not None and result.returncode not in allowed_returncodes:
             result.checked_stdout()

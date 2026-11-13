@@ -236,6 +236,8 @@ def invoke(
         raise ValueError(f"unknown knowledge operation: {operation}")
 
     args = dict(arguments or {})
+    if operation in {"knowledge_query", "knowledge_explain"} and args.get("mode") == "standard":
+        args["mode"] = "reuse"
     target_engine = _select_engine_path(config, args)
     token = lease.get("token")
 

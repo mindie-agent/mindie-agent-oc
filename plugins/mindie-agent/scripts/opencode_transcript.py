@@ -1,60 +1,68 @@
-"""Bounded incremental reader and SQLite-v2 spool projector for OpenCode (`oc`) transcripts.
+"""Bounded incremental public-transcript reader for OpenCode (`opencode_transcript.py`).
 
 [Role]
 Per-Harness transcript adapter (`FileIdentity`, `identify`, `capture_source`,
-`read_material`) and read-only OpenCode v2 `opencode.db` spool projector
-(`sync_session_spool`) writing per-session append-only JSONL files under
-`<state_dir>/transcripts/<session_id>.jsonl`.
+`read_material`) consumed by `mindie_knowledge.loop` (`Engine`), re-exporting
+`sync_session_spool` from `opencode_spool.py`.
 
 [Invariants]
-- Opens OpenCode's `opencode.db` strictly in read-only URI mode (`?mode=ro`) and
-  rejects subagent (`parent_id`) or forked (`fork_session_id`) sessions.
-- Extracts only public user and assistant text (`type == "text"`); excludes
-  `reasoning`, `tool`, `tool_use`, `tool_result`, `synthetic`, `system`, `skill`,
-  `shell`, `compaction`, `idle`, `ignored`/`synthetic` parts, and control tags.
 - Enforces exact `[start, end)` SHA-256 byte accounting with a 512-byte prefix
   anchor (`FileIdentity`).
+- Never populates `coverage` on complete reads; corrupt, truncated, oversize-unreadable,
+  or timestamp-less public records populate `discarded_records` without advancing cursors.
+- Never truncates or drops single large public messages (`<= max_scan_bytes`).
 
 [Timeouts & Locks]
-- `sync_session_spool` uses `timeout=2.0s` (`busy_timeout=2000`) read-only SQLite
-  reads; `read_material` enforces `max_scan_bytes=16 MiB` and `max_seconds=2.0s`.
+- `read_material` enforces `max_scan_bytes=16 MiB` and `max_seconds=2.0s` with
+  zero locks or subprocesses.
 
 [Side-Effect Policy]
 - `identify`, `capture_source`, and `read_material` are strictly read-only.
-- `sync_session_spool` appends only to MindIE-owned `<state_dir>/transcripts/`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import re
-import sqlite3
+import sys
 import time
-from urllib.parse import quote
 
-MAX_WINDOW = 256 * 1024
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from opencode_spool import (  # noqa: E402
+    SESSION_ID_RE,
+    SPOOL_SCHEMA,
+    extract_record as _extract_record,
+    sync_session_spool,
+    to_seconds,
+)
+
+__all__ = [
+    "ANCHOR_BYTES",
+    "FileIdentity",
+    "MAX_RECORDS",
+    "MAX_TEXT",
+    "SPOOL_SCHEMA",
+    "capture_source",
+    "identify",
+    "read_increment",
+    "read_material",
+    "sync_session_spool",
+    "to_seconds",
+]
+
 MAX_TEXT = 48 * 1024
 MAX_RECORDS = 200
 ANCHOR_BYTES = 512
 SOURCE_HEAD_BYTES = 1024 * 1024
 SOURCE_HEAD_LINES = 64
-SPOOL_SCHEMA = "mindie-oc-spool/1"
-
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{3,127}\Z")
-USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
-STRIP_TAGS_RE = re.compile(
-    r"<(?:system-reminder|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM_MESSAGE)\b[^>]*>.*?</(?:system-reminder|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM_MESSAGE)>",
-    re.DOTALL,
-)
-GESTURE_PREFIX_RE = re.compile(
-    r"^\s*(?:/mindie-agent(?::mindie-agent)?|\$mindie-agent(?::mindie-agent)?)(?:\s+|$)"
-)
+MAX_SPOOL_LINE_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -136,154 +144,6 @@ def identify(path: str | Path) -> FileIdentity | None:
     )
 
 
-def to_seconds(raw) -> float | None:
-    if type(raw) in (int, float) and raw > 0:
-        value = float(raw)
-        if value >= 1e12:
-            value /= 1000.0
-        return value if math.isfinite(value) else None
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    text = raw.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        stamp = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=timezone.utc)
-    return stamp.timestamp()
-
-
-def _readonly_sqlite_uri(db_path: Path) -> str:
-    posix = db_path.resolve().as_posix()
-    if not posix.startswith("/"):
-        posix = "/" + posix
-    return f"file:{quote(posix, safe='/:')}?mode=ro"
-
-
-def sync_session_spool(
-    session_id: str,
-    *,
-    db_path: str | Path,
-    spool_dir: str | Path,
-) -> Path | None:
-    """Incrementally project OpenCode v2 `session_message` rows into an append-only per-session JSONL spool."""
-    if not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id.strip()) or ".." in session_id:
-        raise ValueError("native OpenCode sessionID is missing or invalid")
-    sid = session_id.strip()
-    db_file = Path(db_path)
-    if not db_file.is_file():
-        return None
-
-    out_dir = Path(spool_dir).resolve()
-    out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    spool_file = out_dir / f"{sid}.jsonl"
-    cursor_file = out_dir / f"{sid}.seq"
-
-    last_seq = -1
-    if spool_file.is_file() and cursor_file.is_file():
-        try:
-            last_seq = int(cursor_file.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            last_seq = -1
-
-    db = sqlite3.connect(_readonly_sqlite_uri(db_file), uri=True, timeout=2.0)
-    try:
-        db.execute("PRAGMA busy_timeout=2000;")
-        srow = db.execute(
-            "SELECT id, directory, parent_id, fork_session_id, time_created FROM session_v2 WHERE id=?",
-            (sid,),
-        ).fetchone()
-        if srow is None:
-            return spool_file if spool_file.is_file() else None
-        _id, directory, parent_id, fork_session_id, session_created = srow
-        if (isinstance(parent_id, str) and parent_id.strip()) or (
-            isinstance(fork_session_id, str) and fork_session_id.strip()
-        ):
-            raise ValueError("subagent or forked OpenCode session cannot be captured")
-
-        mrows = db.execute(
-            "SELECT id, type, seq, time_created, data FROM session_message "
-            "WHERE session_id=? AND seq>? ORDER BY seq ASC",
-            (sid, last_seq),
-        ).fetchall()
-        if not mrows:
-            return spool_file if spool_file.is_file() else None
-
-        parts_by_msg: dict[str, list[dict]] = {}
-        msg_ids = [r[0] for r in mrows if isinstance(r[0], str)]
-        if msg_ids:
-            placeholders = ",".join("?" for _ in msg_ids)
-            for p_mid, p_type, p_data in db.execute(
-                f"SELECT message_id, type, data FROM session_part WHERE session_id=? AND message_id IN ({placeholders}) ORDER BY ordinal ASC",
-                (sid, *msg_ids),
-            ):
-                try:
-                    parsed_part = json.loads(p_data) if isinstance(p_data, str) else {}
-                except ValueError:
-                    parsed_part = {}
-                if isinstance(parsed_part, dict):
-                    parsed_part.setdefault("type", p_type)
-                    parts_by_msg.setdefault(p_mid, []).append(parsed_part)
-    finally:
-        db.close()
-
-    lines: list[bytes] = []
-    max_seq = last_seq
-    for mid, mtype, seq, msg_created, raw_data in mrows:
-        if int(seq) > max_seq:
-            max_seq = int(seq)
-        try:
-            parsed_data = json.loads(raw_data) if isinstance(raw_data, str) else {}
-        except ValueError:
-            parsed_data = {}
-        candidate = dict(
-            schema=SPOOL_SCHEMA,
-            session_id=sid,
-            directory=directory,
-            session_created=session_created,
-            message_id=mid,
-            type=mtype,
-            seq=int(seq),
-            time_created=msg_created,
-            data=parsed_data if isinstance(parsed_data, dict) else {},
-        )
-        if mid in parts_by_msg:
-            candidate["parts"] = parts_by_msg[mid]
-        extracted = _extract_record(candidate)
-        if extracted is None:
-            continue
-        role, text_body, _stamp = extracted
-        sanitized_entry = dict(
-            schema=SPOOL_SCHEMA,
-            session_id=sid,
-            directory=directory,
-            session_created=session_created,
-            message_id=mid,
-            type=role,
-            seq=int(seq),
-            time_created=msg_created,
-            data=dict(text=text_body, time=dict(created=msg_created)),
-        )
-        lines.append(
-            (json.dumps(sanitized_entry, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
-        )
-
-    if lines:
-        with spool_file.open("ab") as stream:
-            for raw_line in lines:
-                stream.write(raw_line)
-            stream.flush()
-    if spool_file.is_file():
-        cursor_tmp = out_dir / f".{sid}.seq.tmp"
-        cursor_tmp.write_text(f"{max_seq}\n", encoding="utf-8")
-        os.replace(cursor_tmp, cursor_file)
-        return spool_file
-    return None
-
-
 def _session_in_path(path: str | Path) -> str | None:
     stem = Path(path).stem
     if SESSION_ID_RE.fullmatch(stem) and stem.lower() not in {"transcript", "transcript_full", "opencode"}:
@@ -293,6 +153,42 @@ def _session_in_path(path: str | Path) -> str | None:
         if SESSION_ID_RE.fullmatch(part) and part.lower() not in {"transcripts", "sessions", "logs", "oc-state"}:
             return part
     return None
+
+
+def _iter_head_lines(path: Path, *, max_lines: int, max_line_bytes: int):
+    """Stream up to `max_lines` newline-delimited records, allowing each line up to `max_line_bytes` (`16 MiB`)."""
+    with path.open("rb") as stream:
+        emitted = 0
+        buf = bytearray()
+        overflow = False
+        while emitted < max_lines:
+            chunk = stream.read(65536)
+            if not chunk:
+                if buf and not overflow:
+                    yield bytes(buf)
+                break
+            start_idx = 0
+            while emitted < max_lines and start_idx < len(chunk):
+                nl = chunk.find(b"\n", start_idx)
+                if nl == -1:
+                    rem = chunk[start_idx:]
+                    if not overflow:
+                        if len(buf) + len(rem) <= max_line_bytes:
+                            buf.extend(rem)
+                        else:
+                            buf.clear()
+                            overflow = True
+                    break
+                piece = chunk[start_idx:nl]
+                start_idx = nl + 1
+                emitted += 1
+                if not overflow and len(buf) + len(piece) <= max_line_bytes:
+                    line = (bytes(buf) + piece) if buf else piece
+                    buf.clear()
+                    yield line.rstrip(b"\r")
+                else:
+                    buf.clear()
+                    overflow = False
 
 
 def capture_source(path: str | Path, session_id: str, *, binding: dict | None = None) -> dict:
@@ -314,11 +210,8 @@ def capture_source(path: str | Path, session_id: str, *, binding: dict | None = 
     if owner != norm_session:
         raise ValueError("capture transcript does not belong to this session_id")
 
-    with selected.open("rb") as stream:
-        head = stream.read(SOURCE_HEAD_BYTES)
-    lines = head.split(b"\n")[:SOURCE_HEAD_LINES]
     created = None
-    for raw in lines:
+    for raw in _iter_head_lines(selected, max_lines=SOURCE_HEAD_LINES, max_line_bytes=MAX_SPOOL_LINE_BYTES):
         if not raw.strip():
             continue
         try:
@@ -364,84 +257,6 @@ def capture_source(path: str | Path, session_id: str, *, binding: dict | None = 
     raise ValueError("native task binding is required to establish project scope")
 
 
-def _clean_user_text(raw: str) -> str:
-    match = USER_REQUEST_RE.search(raw)
-    text = match.group(1) if match is not None else STRIP_TAGS_RE.sub("", raw)
-    text = STRIP_TAGS_RE.sub("", text).strip()
-    if GESTURE_PREFIX_RE.match(text):
-        text = GESTURE_PREFIX_RE.sub("", text, count=1).strip()
-        if text in {"", "activate", "deactivate", "status", "init", "recover"}:
-            return ""
-    return text
-
-
-def _extract_public_parts(blocks: object) -> str:
-    if isinstance(blocks, str):
-        return blocks
-    if not isinstance(blocks, list):
-        return ""
-    chunks: list[str] = []
-    for item in blocks:
-        if not isinstance(item, dict):
-            continue
-        if item.get("synthetic") is True or item.get("ignored") is True or item.get("isMeta") is True:
-            continue
-        btype = item.get("type")
-        if btype in {"text", "input_text", "output_text"} and isinstance(item.get("text"), str):
-            text = item["text"]
-            if not text.startswith("<persisted-output>"):
-                chunks.append(text)
-    return "\n".join(chunks)
-
-
-def _extract_record(record: dict) -> tuple[str, str, float | None] | None:
-    if record.get("isMeta") is True or record.get("synthetic") is True:
-        return None
-
-    # OpenCode v2 spool record (`mindie-oc-spool/1`)
-    if record.get("schema") == SPOOL_SCHEMA:
-        mtype = record.get("type")
-        data = record.get("data") if isinstance(record.get("data"), dict) else {}
-        time_info = data.get("time") if isinstance(data.get("time"), dict) else {}
-        stamp = to_seconds(time_info.get("created") or record.get("time_created"))
-        if mtype == "user":
-            if data.get("synthetic") is True or data.get("ignored") is True:
-                return None
-            raw_text = data.get("text") if isinstance(data.get("text"), str) else _extract_public_parts(data.get("content") or record.get("parts"))
-            cleaned = _clean_user_text(raw_text)
-            return ("user", cleaned, stamp) if cleaned else None
-        if mtype == "assistant":
-            raw_text = (
-                data.get("text")
-                if isinstance(data.get("text"), str)
-                else _extract_public_parts(data.get("content") or record.get("parts"))
-            )
-            cleaned = STRIP_TAGS_RE.sub("", raw_text).strip()
-            return ("assistant", cleaned, stamp) if cleaned else None
-        return None
-
-    # Direct JSONL message record (`type` or `role` in `{"user", "assistant"}`)
-    stamp = to_seconds(record.get("time_created") or record.get("timestamp") or record.get("created_at"))
-    role = record.get("role") or record.get("type")
-    if role == "message" and isinstance(record.get("message"), dict):
-        msg = record["message"]
-        role = msg.get("role")
-        raw_text = _extract_public_parts(msg.get("content"))
-    else:
-        raw_text = (
-            record["text"]
-            if isinstance(record.get("text"), str)
-            else _extract_public_parts(record.get("content") or record.get("parts"))
-        )
-    if role == "user":
-        cleaned = _clean_user_text(raw_text)
-        return ("user", cleaned, stamp) if cleaned else None
-    if role == "assistant":
-        cleaned = STRIP_TAGS_RE.sub("", raw_text).strip()
-        return ("assistant", cleaned, stamp) if cleaned else None
-    return None
-
-
 def read_material(
     path: str | Path,
     start: int = 0,
@@ -463,7 +278,7 @@ def read_material(
     boundary = to_seconds(not_before) if not_before is not None else None
     norm_session = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
 
-    result = dict(
+    result: dict = dict(
         status="ok",
         start=start,
         end=start,
@@ -527,64 +342,50 @@ def read_material(
             if start > 0:
                 stream.seek(start - 1)
                 if stream.read(1) != b"\n":
-                    result.update(status="replaced", coverage_note="start offset is not at a record boundary")
+                    result.update(status="invalid-boundary", coverage_note="cursor is not a whole-record boundary")
                     return result
-            else:
-                stream.seek(0)
+            stream.seek(start)
 
-            limit = min(stat.st_size, scan_until) if scan_until is not None else stat.st_size
+            end_limit = min(stat.st_size, start + max_scan_bytes)
+            if scan_until is not None:
+                end_limit = min(end_limit, scan_until)
             offset = start
-            scanned = 0
 
-            while offset < limit:
-                if scanned >= max_scan_bytes or (time.monotonic() - begun) >= max_seconds or len(included) >= MAX_RECORDS:
+            while offset < end_limit:
+                if (time.monotonic() - begun) >= max_seconds or len(included) >= MAX_RECORDS:
                     result["more"] = True
                     break
-                raw_line = stream.readline(min(MAX_WINDOW + 2, limit - offset))
+                room = end_limit - offset
+                raw_line = stream.readline(room)
                 if not raw_line:
                     break
-                if not raw_line.endswith(b"\n") and (offset + len(raw_line)) < stat.st_size and len(raw_line) > MAX_WINDOW:
-                    # Oversize line exceeding window: consume until newline within budget
-                    remainder_budget = min(limit - (offset + len(raw_line)), max_scan_bytes - scanned)
-                    tail = b""
-                    while not raw_line.endswith(b"\n") and remainder_budget > 0:
-                        chunk = stream.read(min(65536, remainder_budget))
-                        if not chunk:
-                            break
-                        nl = chunk.find(b"\n")
-                        if nl != -1:
-                            tail += chunk[: nl + 1]
-                            stream.seek(offset + len(raw_line) + len(tail))
-                            break
-                        tail += chunk
-                        remainder_budget -= len(chunk)
-                    full_line = raw_line + tail
-                    if not full_line.endswith(b"\n"):
+                if not raw_line.endswith(b"\n"):
+                    if offset + len(raw_line) == stat.st_size:
                         result["partial"] = True
                         break
-                    consumed.update(full_line)
-                    offset += len(full_line)
-                    scanned += len(full_line)
+                    if scan_until is not None and offset + len(raw_line) == scan_until:
+                        result["partial"] = True
+                        break
+                    if offset > start:
+                        result["more"] = True
+                        break
+                    result.setdefault("discarded_records", []).append(
+                        dict(start=offset, end=offset + len(raw_line), reason="record exceeds max_scan_bytes")
+                    )
                     result["oversize_records"] += 1
-                    continue
-
-                if not raw_line.endswith(b"\n"):
-                    result["partial"] = True
-                    break
+                    result.update(status="incomplete", coverage_note="record exceeds max_scan_bytes")
+                    return result
 
                 try:
                     record = json.loads(raw_line.decode("utf-8"))
                 except (UnicodeDecodeError, ValueError):
-                    consumed.update(raw_line)
-                    offset += len(raw_line)
-                    scanned += len(raw_line)
-                    result["skipped_records"] += 1
-                    continue
-
+                    record = None
                 if not isinstance(record, dict):
+                    result.setdefault("discarded_records", []).append(
+                        dict(start=offset, end=offset + len(raw_line), reason="invalid record")
+                    )
                     consumed.update(raw_line)
                     offset += len(raw_line)
-                    scanned += len(raw_line)
                     result["skipped_records"] += 1
                     continue
 
@@ -599,41 +400,40 @@ def read_material(
                     if boundary is not None:
                         if stamp is None:
                             result["timestamps_reliable"] = False
+                            result.setdefault("discarded_records", []).append(
+                                dict(start=offset, end=offset + len(raw_line), reason="missing public timestamp")
+                            )
                             consumed.update(raw_line)
                             offset += len(raw_line)
-                            scanned += len(raw_line)
                             result["skipped_records"] += 1
                             continue
                         if stamp + 1e-3 < boundary:
                             consumed.update(raw_line)
                             offset += len(raw_line)
-                            scanned += len(raw_line)
                             result["skipped_records"] += 1
                             continue
-                    formatted = f"[{role}]\n{text_body}"
+                    norm_text = text_body.replace("\r\n", "\n").replace("\r", "\n")
+                    formatted = f"[{role}]\n{norm_text}"
                     encoded_len = len(formatted.encode("utf-8")) + (2 if included else 0)
                     if included and (text_size + encoded_len) > max_text_bytes:
                         result["more"] = True
                         break
-                    if not included and encoded_len > max_text_bytes:
-                        formatted = formatted.encode("utf-8")[:max_text_bytes].decode("utf-8", errors="ignore")
-                        encoded_len = len(formatted.encode("utf-8"))
                     included.append(formatted)
                     text_size += encoded_len
                     result["records"] += 1
-                    result["coverage"].append([offset, offset + len(raw_line)])
                 else:
                     result["skipped_records"] += 1
 
                 consumed.update(raw_line)
                 offset += len(raw_line)
-                scanned += len(raw_line)
 
             result["end"] = offset
             result["digest"] = consumed.hexdigest()
             result["text"] = "\n\n".join(included)
             if offset < stat.st_size:
                 result["more"] = True
+            if result["status"] == "ok" and result["end"] == start and not result.get("discarded_records"):
+                result["status"] = "unchanged"
             return result
     except TimeoutError:
         raise

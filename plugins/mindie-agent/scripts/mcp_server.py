@@ -1,37 +1,27 @@
 """Public stdio JSON-RPC 2.0 MCP server for OpenCode (`remote` and `tools` surfaces).
 
 [Role]
-Serves public MCP discovery (`tools/list`) and tool execution (`tools/call`) for
-`mindie-remote-dev` (20 canonical `remote_*` tools) and `mindie-tools`
-(`mindie_status`, `profiler`, `sim`, `coordinator`, `debugger`, `npu_top`,
-`npu_top` observation tools, `diagnostics_status`, `diagnostics_bundle`).
+Serves public MCP discovery (`tools/list`) and execution (`tools/call`) for
+`mindie-remote-dev` (20 `remote_*` tools) and `mindie-tools` (`mindie_status`,
+`profiler`, `sim`, `coordinator`, `debugger`, `npu_top*`, `diagnostics_*`).
 
 [Invariants]
-- Default MCP discovery (`tools/list`) NEVER exposes `knowledge_*` tool names,
-  descriptions, or schemas—even if a session has activated `/mindie-agent`.
-- Deterministic tools (`remote_*`, `profiler`, `sim`, `coordinator`, `debugger`,
-  `npu_top`, `diagnostics_*`, `mindie_status`) work in ordinary sessions without
-  requiring a knowledge lease.
-- Every `tools/call` resolves session identity from a one-shot `execute.before`
-  bind (`claim_bind`) or `OPENCODE_SESSION_ID`; model-supplied session identity
-  keys in `params.arguments` are rejected.
-- Receipt Honesty Invariant: once a primary remote or component operation
-  succeeds, if local SQLite receipt persistence (`RemoteReceipts.finish`) or
-  `finish_bind` raises an `OSError` or `sqlite3.Error`, `isError` stays `False`
-  and `receipt_warning` + `receipt_unconfirmed=True` are attached to
-  `structuredContent` so the caller never blindly repeats a completed mutation.
+- `tools/list` NEVER exposes `knowledge_*` names, descriptions, or schemas.
+- Deterministic tools work in ordinary sessions without requiring a knowledge lease.
+- Session identity comes only from one-shot `claim_bind` or `OPENCODE_SESSION_ID`;
+  model-supplied session keys in `params.arguments` are rejected.
+- Receipt Honesty: once a primary remote/component call succeeds, local receipt or
+  `finish_bind` `OSError`/`sqlite3.Error` keeps `isError=False` and attaches
+  `receipt_warning` + `receipt_unconfirmed=True`.
 
 [Timeouts & Locks]
-- Uses SQLite WAL mode with `busy_timeout=5000` (`timeout=5.0`) for
-  `RemoteReceipts` (`remote-receipts.sqlite3`).
-- Enforces `remote_timeout(name, args) = max(minimum, inner_wait + 60.0s grace)`
-  (`660s >= 600s + 60s`) and decouples `COMPONENT_CAPTURE_LIMIT_BYTES = 16 MiB`
-  from MCP response truncation budgets.
+- SQLite WAL + `busy_timeout=5000` (`timeout=5.0`) on `remote-receipts.sqlite3`.
+- Enforces `remote_timeout = max(minimum, inner_wait + 60.0s)` (`660s >= 600s + 60s`)
+  and decouples `COMPONENT_CAPTURE_LIMIT_BYTES = 16 MiB` from MCP truncation.
 
 [Side-Effect Policy]
-- `initialize` triggers non-blocking background component update checks if due
-  (no-op in isolated test homes or unprovisioned profiles); `tools/list` is a
-  pure in-memory catalog operation.
+- `initialize` triggers non-blocking background update checks if due; `tools/list`
+  is a pure in-memory catalog operation.
 """
 
 from __future__ import annotations
@@ -55,7 +45,7 @@ from bounded import run as bounded_run
 from component_update import trigger_background_update_if_due
 from identity import claim_bind, finish_bind, reject_forged_identity_args, require_session
 from oc_native_compat import ensure_oc_native_support
-from paths import bind_db_path, config_path, diagnostics_config_path, read_json, remote_receipts_path, state_dir
+from paths import bind_db_path, config_path, diagnostics_config_path, plugin_root, read_json, remote_receipts_path, state_dir
 
 ensure_oc_native_support()
 
@@ -222,6 +212,17 @@ class RemoteReceipts:
             db.close()
 
 
+def _with_bind_property(tool: dict) -> dict:
+    """Declare optional `_mindie_bind_id` so OpenCode's post-hook schema decoder preserves exact call correlation."""
+    item = dict(tool)
+    raw_schema = item.get("inputSchema")
+    if isinstance(raw_schema, dict):
+        props = dict(raw_schema.get("properties") or {})
+        props.setdefault("_mindie_bind_id", dict(type="string"))
+        item["inputSchema"] = dict(raw_schema, properties=props)
+    return item
+
+
 def tools_catalog() -> list[dict]:
     """Return the deterministic `mindie-tools` MCP catalog (zero knowledge tools)."""
     limits = {
@@ -297,10 +298,11 @@ def tools_catalog() -> list[dict]:
             inputSchema=dict(
                 type="object",
                 additionalProperties=False,
-                required=["root"],
+                required=[],
                 properties=dict(
                     root=dict(type="string"),
                     operation_id=dict(type="string"),
+                    incident_id=dict(type="string"),
                     output=dict(type="string"),
                     **limits,
                 ),
@@ -308,14 +310,14 @@ def tools_catalog() -> list[dict]:
             annotations=dict(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         )
     )
-    return items
+    return [_with_bind_property(item) for item in items]
 
 
 def remote_catalog() -> list[dict]:
     """Return the `mindie-remote-dev` canonical MCP catalog."""
     from remote_dev.mcp.tools import list_tools
 
-    return list(list_tools("canonical"))
+    return [_with_bind_property(item) for item in list_tools("canonical")]
 
 
 def _resolve_component_command(component: str, *, config=None) -> list[str]:
@@ -338,11 +340,18 @@ def _resolve_component_command(component: str, *, config=None) -> list[str]:
     return [python_exe, "-I", "-X", "utf8", "-m", module_map[component]]
 
 
-def _resolve_session(surface: str, tool_name: str, arguments: dict, *, config=None) -> tuple[str, str | None, str | None]:
+def _resolve_session(
+    surface: str,
+    tool_name: str,
+    arguments: dict,
+    *,
+    bind_id: str | None = None,
+    config=None,
+) -> tuple[str, str | None, str | None]:
     """Resolve session identity from an `execute.before` bind or `OPENCODE_SESSION_ID`."""
     reject_forged_identity_args(arguments)
     if bind_db_path(config).is_file():
-        bound = claim_bind(surface, tool_name, arguments, config=config)
+        bound = claim_bind(surface, tool_name, arguments, bind_id=bind_id, config=config)
         return bound["session"], bound["bind_id"], bound.get("workspace_root")
     return require_session(os.environ.get("OPENCODE_SESSION_ID")), None, None
 
@@ -398,8 +407,15 @@ def call_tools_surface(
     receipts: RemoteReceipts | None = None,
 ) -> dict:
     raw_args = dict(arguments or {})
+    explicit_bind = raw_args.pop("_mindie_bind_id", None)
     try:
-        session, bind_id, bound_cwd = _resolve_session("tools", name, raw_args, config=config)
+        session, bind_id, bound_cwd = _resolve_session(
+            "tools",
+            name,
+            raw_args,
+            bind_id=explicit_bind if isinstance(explicit_bind, str) else None,
+            config=config,
+        )
     except Exception as exc:
         return _admission_failure(exc)
     args = dict(raw_args)
@@ -432,14 +448,18 @@ def call_tools_surface(
                 diag_cfg = args.get("config") if isinstance(args.get("config"), str) else str(diagnostics_config_path(config))
                 argv = ["reporting", "status", "--config", diag_cfg]
             else:
+                import diagnostic_support
+
                 component = "diagnostics"
                 root_arg = args.get("root")
-                if not isinstance(root_arg, str) or not root_arg:
-                    raise ValueError("diagnostics_bundle requires 'root'")
-                argv = ["bundle", "--root", root_arg]
-                for k in ("operation_id", "output"):
-                    if isinstance(args.get(k), str):
-                        argv += ["--" + k.replace("_", "-"), args[k]]
+                if root_arg is not None and (not isinstance(root_arg, str) or not root_arg):
+                    raise ValueError("diagnostics_bundle 'root' must be a non-empty string")
+                argv = ["bundle", "--root", root_arg or diagnostic_support.default_diagnostics_root()]
+                op_id = args.get("operation_id") if isinstance(args.get("operation_id"), str) else args.get("incident_id")
+                if isinstance(op_id, str) and op_id:
+                    argv += ["--operation-id", op_id]
+                if isinstance(args.get("output"), str) and args["output"]:
+                    argv += ["--output", args["output"]]
 
             budget = args.get("max_output_tokens", 16384)
             if type(budget) is not int or not 1 <= budget <= 262144:
@@ -458,6 +478,7 @@ def call_tools_surface(
             child_env = dict(os.environ)
             child_env["OPENCODE_SESSION_ID"] = session
             child_env["MINDIE_AGENT_CONFIG"] = str(config_path(config))
+            child_env.setdefault("MINDIE_DIAGNOSTICS_CONFIG", str(diagnostics_config_path(config)))
             child_env.pop("PYTHONPATH", None)
 
             cmd = _resolve_component_command(component, config=config) + list(argv)
@@ -468,11 +489,16 @@ def call_tools_surface(
                 max_output=COMPONENT_CAPTURE_LIMIT_BYTES,
                 env=child_env,
                 cwd=run_cwd,
+                strict_output_limit=False,
             )
             reply_limit = budget * 4
             stdout_bytes = proc.stdout.encode("utf-8", errors="replace")
             stderr_bytes = proc.stderr.encode("utf-8", errors="replace")
-            truncated = len(stdout_bytes) + len(stderr_bytes) > reply_limit
+            truncated = (
+                proc.stdout_truncated
+                or proc.stderr_truncated
+                or len(stdout_bytes) + len(stderr_bytes) > reply_limit
+            )
             err_budget = min(len(stderr_bytes), reply_limit // 2)
             out_budget = min(len(stdout_bytes), reply_limit - err_budget)
             err_budget = min(len(stderr_bytes), reply_limit - out_budget)
@@ -488,6 +514,15 @@ def call_tools_surface(
                     payload["result"] = json.loads(proc.stdout)
                 except json.JSONDecodeError:
                     pass
+            if name in COMPONENT_DESCRIPTIONS and proc.returncode not in (0, 2):
+                import diagnostic_support
+
+                diag = diagnostic_support.record_component_crash(
+                    component, argv, proc.returncode, proc.stderr,
+                    parsed_result=payload.get("result"), config=config, executable=cmd[0],
+                )
+                if diag is not None:
+                    payload["diagnostic"] = diag
             succeeded = proc.returncode == 0
             result = dict(
                 content=[dict(type="text", text=json.dumps(payload, ensure_ascii=False))],
@@ -497,15 +532,24 @@ def call_tools_surface(
         else:
             raise ValueError(f"unknown mindie-tools tool: {name}")
     except Exception as exc:
+        import diagnostic_support
+
+        err_struct = dict(error=str(exc), error_type=type(exc).__name__)
+        if diagnostic_support.is_internal_mcp_exception(exc):
+            err_struct["diagnostic"] = diagnostic_support.failure(
+                "mcp.tools", str(name or "dispatch"), "internal", exception=exc, config=config
+            )
         result = dict(
             content=[dict(type="text", text=f"{type(exc).__name__}: {exc}")],
-            structuredContent=dict(error=str(exc), error_type=type(exc).__name__),
+            structuredContent=err_struct,
             isError=True,
         )
 
     if bind_id is not None:
         try:
             finish_bind(bind_id, succeeded, config=config)
+        except TimeoutError:
+            raise
         except (OSError, sqlite3.Error) as exc:
             if succeeded:
                 result = _attach_accounting_warning(result, "bind_warning", exc)
@@ -521,8 +565,15 @@ def call_remote_surface(
 ) -> dict:
     os.environ.setdefault("MINDIE_DIAGNOSTICS_CONFIG", str(diagnostics_config_path(config)))
     raw_args = dict(arguments or {})
+    explicit_bind = raw_args.pop("_mindie_bind_id", None)
     try:
-        session, bind_id, _bound_cwd = _resolve_session("remote", name, raw_args, config=config)
+        session, bind_id, _bound_cwd = _resolve_session(
+            "remote",
+            name,
+            raw_args,
+            bind_id=explicit_bind if isinstance(explicit_bind, str) else None,
+            config=config,
+        )
     except Exception as exc:
         return _admission_failure(exc)
 
@@ -583,6 +634,8 @@ def call_remote_surface(
 
     try:
         receipt_store.finish(call_id, outcome)
+    except TimeoutError:
+        raise
     except (OSError, sqlite3.Error) as exc:
         if succeeded:
             result = _attach_accounting_warning(result, "receipt_warning", exc)
@@ -590,6 +643,8 @@ def call_remote_surface(
     if bind_id is not None:
         try:
             finish_bind(bind_id, succeeded, config=config)
+        except TimeoutError:
+            raise
         except (OSError, sqlite3.Error) as exc:
             if succeeded:
                 result = _attach_accounting_warning(result, "bind_warning", exc)
@@ -609,13 +664,22 @@ def handle_rpc(request: dict, surface: str, *, config=None, receipts: RemoteRece
         return dict(jsonrpc="2.0", id=req_id, result={})
     if method == "initialize":
         trigger_background_update_if_due(config=config)
+        manifest_file = plugin_root() / "plugin.json"
+        srv_ver = "0.1.0"
+        if manifest_file.is_file():
+            try:
+                srv_ver = str(read_json(manifest_file).get("version") or "0.1.0")
+            except TimeoutError:
+                raise
+            except (OSError, ValueError):
+                pass
         return dict(
             jsonrpc="2.0",
             id=req_id,
             result=dict(
                 protocolVersion=params.get("protocolVersion") or "2024-11-05",
                 capabilities=dict(tools=dict(listChanged=False)),
-                serverInfo=dict(name=f"mindie-oc-{surface}", version="0.1.0"),
+                serverInfo=dict(name=f"mindie-oc-{surface}", version=srv_ver),
             ),
         )
     if method == "tools/list":

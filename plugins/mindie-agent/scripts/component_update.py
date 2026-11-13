@@ -14,32 +14,34 @@ is verified.
 - Monotonic Component Floor: `discover()` selects `max(installed, baseline,
   latest_formal_release)` and never downgrades an already-installed newer
   component.
-- Atomic Profile Rebinding: `oc.json` and `oc.engine.json` are updated via
-  `atomic_write_json` (`os.replace()`) only after the candidate generation
-  passes `runtime_inventory` lock and VCS receipt verification.
-- Single-Instance Update Lock: concurrent background checks acquire
-  `oc-component-update.lock` without racing `oc.json` writes.
+- Candidate-First Atomic Switch: candidate source staging, contract validation,
+  runtime verification, `prepare()`, and generation-isolated `oc.engine.<gen>.json`
+  creation ALL complete before a single atomic `os.replace()` updates `oc.json`.
+  Any failure leaves the previously active `oc.json` and `engine_config` untouched.
+- Single-Instance Update Lock: concurrent checks serialize via `oc-component-update.lock`.
 - Never activates a session lease.
 
 [Timeouts & Locks]
-- Enclosing budget defaults to `540.0s`: `15.0s` metadata read, `120.0s` release
-  catalog discovery, `420.0s` `uv` runtime build with OS generation lock, and
-  `5.0s` cleanup reserve (`outer_timeout >= sum(inner_budgets) + cleanup_grace`).
+- Enclosing shared monotonic deadline defaults to `540.0s`: lock wait, `15.0s`
+  metadata read, `120.0s` release catalog discovery, `420.0s` `uv` runtime build
+  with OS generation lock, and `5.0s` cleanup reserve.
 
 [Side-Effect Policy]
-- Writes candidate runtime generations under `state_dir()/component-runtimes`
-  and atomically updates `oc.json` / `oc.engine.json` when a newer component
-  release or native plugin generation is activated.
+- Writes candidate runtime generations under `state_dir()/component-runtimes`,
+  generation engine configs under `config_home()/generations/`, and atomically
+  flips `oc.json` last when promoting a verified candidate.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -51,12 +53,15 @@ if str(HERE) not in sys.path:
 from bounded import run as bounded_run
 from oc_native_compat import ensure_oc_native_support
 from paths import (
+    admission_path,
     apply_enterprise_transport_env,
     atomic_write_json,
     community_config_path,
     config_path,
+    consent_path,
     data_home,
     engine_config_path,
+    installed_source_root,
     read_json,
     repo_root,
     state_dir,
@@ -101,6 +106,8 @@ def _update_lock(lock_file: Path, *, blocking_timeout: float = 0.0):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
                 break
+            except TimeoutError:
+                raise
             except OSError:
                 if time.monotonic() >= deadline:
                     break
@@ -118,6 +125,8 @@ def _update_lock(lock_file: Path, *, blocking_timeout: float = 0.0):
                     import fcntl
 
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
         handle.close()
@@ -143,6 +152,16 @@ def trigger_background_update_if_due(*, config: str | Path | None = None) -> boo
         atomic_write_json(status_file, {"checked_at": now, "status": "in_progress"})
         adapter = read_json(cfg_file)
         py_exe = adapter.get("python") or sys.executable
+        installed_root = installed_source_root()
+        target_script = (
+            installed_root / "plugins" / "mindie-agent" / "scripts" / "component_update.py"
+            if installed_root is not None
+            and (installed_root / "plugins" / "mindie-agent" / "scripts" / "component_update.py").is_file()
+            else Path(__file__).resolve()
+        )
+        argv = [str(py_exe), "-I", str(target_script), "--config", str(cfg_file), "--non-blocking"]
+        if installed_root is not None:
+            argv.extend(["--source", str(installed_root)])
         env = apply_enterprise_transport_env(dict(os.environ))
         kwargs: dict = dict(
             stdin=subprocess.DEVNULL,
@@ -159,11 +178,10 @@ def trigger_background_update_if_due(*, config: str | Path | None = None) -> boo
             )
         else:
             kwargs["start_new_session"] = True
-        subprocess.Popen(
-            [str(py_exe), "-I", str(Path(__file__).resolve()), "--config", str(cfg_file), "--non-blocking"],
-            **kwargs,
-        )
+        subprocess.Popen(argv, **kwargs)
         return True
+    except TimeoutError:
+        raise
     except Exception:
         return False
 
@@ -295,6 +313,115 @@ def _candidate_plugin_is_newer(candidate_source: Path, adapter: dict) -> bool:
     return active_ver is None or cand_ver > active_ver
 
 
+def _find_gitleaks_executable() -> str | None:
+    found = shutil.which("gitleaks")
+    if found:
+        return found
+    cache_dir = Path.home() / ".cache" / "mindie-agent" / "gitleaks"
+    if cache_dir.is_dir():
+        for candidate in sorted(cache_dir.rglob("gitleaks*"), reverse=True):
+            if candidate.is_file() and candidate.name in {"gitleaks", "gitleaks.exe"}:
+                return str(candidate.resolve())
+    return None
+
+
+def _write_generation_and_switch_profile(
+    *,
+    cfg_file: Path,
+    base_adapter: dict,
+    base_engine: dict,
+    target_source: Path,
+    target_python: str,
+    validation: dict,
+    artifact: dict | None,
+) -> Path:
+    """Write generation-isolated `oc.engine.<gen>.json` FIRST, then atomically flip `oc.json`."""
+    from mindie_knowledge.component_bindings import rebind_commands
+
+    sdir = Path(base_adapter["state_dir"]) if isinstance(base_adapter.get("state_dir"), str) else state_dir(cfg_file)
+    adm_file = (
+        Path(base_adapter["admission_path"])
+        if isinstance(base_adapter.get("admission_path"), str)
+        else admission_path(cfg_file)
+    )
+    comm_file = community_config_path(cfg_file)
+    data_root = data_home() / "domains"
+    sdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    scripts_dir = (target_source / "plugins/mindie-agent/scripts").resolve()
+    domain = str(base_adapter.get("domain") or "vllm-ascend")
+    gen_id = hashlib.sha256(
+        json.dumps(
+            {
+                "python": target_python,
+                "source_root": str(target_source),
+                "native_version": validation.get("native_version"),
+                "components": artifact.get("components") if isinstance(artifact, dict) else base_adapter.get("component_runtime"),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+    gen_eng_file = cfg_file.parent / "generations" / f"{cfg_file.stem}.engine.{gen_id}.json"
+    eng_payload = dict(
+        base_engine,
+        schema="mindie-engine-config/1",
+        harness="opencode",
+        domain=domain,
+        root=str(base_engine.get("root") or data_root),
+        state_dir=str(base_engine.get("state_dir") or (sdir / "engine")),
+        admission_path=str(adm_file),
+        community_config=str(comm_file),
+        settings_path=str(comm_file),
+        transcript_adapter=str(scripts_dir / "opencode_transcript.py"),
+        summary_command=[target_python, "-I", str(scripts_dir / "organizer.py")],
+        redactor_executable=base_engine.get("redactor_executable") or _find_gitleaks_executable(),
+        feeds=base_engine.get("feeds")
+        or [{"repository": "mindie-agent/knowledge-vllm-ascend", "ref": "main", "domain": domain, "interval_seconds": 300}],
+        product_validation=validation,
+    )
+    # Step 1: Write isolated candidate engine config BEFORE touching active `oc.json`.
+    atomic_write_json(gen_eng_file, eng_payload)
+
+    updated_adapter = dict(
+        base_adapter,
+        schema="mindie-adapter-config/1",
+        harness="opencode",
+        python=target_python,
+        runtime_scripts=str(scripts_dir),
+        source_root=str(target_source),
+        engine_config=str(gen_eng_file),
+        state_dir=str(sdir),
+        admission_path=str(adm_file),
+        domain=domain,
+        product_validation=validation,
+    )
+    if artifact is not None:
+        updated_adapter["component_runtime"] = artifact["components"]
+        if updated_adapter.get("component_commands"):
+            updated_adapter["component_commands"] = rebind_commands(
+                updated_adapter,
+                target_python,
+                artifact["components"]["runtime"],
+            )
+
+    # Step 2: Single atomic pointer switch! Readers of `oc.json` transition atomically
+    # to `(target_python, gen_eng_file, target_source)` with zero split-brain window.
+    atomic_write_json(cfg_file, updated_adapter)
+
+    # Best-effort legacy mirror for external callers reading `<stem>.engine.json` directly.
+    default_eng = cfg_file.with_name(cfg_file.stem + ".engine.json")
+    if default_eng != gen_eng_file:
+        try:
+            atomic_write_json(default_eng, eng_payload)
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+    return gen_eng_file
+
+
 def check(
     *,
     config: str | Path | None = None,
@@ -305,13 +432,28 @@ def check(
     timeout: float = 540.0,
 ) -> dict:
     apply_enterprise_transport_env()
-    from mindie_knowledge.component_bindings import rebind_commands
     from mindie_knowledge.component_runtime import read_inventory
-    from setup import ensure_default_profile
+    from setup import (
+        _write_initial_community_config,
+        ensure_runtime_python,
+        stage_source_baseline,
+        validate_contracts,
+    )
+
+    if timeout <= 0:
+        raise TimeoutError("OpenCode component update timeout must be positive")
+    deadline = time.monotonic() + float(timeout)
+
+    def remaining(reserve: float = 0.0) -> float:
+        avail = deadline - time.monotonic() - reserve
+        if avail <= 0:
+            raise TimeoutError("OpenCode component update exceeded its total budget")
+        return avail
 
     cfg_file = config_path(config)
     lock_file = data_home() / "oc-component-update.lock"
-    with _update_lock(lock_file, blocking_timeout=0.0 if non_blocking else 5.0) as acquired:
+    lock_wait = 0.0 if non_blocking else min(5.0, max(0.0, deadline - time.monotonic()))
+    with _update_lock(lock_file, blocking_timeout=lock_wait) as acquired:
         if not acquired:
             return dict(
                 schema="mindie-component-update/1",
@@ -320,64 +462,106 @@ def check(
                 needs_host_reload=False,
             )
 
-        native_promoted = False
-        candidate_checkout = Path(source).resolve() if source else HERE.parent.parent.parent.resolve()
+        candidate_checkout = (
+            Path(source).resolve()
+            if source is not None
+            else (installed_source_root() or HERE.parent.parent.parent.resolve())
+        )
         status_file = data_home() / "oc-component-update-status.json"
-        try:
-            if not cfg_file.is_file():
-                ensure_default_profile(config=cfg_file, source_root=candidate_checkout)
-                native_promoted = True
-            else:
-                existing_adapter = read_json(cfg_file)
-                if _candidate_plugin_is_newer(candidate_checkout, existing_adapter):
-                    ensure_default_profile(config=cfg_file, source_root=candidate_checkout)
-                    native_promoted = True
+        profile_existed = cfg_file.is_file()
+        existing_adapter = read_json(cfg_file) if profile_existed else {}
+        existing_eng_file = engine_config_path(cfg_file)
+        existing_engine = read_json(existing_eng_file) if existing_eng_file.is_file() else {}
+        native_candidate = (not profile_existed) or _candidate_plugin_is_newer(candidate_checkout, existing_adapter)
 
-            adapter = read_json(cfg_file)
-            eng_file = engine_config_path(cfg_file)
-            current_python = adapter.get("python") or sys.executable
+        try:
+            if native_candidate:
+                # Stage immutable candidate snapshot & validate contracts WITHOUT touching active `oc.json`.
+                target_source = stage_source_baseline(source_dir=candidate_checkout)
+                validation = validate_contracts(target_source)
+                base_python = ensure_runtime_python(
+                    source_root=target_source,
+                    python_exe=existing_adapter.get("python") if isinstance(existing_adapter.get("python"), str) else None,
+                    config=cfg_file,
+                    timeout=remaining(10.0),
+                )
+            else:
+                configured_sr = existing_adapter.get("source_root")
+                if (
+                    isinstance(configured_sr, str)
+                    and os.path.isabs(configured_sr)
+                    and (Path(configured_sr) / "pyproject.toml").is_file()
+                ):
+                    target_source = Path(configured_sr).resolve()
+                else:
+                    target_source = repo_root(cfg_file)
+                validation = validate_contracts(target_source)
+                base_python = str(existing_adapter.get("python") or sys.executable)
+
             artifact = prepare(
-                source=source or repo_root(cfg_file),
-                python=current_python,
+                source=target_source,
+                python=base_python,
                 config=cfg_file,
                 force=force,
-                timeout=timeout,
+                timeout=remaining(5.0),
             )
+
+            target_python = _norm_python_path(artifact["python"] if artifact is not None else base_python)
+            if artifact is not None or native_candidate:
+                active_eng_file = _write_generation_and_switch_profile(
+                    cfg_file=cfg_file,
+                    base_adapter=existing_adapter,
+                    base_engine=existing_engine,
+                    target_source=target_source,
+                    target_python=target_python,
+                    validation=validation,
+                    artifact=artifact,
+                )
+                comm_file = community_config_path(cfg_file)
+                if not comm_file.is_file():
+                    _write_initial_community_config(
+                        target_python,
+                        comm_file,
+                        dict(
+                            enabled=False,
+                            repository="mindie-agent/knowledge-vllm-ascend",
+                            project_roots=[],
+                            branch="main",
+                            idle_seconds=300,
+                            consent_config=str(consent_path(cfg_file).resolve()),
+                        ),
+                    )
+                status = "updated"
+            else:
+                active_eng_file = existing_eng_file
+                status = "up_to_date"
         except Exception as exc:
+            import diagnostic_support
+
+            diag = diagnostic_support.failure("component.update", "prepare", "update", exception=exc, config=cfg_file)
             try:
                 atomic_write_json(
                     status_file,
-                    {"checked_at": time.time(), "status": "failed", "error": f"{type(exc).__name__}: {exc}"},
+                    {
+                        "checked_at": time.time(),
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "diagnostic": diag,
+                    },
                 )
+            except TimeoutError:
+                raise
             except OSError:
                 pass
             raise
 
         if artifact is not None:
-            new_python = _norm_python_path(artifact["python"])
-            updated_adapter = dict(adapter)
-            updated_adapter["python"] = new_python
-            updated_adapter["component_runtime"] = artifact["components"]
-            if updated_adapter.get("component_commands"):
-                updated_adapter["component_commands"] = rebind_commands(
-                    updated_adapter,
-                    new_python,
-                    artifact["components"]["runtime"],
-                )
-            atomic_write_json(cfg_file, updated_adapter)
-            if eng_file.is_file():
-                eng_payload = read_json(eng_file)
-                scripts_dir = Path(updated_adapter.get("runtime_scripts") or HERE)
-                eng_payload["summary_command"] = [new_python, "-I", str(scripts_dir / "organizer.py")]
-                atomic_write_json(eng_file, eng_payload)
-            status = "updated"
-            active_python = new_python
             installed = artifact["installed"]
         else:
-            status = "updated" if native_promoted else "up_to_date"
-            active_python = _norm_python_path(current_python)
             try:
-                installed = read_inventory(active_python, timeout=15.0)
+                installed = read_inventory(target_python, timeout=min(15.0, remaining(0.0)))
+            except TimeoutError:
+                raise
             except Exception:
                 installed = {}
 
@@ -387,14 +571,16 @@ def check(
             harness="opencode",
             status=status,
             needs_host_reload=needs_reload,
-            python=active_python,
+            python=target_python,
             installed=installed,
         )
-        if sync_feeds and community_config_path(cfg_file).is_file() and eng_file.is_file():
+        if sync_feeds and community_config_path(cfg_file).is_file() and active_eng_file.is_file():
             try:
                 from mindie_knowledge.loop.cli import sync_feeds as run_sync_feeds
 
-                result["feed_sync"] = run_sync_feeds(str(eng_file))
+                result["feed_sync"] = run_sync_feeds(str(active_eng_file))
+            except TimeoutError:
+                raise
             except Exception as exc:
                 result["feed_sync_error"] = f"{type(exc).__name__}: {exc}"
         try:
@@ -404,9 +590,11 @@ def check(
                     "checked_at": time.time(),
                     "status": status,
                     "needs_host_reload": needs_reload,
-                    "python": active_python,
+                    "python": target_python,
                 },
             )
+        except TimeoutError:
+            raise
         except OSError:
             pass
         return result

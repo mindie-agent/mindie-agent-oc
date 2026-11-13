@@ -55,6 +55,7 @@ from paths import (
     data_home,
     diagnostics_config_path,
     engine_config_path,
+    installed_source_root,
     plugin_root,
     read_json,
     repo_root,
@@ -65,8 +66,10 @@ ensure_oc_native_support()
 
 BOOTSTRAP_TIMEOUT = 540.0
 _REPO_SLUG_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-_TEXT_SUFFIXES = {".py", ".mjs", ".cjs", ".js", ".json", ".md", ".toml", ".svg", ".txt", ".yml", ".yaml"}
-_BASELINE_ITEMS = ("package.json", "index.mjs", "pyproject.toml", "product-contract.json", "harness-compatibility.json", "plugins")
+_SEMVER_TUPLE_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
+_IFACE_ID_RE = re.compile(r"[a-z][a-z0-9_.-]{0,95}\Z")
+_TEXT_SUFFIXES = {".py", ".mjs", ".cjs", ".js", ".json", ".md", ".toml", ".lock", ".svg", ".txt", ".yml", ".yaml"}
+_BASELINE_ITEMS = ("package.json", "index.mjs", "pyproject.toml", "uv.lock", "product-contract.json", "harness-compatibility.json", "plugins")
 
 
 def _copy_lf_clean(src: Path, dst: Path) -> None:
@@ -78,7 +81,11 @@ def _copy_lf_clean(src: Path, dst: Path) -> None:
 
 
 def _discover_checkout_source(workspace_root: str | Path | None = None) -> Path | None:
-    candidates: list[Path] = [HERE.parent.parent.parent, plugin_root().parent.parent]
+    candidates: list[Path] = []
+    installed_root = installed_source_root()
+    if installed_root is not None:
+        candidates.append(installed_root)
+    candidates.extend([HERE.parent.parent.parent, plugin_root().parent.parent])
     if workspace_root is not None:
         ws = Path(workspace_root).expanduser()
         candidates.extend([ws, ws / "mindie-agent-oc"])
@@ -87,6 +94,8 @@ def _discover_checkout_source(workspace_root: str | Path | None = None) -> Path 
     for cand in candidates:
         try:
             resolved = cand.resolve()
+        except TimeoutError:
+            raise
         except OSError:
             continue
         if (resolved / "pyproject.toml").is_file() and (resolved / "product-contract.json").is_file():
@@ -228,7 +237,7 @@ def ensure_runtime_python(
     timeout: float = BOOTSTRAP_TIMEOUT,
 ) -> str:
     """Return an interpreter with MindIE runtime components installed, bootstrapping `oc-venv` if needed."""
-    from component_update import compatible_runtime
+    from component_update import _update_lock, compatible_runtime
 
     def verified(interpreter):
         return compatible_runtime(
@@ -255,19 +264,72 @@ def ensure_runtime_python(
     if uv is None:
         raise RuntimeError("uv is required to bootstrap the MindIE OpenCode runtime")
 
-    env = apply_enterprise_transport_env(dict(os.environ))
-    env["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
-    proc = bounded_run(
-        [uv, "sync", "--project", str(src_root), "--all-extras", "--no-dev", "--python", "3.13"],
-        "",
-        timeout=timeout,
-        max_output=256 * 1024,
-        env=env,
-    )
+    data_home().mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _update_lock(data_home() / "oc-bootstrap.lock", blocking_timeout=timeout) as locked:
+        if not locked:
+            raise TimeoutError("timed out waiting for concurrent oc-venv bootstrap lock")
+        if _probe_runtime_python(venv_py):
+            return verified(_norm_python_path(venv_py))
+        with tempfile.TemporaryDirectory(prefix=".oc-venv-build-", dir=data_home()) as tmp_build:
+            build_dir = Path(tmp_build)
+            _copy_lf_clean(src_root / "pyproject.toml", build_dir / "pyproject.toml")
+            has_lock = (src_root / "uv.lock").is_file()
+            if has_lock:
+                _copy_lf_clean(src_root / "uv.lock", build_dir / "uv.lock")
+            env = apply_enterprise_transport_env(dict(os.environ))
+            env["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
+            uv_argv = [uv, "sync", *(["--frozen"] if has_lock else [])]
+            uv_argv.extend(["--no-editable", "--no-install-project", "--project", str(build_dir), "--all-extras", "--no-dev", "--python", "3.13"])
+            proc = bounded_run(uv_argv, "", timeout=timeout, max_output=256 * 1024, env=env)
     if proc.returncode != 0 or not venv_py.is_file():
         detail = (proc.stderr or proc.stdout or "").strip()[-1000:]
         raise RuntimeError(f"uv sync failed while bootstrapping oc-venv (exit {proc.returncode}): {detail}")
     return verified(_norm_python_path(venv_py))
+
+
+def _parse_ver_key(raw: object) -> tuple[int, int, int, int, str]:
+    if not isinstance(raw, str):
+        raise ValueError("invalid version string in compatibility interval")
+    m = _SEMVER_TUPLE_RE.fullmatch(raw.strip())
+    if m is None:
+        raise ValueError(f"invalid semantic version in compatibility interval: {raw!r}")
+    pre = m.group(4) or ""
+    # In SemVer, prerelease < normal release (`0 < 1`).
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if pre else 1, pre)
+
+
+def _validate_intervals_local(value: object) -> list[tuple[tuple, tuple, bool, bool]]:
+    if not isinstance(value, list) or not (1 <= len(value) <= 32):
+        raise ValueError("compatibility supported intervals must be a non-empty list")
+    out: list[tuple[tuple, tuple, bool, bool]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"minimum", "maximum", "maximum_inclusive", "include_prerelease"}:
+            raise ValueError("invalid compatibility interval schema")
+        inc = item["maximum_inclusive"]
+        pre = item["include_prerelease"]
+        if type(inc) is not bool or type(pre) is not bool:
+            raise ValueError("compatibility interval flags must be booleans")
+        vmin = _parse_ver_key(item["minimum"])
+        vmax = _parse_ver_key(item["maximum"])
+        if vmin > vmax or (vmin == vmax and not inc):
+            raise ValueError("compatibility interval minimum exceeds maximum")
+        if (vmin[3] == 0 or vmax[3] == 0) and not pre:
+            raise ValueError("prerelease endpoint requires include_prerelease=true")
+        parsed_iv = (vmin, vmax, inc, pre)
+        if parsed_iv in out:
+            raise ValueError("duplicate compatibility interval")
+        out.append(parsed_iv)
+    return out
+
+
+def _interval_covers(bound: tuple[tuple, tuple, bool, bool], target: tuple[tuple, tuple, bool, bool]) -> bool:
+    bmin, bmax, binc, bpre = bound
+    tmin, tmax, tinc, tpre = target
+    return (
+        bmin <= tmin
+        and (bmax > tmax or (bmax == tmax and (binc or not tinc)))
+        and (bpre or not tpre)
+    )
 
 
 def validate_contracts(source_root: str | Path | None = None) -> dict:
@@ -275,13 +337,57 @@ def validate_contracts(source_root: str | Path | None = None) -> dict:
     contract = read_json(root / "product-contract.json")
     compat = read_json(root / "harness-compatibility.json")
     manifest = read_json(root / "plugins" / "mindie-agent" / "plugin.json")
-    if contract.get("native_version") != manifest.get("version"):
+    if contract.get("schema") != "mindie-product-contract/1" or contract.get("harness") != "opencode":
+        raise ValueError("product-contract.json schema or harness mismatch for opencode")
+    native_ver = contract.get("native_version")
+    if not isinstance(native_ver, str) or not re.fullmatch(r"\d+\.\d+\.\d+", native_ver):
+        raise ValueError("product-contract.json requires a formal SemVer native_version")
+    if native_ver != manifest.get("version"):
         raise ValueError("plugin.json version does not match product-contract.json native_version")
+    if compat.get("schema") != "mindie-harness-compatibility/1" or compat.get("harness") != "opencode":
+        raise ValueError("harness-compatibility.json schema or harness mismatch for opencode")
+
+    top_intervals = _validate_intervals_local(compat.get("supported"))
+    used_ifaces = compat.get("used_interfaces")
+    registry = compat.get("interface_registry")
+    if (
+        not isinstance(used_ifaces, list)
+        or not used_ifaces
+        or len(set(used_ifaces)) != len(used_ifaces)
+        or any(not isinstance(i, str) or not _IFACE_ID_RE.fullmatch(i) for i in used_ifaces)
+    ):
+        raise ValueError("harness-compatibility.json used_interfaces is invalid")
+    if not isinstance(registry, dict) or not registry:
+        raise ValueError("harness-compatibility.json interface_registry is empty or invalid")
+    declared_bounds: dict[str, list[tuple[tuple, tuple, bool, bool]]] = {}
+    for ident, entry in registry.items():
+        if not isinstance(ident, str) or not _IFACE_ID_RE.fullmatch(ident):
+            raise ValueError("invalid interface identifier in interface_registry")
+        if not isinstance(entry, dict) or set(entry) != {"supported", "code_paths", "test_ids", "evidence_refs"}:
+            raise ValueError(f"invalid interface_registry entry for {ident}")
+        declared_bounds[ident] = _validate_intervals_local(entry["supported"])
+        for field in ("code_paths", "test_ids", "evidence_refs"):
+            vals = entry[field]
+            if not isinstance(vals, list) or not vals or any(not isinstance(v, str) or not v.strip() for v in vals):
+                raise ValueError(f"interface_registry[{ident}].{field} must be non-empty strings")
+    for ident in used_ifaces:
+        if ident not in declared_bounds:
+            raise ValueError(f"used interface {ident!r} is missing from interface_registry")
+        for target_iv in top_intervals:
+            if not any(_interval_covers(b, target_iv) for b in declared_bounds[ident]):
+                raise ValueError(f"interface {ident!r} does not cover declared harness support interval")
+
+    if importlib.util.find_spec("mindie_knowledge") is not None:
+        ensure_oc_native_support()
+        from mindie_knowledge import releases
+
+        releases.validate_compatibility(compat, harness_name="opencode")
+
     return dict(
         schema="mindie-candidate-check/1",
         status="validated",
-        harness=compat.get("harness", "opencode"),
-        native_version=contract["native_version"],
+        harness="opencode",
+        native_version=native_ver,
     )
 
 
@@ -395,6 +501,9 @@ def ensure_default_profile(
                 consent_config=str(cfile.resolve()),
             ),
         )
+    from admission import flush_pending_cold_activations
+
+    flush_pending_cold_activations(interpreter, config=cfg_file)
     return adapter_payload
 
 
@@ -403,6 +512,8 @@ def _read_optional_json(path: Path) -> tuple[str, dict]:
         return "missing", {}
     try:
         return "ok", read_json(path)
+    except TimeoutError:
+        raise
     except FileNotFoundError:
         return "missing", {}
     except ValueError:
@@ -466,22 +577,31 @@ def _resolve_github_fork(repository: str, account: str | None) -> tuple[str | No
     if not gh:
         return account, None
     env = apply_enterprise_transport_env(dict(os.environ))
-    resolved_account = account
-    if not resolved_account:
-        proc = bounded_run([gh, "api", "--hostname", "github.com", "user", "--jq", ".login"], "", timeout=10.0, env=env)
-        login = (proc.stdout or "").strip()
-        if proc.returncode == 0 and login and "/" not in login and not any(c.isspace() for c in login):
-            resolved_account = login
+    user_proc = bounded_run([gh, "api", "--hostname", "github.com", "user", "--jq", ".login"], "", timeout=10.0, env=env)
+    auth_login = (user_proc.stdout or "").strip() if user_proc.returncode == 0 else ""
+    if "/" in auth_login or any(c.isspace() for c in auth_login):
+        auth_login = ""
+    resolved_account = account or (auth_login or None)
     if not resolved_account:
         return None, None
     candidate_fork = f"{resolved_account}/{repository.split('/', 1)[1]}"
-    probe = bounded_run(
-        [gh, "api", "--hostname", "github.com", f"repos/{candidate_fork}", "--jq", ".full_name"], "", timeout=10.0, env=env
-    )
-    if probe.returncode == 0 and (probe.stdout or "").strip():
-        return resolved_account, candidate_fork
-    fork_proc = bounded_run([gh, "repo", "fork", repository, "--clone=false"], "", timeout=15.0, env=env)
-    return resolved_account, (candidate_fork if fork_proc.returncode == 0 else None)
+    probe = bounded_run([gh, "api", "--hostname", "github.com", f"repos/{candidate_fork}", "--jq", ".full_name"], "", timeout=10.0, env=env)
+    probed_name = (probe.stdout or "").strip()
+    if probe.returncode == 0 and probed_name.lower() == candidate_fork.lower():
+        return resolved_account, probed_name
+    fork_cmd = [gh, "repo", "fork", repository, "--clone=false"]
+    if auth_login and resolved_account.lower() != auth_login.lower():
+        fork_cmd.extend(["--org", resolved_account])
+    elif not auth_login and account:
+        fork_cmd.extend(["--org", resolved_account])
+    fork_proc = bounded_run(fork_cmd, "", timeout=15.0, env=env)
+    if fork_proc.returncode != 0:
+        return resolved_account, None
+    verify = bounded_run([gh, "api", "--hostname", "github.com", f"repos/{candidate_fork}", "--jq", ".full_name"], "", timeout=10.0, env=env)
+    verified_name = (verify.stdout or "").strip()
+    if verify.returncode == 0 and verified_name.lower() == candidate_fork.lower():
+        return resolved_account, verified_name
+    return resolved_account, None
 
 
 def configure_community(
@@ -621,16 +741,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sharing" and not (args.status or args.enable or args.disable):
         parser.error("sharing requires one of --status, --enable, or --disable")
     if bool(getattr(args, "dry_run", False)):
-        return _emit_json(
-            {
-                "schema": "mindie-oc-setup/1",
-                "status": "dry-run",
-                "bootstrap": False,
-                "cmd": args.cmd,
-                "uv": shutil.which("uv"),
-                "gh": shutil.which("gh"),
-            }
-        )
+        return _emit_json({"schema": "mindie-oc-setup/1", "status": "dry-run", "bootstrap": False, "cmd": args.cmd, "uv": shutil.which("uv"), "gh": shutil.which("gh")})
     if args.cmd not in {"init", "sharing"}:
         parser.error("a command is required: init | sharing")
     if args.cmd == "sharing" and args.status:
@@ -644,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
         env = apply_enterprise_transport_env(dict(os.environ))
         env["_MINDIE_OC_SETUP_BOOTSTRAPPED"] = "1"
         env["MINDIE_OC_SOURCE_ROOT"] = str(staged_src)
-        run_kwargs: dict = {"env": env}
+        run_kwargs: dict = {"env": env, "timeout": 580.0}
         if os.name == "nt":
             run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         proc = subprocess.run([target_py, "-I", str(Path(__file__).resolve()), *incoming], **run_kwargs)
