@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Configure Git line endings and long paths
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install locked runtime and test dependencies
+        run: uv sync --locked --no-editable --no-install-project --extra test
+      - name: Enforce Unix LF line endings
+        run: uv run --no-sync python .github/scripts/check_lf_eol.py
+      - name: Contract, update, and continuity tests
+        run: uv run --no-sync python -m pytest -q -m "not live_npu and not live_opencode"
+      - name: JavaScript syntax and release metadata checks
+        run: |
+          node --check index.mjs
+          node --check plugins/mindie-agent/paths.mjs
+          node --check plugins/mindie-agent/opencode_host.mjs
+          uv run --no-sync python plugins/mindie-agent/scripts/release_metadata.py --source . --tests tests --revision "${{ github.sha }}" > "${{ runner.temp }}/mindie-plugin-release.json"

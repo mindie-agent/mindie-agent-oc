@@ -1,0 +1,6 @@
+# Activation & Capture Lifecycle in OpenCode
+
+- **Manual Entry Only**: Only an explicit `/mindie-agent` command or `/mindie-agent` / `$mindie-agent` prompt prefix in a top-level session (`!parentID && !forkSessionID`) grants `entry_enabled = 1` in `admission.sqlite3`.
+- **Session Context Isolation**: `session.hook("context")` injects `SKILL.md` strictly for sessions with an active manual lease, and `shell.hook("create.before")` binds `OPENCODE_SESSION_ID` only to shell commands initiated by that session. Subagents and sibling sessions do not inherit the lease.
+- **Deactivation**: `/mindie-agent deactivate` revokes the session's lease across all registered domains; deterministic MCP tools (`mindie-remote-dev`, `mindie-tools`) remain available.
+- **Turn-End `session.idle` Capture**: On `session.idle`, `capture_stop.py` checks `Admission.knowledge_lease(sessionID)`, community sharing consent (`mindie-community.json`), and project scope, projects public `user` and visible `assistant` text parts read-only (`?mode=ro`) from OpenCode's `opencode.db` into `<state_dir>/transcripts/<sessionID>.jsonl`, and hands off the turn receipt to `mindie_knowledge.loop.cli.capture_hook` without blocking the user.

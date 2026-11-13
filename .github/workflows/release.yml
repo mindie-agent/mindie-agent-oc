@@ -1,0 +1,32 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@484b80621aaf9293c559786d0ef2174c79a0dbb4
+    with:
+      benchmark-ref: 484b80621aaf9293c559786d0ef2174c79a0dbb4
+      release-notes-path: docs/releases/mindie-agent-oc-0.1.0.md
+      node: true
+      version-files: |
+        package.json
+        pyproject.toml
+        plugins/mindie-agent/plugin.json
+      setup-command: |
+        uv sync --locked --no-editable --no-install-project --extra test
+      test-command: |
+        .venv/bin/python .github/scripts/check_lf_eol.py
+        .venv/bin/python -m pytest -q -m "not live_npu and not live_opencode"
+        node --check index.mjs
+        node --check plugins/mindie-agent/paths.mjs
+        node --check plugins/mindie-agent/opencode_host.mjs
+      build-command: |
+        npm pack --pack-destination "$RELEASE_ASSETS_DIR"
+        git archive --format=tar.gz --prefix="mindie-agent-oc-$RELEASE_VERSION/" --output="$RELEASE_ASSETS_DIR/mindie-agent-oc-$RELEASE_VERSION.tar.gz" "$GITHUB_SHA"
+        .venv/bin/python plugins/mindie-agent/scripts/release_metadata.py --source . --tests tests --revision "$GITHUB_SHA" > "$RELEASE_ASSETS_DIR/mindie-plugin-release.json"

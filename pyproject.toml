@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mindie-agent-oc"
+version = "0.1.0"
+description = "OpenCode native harness plugin adapter for MindIE Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mindie-knowledge>=0.13.0",
+    "remote-dev>=0.11.0",
+    "mindie-diagnostics>=0.5.0",
+    "mindie-coordinator>=0.7.0",
+    "mindie-debugger>=0.1.0",
+    "mindie-profiler>=0.5.0",
+    "mindie-sim>=0.9.0",
+    "npu-top>=0.3.0",
+]
+
+[project.optional-dependencies]
+components = []
+test = [
+    "pytest>=8,<10",
+    "jsonschema>=4",
+]
+
+[tool.setuptools]
+py-modules = []
+
+[tool.uv.sources]
+mindie-knowledge = { git = "https://github.com/mindie-agent/knowledge", rev = "ac4a89e993c89deba5a4a629e1cd89d61e57c843" }
+remote-dev = { git = "https://github.com/mindie-agent/remote-dev", rev = "991ef7863b2b208f94f54a29db4ac5be50884ea3" }
+mindie-diagnostics = { git = "https://github.com/mindie-agent/diagnostics", rev = "40ce12019354c26ef9006c0d4abc6ffade96afbd" }
+mindie-coordinator = { git = "https://github.com/mindie-agent/coordinator", rev = "819b0deb7bea994d4dff9c009200a48dd9300cc4" }
+mindie-debugger = { git = "https://github.com/mindie-agent/debugger", rev = "e9406b2b178335190d5cb59dff4d6985894497ba" }
+mindie-profiler = { git = "https://github.com/mindie-agent/profiler", rev = "79d97e75bff7351b0472b93c03b072c1cf47f5e7" }
+mindie-sim = { git = "https://github.com/mindie-agent/sim", rev = "6f1d5a871a7b1ef20ff7a8cab33aaf4637fb3f66" }
+npu-top = { git = "https://github.com/mindie-agent/npu-top", rev = "8f0cb3ec66393812e90e118cd73704070c6027a2" }
+
+[tool.uv]
+override-dependencies = [
+    "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@ac4a89e993c89deba5a4a629e1cd89d61e57c843",
+    "remote-dev @ git+https://github.com/mindie-agent/remote-dev@991ef7863b2b208f94f54a29db4ac5be50884ea3",
+    "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@40ce12019354c26ef9006c0d4abc6ffade96afbd",
+    "mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@819b0deb7bea994d4dff9c009200a48dd9300cc4",
+    "mindie-debugger @ git+https://github.com/mindie-agent/debugger@e9406b2b178335190d5cb59dff4d6985894497ba",
+    "mindie-profiler @ git+https://github.com/mindie-agent/profiler@79d97e75bff7351b0472b93c03b072c1cf47f5e7",
+    "mindie-sim @ git+https://github.com/mindie-agent/sim@6f1d5a871a7b1ef20ff7a8cab33aaf4637fb3f66",
+    "npu-top @ git+https://github.com/mindie-agent/npu-top@8f0cb3ec66393812e90e118cd73704070c6027a2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live_npu: standing A2/A3 Ascend NPU non-destructive live integration",
+    "live_opencode: live OpenCode v2 CLI and model end-to-end integration",
+]

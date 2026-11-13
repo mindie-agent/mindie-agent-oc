@@ -1,0 +1,53 @@
+{
+  "name": "@mindie-agent/oc",
+  "version": "0.1.0",
+  "description": "OpenCode native harness plugin adapter for MindIE Agent: Ascend NPU remote-dev, deterministic profiling/simulation/coordination/debugging tools, and manual /mindie-agent L1-L4 knowledge flywheel.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "plugins/",
+    "docs/",
+    "pyproject.toml",
+    "uv.lock",
+    "product-contract.json",
+    "harness-compatibility.json",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mindie",
+    "opencode",
+    "opencode-plugin",
+    "ascend",
+    "npu",
+    "vllm-ascend",
+    "knowledge",
+    "remote-dev"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=0.0.0-0 <3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mindie-agent/mindie-agent-oc.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mindie-agent/mindie-agent-oc/issues"
+  },
+  "homepage": "https://github.com/mindie-agent/mindie-agent-oc#readme"
+}

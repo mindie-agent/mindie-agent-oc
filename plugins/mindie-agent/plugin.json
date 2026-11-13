@@ -1,0 +1,20 @@
+{
+  "name": "mindie-agent",
+  "displayName": "MindIE Agent for OpenCode",
+  "version": "0.1.0",
+  "description": "Ascend NPU & vLLM-Ascend engineering assistant for OpenCode: on-demand /mindie-agent L1-L4 knowledge flywheel, remote NPU development, profiling, roofline simulation, CANN/ACLGraph debugging, and cluster lease coordination.",
+  "author": {
+    "name": "MindIE Agent Team",
+    "url": "https://github.com/mindie-agent/mindie-agent"
+  },
+  "homepage": "https://github.com/mindie-agent/mindie-agent",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mindie-agent/mindie-agent-oc"
+  },
+  "suggestedPrompts": [
+    "/mindie-agent 排查 vLLM-Ascend 新模型 0-day Bring-up 精度偏差",
+    "/mindie-agent 分析昇腾 A3 910C Profiling 算子瓶颈与 Roofline 优化空间",
+    "探测远端昇腾集群空闲 NPU 卡并申请测试容器租约"
+  ]
+}

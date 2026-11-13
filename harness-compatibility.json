@@ -1,0 +1,224 @@
+{
+  "schema": "mindie-harness-compatibility/1",
+  "harness": "opencode",
+  "supported": [
+    {
+      "minimum": "2.2.0",
+      "maximum": "2.99.99",
+      "maximum_inclusive": true,
+      "include_prerelease": true
+    }
+  ],
+  "used_interfaces": [
+    "plugin.v2-setup",
+    "mcp.transform-local",
+    "command.transform",
+    "session.hook.prompt",
+    "session.hook.context",
+    "tool.hook.execute-before",
+    "shell.hook.create-before",
+    "event.session-idle",
+    "transcript.sqlite-v2-spool",
+    "generate.text-summary"
+  ],
+  "interface_registry": {
+    "plugin.v2-setup": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "index.mjs",
+        "plugins/mindie-agent/opencode_host.mjs"
+      ],
+      "test_ids": [
+        "tests/test_oc_plugin.py::test_plugin_manifests_and_opencode_v2_loading"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "mcp.transform-local": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/scripts/mcp_server.py:serve"
+      ],
+      "test_ids": [
+        "tests/test_oc_mcp_and_knowledge.py::test_public_mcp_excludes_knowledge_even_when_session_is_active",
+        "tests/test_oc_mcp_and_knowledge.py::test_receipt_honesty_preserves_succeeded_remote_result_on_local_sqlite_error"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "command.transform": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/scripts/bridge.py:handle_gesture"
+      ],
+      "test_ids": [
+        "tests/test_oc_lifecycle.py::test_explicit_mindie_agent_gesture_activates_and_deactivates_lease"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "session.hook.prompt": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/scripts/bridge.py:handle_gesture"
+      ],
+      "test_ids": [
+        "tests/test_oc_lifecycle.py::test_passive_ordinary_prompt_and_subagent_non_inheritance"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "session.hook.context": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs"
+      ],
+      "test_ids": [
+        "tests/test_oc_plugin.py::test_host_session_isolation_and_context_injection"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "tool.hook.execute-before": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/scripts/bridge.py:handle_pre_tool_use"
+      ],
+      "test_ids": [
+        "tests/test_oc_lifecycle.py::test_pre_tool_use_binds_mcp_call_and_rejects_replay"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "shell.hook.create-before": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs"
+      ],
+      "test_ids": [
+        "tests/test_oc_plugin.py::test_host_session_isolation_and_context_injection"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "event.session-idle": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/scripts/capture_stop.py:main"
+      ],
+      "test_ids": [
+        "tests/test_oc_lifecycle.py::test_stop_requires_manual_lease_and_spools_public_transcript"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "transcript.sqlite-v2-spool": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/scripts/opencode_transcript.py:read_material"
+      ],
+      "test_ids": [
+        "tests/test_oc_transcript_and_organizer.py::test_sqlite_v2_spool_and_public_transcript_filtering"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    },
+    "generate.text-summary": {
+      "supported": [
+        {
+          "minimum": "2.2.0",
+          "maximum": "2.99.99",
+          "maximum_inclusive": true,
+          "include_prerelease": true
+        }
+      ],
+      "code_paths": [
+        "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/scripts/organizer.py:execute_request"
+      ],
+      "test_ids": [
+        "tests/test_oc_transcript_and_organizer.py::test_organizer_loopback_and_outcome_unknown_no_retry"
+      ],
+      "evidence_refs": [
+        "AGENTS.md"
+      ]
+    }
+  }
+}
