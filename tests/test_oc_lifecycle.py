@@ -234,6 +234,45 @@ def test_stop_requires_manual_lease_and_spools_public_transcript(
 
     monkeypatch.setattr(loop_cli, "capture_hook", _fake_capture_hook)
 
+    # 3. Pre-activation messages (from _seed_opencode_v2_db, timestamp 1700000000100) must NOT be spooled!
+    pre_auth_receipt = handle_stop(
+        {
+            "sessionID": "ses_capture01",
+            "eventID": "evt_idle_pre",
+            "opencodeDb": str(db_file),
+        }
+    )
+    assert pre_auth_receipt == {"stage": "inert", "reason": "transcript_unavailable"}
+    assert len(captured_calls) == 0
+
+    # 4. Append a post-authorization turn (`now_ms`) and verify only authorized public text is spooled.
+    import time as _time
+
+    now_ms = int(_time.time() * 1000) + 100
+    with sqlite3.connect(db_file) as db:
+        db.execute(
+            "INSERT INTO session_message VALUES (?, ?, 2, 'user', ?, ?, ?)",
+            ("msg_u2", "ses_capture01", now_ms, now_ms, json.dumps({"time": {"created": now_ms}, "text": "Verify post-auth ACL 507015"})),
+        )
+        db.execute(
+            "INSERT INTO session_message VALUES (?, ?, 3, 'assistant', ?, ?, ?)",
+            (
+                "msg_a2",
+                "ses_capture01",
+                now_ms + 10,
+                now_ms + 20,
+                json.dumps(
+                    {
+                        "time": {"created": now_ms + 10, "completed": now_ms + 20},
+                        "content": [
+                            {"type": "reasoning", "text": "internal chain of thought"},
+                            {"type": "text", "text": "ACL error 507015 indicates a kernel execution failure."},
+                        ],
+                    }
+                ),
+            ),
+        )
+
     receipt = handle_stop(
         {
             "sessionID": "ses_capture01",
@@ -250,4 +289,5 @@ def test_stop_requires_manual_lease_and_spools_public_transcript(
     assert spool_file.is_file()
     spool_text = spool_file.read_text(encoding="utf-8")
     assert "ACL error 507015" in spool_text
+    assert "How do I decode ACL 507015?" not in spool_text
     assert "internal chain of thought" not in spool_text

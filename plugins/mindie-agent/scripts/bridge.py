@@ -28,8 +28,11 @@ MCP bind table (`mcp-binds.sqlite3`), and turn-end transcript capture.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
+import time
 
 from admission import activate, deactivate, knowledge_lease, status_facts
 from component_update import trigger_background_update_if_due
@@ -42,7 +45,14 @@ from identity import (
     session_from_hook,
     workspace_from_hook,
 )
-from paths import config_path, plugin_root
+from paths import (
+    apply_enterprise_transport_env,
+    atomic_write_json,
+    config_path,
+    data_home,
+    plugin_root,
+    read_json,
+)
 
 
 def _emit(payload: dict) -> int:
@@ -81,6 +91,50 @@ def handle_session_state(event: dict | None = None, *, config=None) -> dict:
         rsi_loop=str(scripts_dir / "rsi_loop.py"),
         experiment_ledger=str(scripts_dir / "experiment_ledger.py"),
     )
+
+
+def _spawn_background_bootstrap(cfg_file: Path, workspace_root: str | Path | None) -> bool:
+    """Spawn a detached long-budget `setup.py init` outside the 10s hook window."""
+    status_file = data_home() / "oc-bootstrap-status.json"
+    now = time.time()
+    if status_file.is_file():
+        try:
+            existing = read_json(status_file)
+            started_at = float(existing.get("started_at") or 0.0)
+            if existing.get("status") == "in_progress" and (now - started_at) < 560.0:
+                return True
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
+            pass
+    try:
+        atomic_write_json(status_file, {"started_at": now, "status": "in_progress", "config": str(cfg_file)})
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+
+    setup_py = Path(__file__).resolve().parent / "setup.py"
+    argv = [sys.executable, "-I", str(setup_py), "init", "--config", str(cfg_file)]
+    if workspace_root:
+        argv.extend(["--workspace-root", str(workspace_root)])
+    env = apply_enterprise_transport_env(dict(os.environ))
+    kwargs: dict = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        env=env,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(argv, **kwargs)
+    return True
 
 
 def handle_gesture(event: dict | None = None, *, config=None) -> dict:
@@ -143,24 +197,39 @@ def handle_gesture(event: dict | None = None, *, config=None) -> dict:
         )
 
     task_prompt = "" if first == "activate" and len(tokens) == 1 else remainder
+    # Activate the manual session lease FIRST (< 5ms SQLite WAL write) so cold-start
+    # runtime provisioning can never prevent or outlive the hook deadline.
+    lease_info = activate(session, workspace_root, config=config)
+
     cfg_file = config_path(config)
     readiness_warning = ""
-    degraded = False
+    bootstrapping = False
     if not cfg_file.is_file():
         try:
-            from setup import ensure_default_profile
+            from setup import _current_python_has_runtime, _discover_existing_mindie_python, ensure_default_profile
 
-            ensure_default_profile(config=cfg_file, workspace_root=workspace_root)
+            ready_py = (
+                sys.executable
+                if _current_python_has_runtime()
+                else _discover_existing_mindie_python()
+            )
+            if ready_py is not None:
+                ensure_default_profile(config=cfg_file, workspace_root=workspace_root, python_exe=str(ready_py))
+            else:
+                bootstrapping = _spawn_background_bootstrap(cfg_file, workspace_root)
+                lease_info["status"] = "bootstrapping"
+                readiness_warning = (
+                    " Note: first-time MindIE runtime bootstrap (`oc-venv`) has started in the background; "
+                    "MCP catalogs will refresh automatically once ready."
+                )
+        except TimeoutError:
+            raise
         except Exception as exc:
-            degraded = True
+            lease_info["status"] = "degraded"
             readiness_warning = (
                 f" Note: default profile initialization degraded ({type(exc).__name__}); "
                 "the session lease remains active."
             )
-
-    lease_info = activate(session, workspace_root, config=config)
-    if degraded:
-        lease_info["status"] = "degraded"
 
     scripts_dir = Path(__file__).resolve().parent
     skill_path = plugin_root() / "skills" / "mindie-agent" / "SKILL.md"
@@ -175,6 +244,7 @@ def handle_gesture(event: dict | None = None, *, config=None) -> dict:
         matched=True,
         activated=True,
         eligible=True,
+        bootstrapping=bootstrapping,
         action="activate",
         session_id=session,
         project_root=lease_info["project_root"],

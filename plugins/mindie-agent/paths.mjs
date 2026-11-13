@@ -71,24 +71,44 @@ export function stateDir(explicitConfig = null) {
     return path.join(dataHome(), "oc-state");
 }
 
+export function admissionPath(explicitConfig = null) {
+    const cfg = configPath(explicitConfig);
+    const data = readJsonSafe(cfg);
+    if (data && typeof data.admission_path === "string" && path.isAbsolute(data.admission_path)) {
+        return data.admission_path;
+    }
+    return path.join(stateDir(explicitConfig), "admission.sqlite3");
+}
+
 export function summaryEndpointPath(explicitConfig = null) {
     return path.join(stateDir(explicitConfig), "summary-endpoint.json");
 }
 
-export function opencodeDbPath() {
+export function opencodeDbPath(explicitConfig = null) {
     const explicit = process.env.MINDIE_OPENCODE_DB;
     if (explicit && path.isAbsolute(explicit)) {
         return path.resolve(explicit);
     }
-    const xdgData = process.env.XDG_DATA_HOME;
-    if (xdgData && path.isAbsolute(xdgData)) {
-        return path.join(path.resolve(xdgData), "opencode", "opencode.db");
+    const cfg = readJsonSafe(configPath(explicitConfig));
+    if (cfg && typeof cfg.opencode_db === "string" && path.isAbsolute(cfg.opencode_db)) {
+        return path.resolve(cfg.opencode_db);
     }
-    const testHome = process.env.OPENCODE_TEST_HOME;
-    const homeDir = testHome && path.isAbsolute(testHome)
-        ? path.resolve(testHome)
-        : os.homedir();
-    return path.join(path.resolve(homeDir, ".local", "share"), "opencode", "opencode.db");
+    const xdgData = process.env.XDG_DATA_HOME;
+    let baseDir;
+    if (xdgData && path.isAbsolute(xdgData)) {
+        baseDir = path.join(path.resolve(xdgData), "opencode");
+    } else {
+        const testHome = process.env.OPENCODE_TEST_HOME;
+        const homeDir = testHome && path.isAbsolute(testHome)
+            ? path.resolve(testHome)
+            : os.homedir();
+        baseDir = path.join(path.resolve(homeDir, ".local", "share"), "opencode");
+    }
+    const nativeEnvDb = process.env.OPENCODE_DB;
+    if (typeof nativeEnvDb === "string" && nativeEnvDb.trim() && nativeEnvDb.trim() !== ":memory:") {
+        return path.resolve(baseDir, nativeEnvDb.trim());
+    }
+    return path.join(baseDir, "opencode.db");
 }
 
 export function atomicWriteJson(targetPath, payload) {

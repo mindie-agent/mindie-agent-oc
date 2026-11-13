@@ -29,6 +29,7 @@ import ast
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -82,7 +83,7 @@ def _copy_plugin_checkout(dst: Path, *, version: str) -> Path:
     contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8", newline="\n")
 
     pyproject_path = dst / "pyproject.toml"
-    txt = pyproject_path.read_text(encoding="utf-8").replace('version = "0.1.0"', f'version = "{version}"', 1)
+    txt = re.sub(r'(?m)^version = "[^"]+"$', f'version = "{version}"', pyproject_path.read_text(encoding="utf-8"), count=1)
     pyproject_path.write_text(txt, encoding="utf-8", newline="\n")
     return dst
 
@@ -403,6 +404,7 @@ def test_release_metadata_validates_interface_registry_and_ast_tests() -> None:
     assert checked["harness"] == "opencode"
     assert len(checked["used_interfaces"]) == 10
     payload = release_metadata.metadata(REPO_ROOT, "a" * 40)
+    expected_version = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))["version"]
     assert payload["schema"] == "mindie-plugin-release/1"
-    assert payload["version"] == "0.1.0"
+    assert payload["version"] == expected_version
     assert payload["compatibility"]["harness"] == "opencode"

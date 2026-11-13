@@ -1,7 +1,7 @@
 {
   "name": "mindie-agent",
   "displayName": "MindIE Agent for OpenCode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ascend NPU & vLLM-Ascend engineering assistant for OpenCode: on-demand /mindie-agent L1-L4 knowledge flywheel, remote NPU development, profiling, roofline simulation, CANN/ACLGraph debugging, and cluster lease coordination.",
   "author": {
     "name": "MindIE Agent Team",

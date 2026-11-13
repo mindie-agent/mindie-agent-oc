@@ -15,6 +15,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import {
+    admissionPath,
     atomicWriteJson,
     configPath,
     dataHome,
@@ -28,8 +29,17 @@ import {
 
 const GESTURE_PREFIX_RE = /^\s*(?:\/mindie-agent(?::mindie-agent)?|\$mindie-agent(?::mindie-agent)?)(?=\s|$)/;
 const MCP_WIRE_RE = /^(?:mcp[_:])?(?:mindie[-_]agent[-_:])?(mindie[-_]remote[-_]dev|mindie[-_]tools)[_:]([A-Za-z0-9_.-]+)$/;
+const SHELL_TOKEN_INLINE_RE = /\r?\n# __mindie_oc_sid:([0-9a-f]{24})(?=$|['"\s])/;
+const TERMINAL_SESSION_EVENTS = new Set([
+    "session.execution.succeeded",
+    "session.execution.failed",
+    "session.execution.interrupted",
+    "session.idle",
+]);
 const HOOK_NODE_TIMEOUT_MS = 10500;
+const MAX_HOOK_STDOUT_BYTES = 1024 * 1024;
 const SHELL_QUEUE_TTL_MS = 30000;
+const CAPTURE_COALESCE_MS = 250;
 const BG_UPGRADE_BACKOFF_MS = 60000;
 const MAX_SUMMARY_BODY_BYTES = 512 * 1024;
 const FORWARDED_ENV_KEYS = [
@@ -38,11 +48,13 @@ const FORWARDED_ENV_KEYS = [
     "MINDIE_AGENT_CONFIG",
     "MINDIE_DIAGNOSTICS_ROOT",
     "MINDIE_OPENCODE_DB",
+    "MINDIE_OC_INSTALLED_ROOT",
     "MINDIE_OC_PYTHON",
     "MINDIE_OC_BIN",
     "MINDIE_SUMMARY_MODEL",
     "MINDIE_SUMMARY_ENDPOINT",
     "MINDIE_SUMMARY_TOKEN",
+    "OPENCODE_DB",
     "OPENCODE_TEST_HOME",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
@@ -66,12 +78,24 @@ function isNewerSemver(candidate, active) {
     return false;
 }
 
+function resolveInstalledCheckoutRoot() {
+    const explicit = process.env.MINDIE_OC_INSTALLED_ROOT;
+    if (explicit && path.isAbsolute(explicit)) {
+        const resolved = path.resolve(explicit);
+        if (fs.existsSync(path.join(resolved, "plugins", "mindie-agent", "plugin.json"))) {
+            return resolved;
+        }
+    }
+    return path.resolve(pluginRoot(), "..", "..");
+}
+
 function maybeTriggerBackgroundPluginSync() {
     if (process.env.MINDIE_CONFIG_HOME && process.env.MINDIE_OC_ALLOW_BG_UPDATE !== "1") {
         return false;
     }
     try {
-        const manifest = readJsonSafe(path.join(pluginRoot(), "plugin.json"));
+        const installedRoot = resolveInstalledCheckoutRoot();
+        const manifest = readJsonSafe(path.join(installedRoot, "plugins", "mindie-agent", "plugin.json"));
         const cfgFile = configPath();
         const activeCfg = readJsonSafe(cfgFile);
         const pluginVer = manifest?.version;
@@ -87,9 +111,12 @@ function maybeTriggerBackgroundPluginSync() {
         }
         atomicWriteJson(statusFile, { checked_at: nowSec, status: "in_progress" });
         const py = resolveBootstrapPython();
-        const updatePy = path.join(pluginRoot(), "scripts", "component_update.py");
-        const child = spawn(py, ["-I", updatePy, "--config", cfgFile, "--non-blocking"], {
-            env: { ...process.env, ...buildMindieEnv() },
+        const candUpdatePy = path.join(installedRoot, "plugins", "mindie-agent", "scripts", "component_update.py");
+        const updatePy = fs.existsSync(candUpdatePy)
+            ? candUpdatePy
+            : path.join(pluginRoot(), "scripts", "component_update.py");
+        const child = spawn(py, ["-I", updatePy, "--config", cfgFile, "--source", installedRoot, "--non-blocking"], {
+            env: { ...process.env, ...buildMindieEnv(), MINDIE_OC_INSTALLED_ROOT: installedRoot },
             stdio: ["ignore", "ignore", "ignore"],
             windowsHide: true,
             detached: process.platform !== "win32",
@@ -116,8 +143,9 @@ function buildMindieEnv() {
     return env;
 }
 
-function admissionMtimeSignature() {
-    const base = path.join(stateDir(), "admission.sqlite3");
+function admissionMtimeSignature(sessionID = null) {
+    const base = admissionPath();
+    let sig = null;
     try {
         const mainStat = fs.statSync(base);
         let walMtime = 0;
@@ -126,9 +154,32 @@ function admissionMtimeSignature() {
         } catch {
             walMtime = 0;
         }
-        return `${mainStat.mtimeMs}:${walMtime}`;
+        sig = `${mainStat.mtimeMs}:${walMtime}`;
     } catch {
-        return null;
+        sig = null;
+    }
+    if (typeof sessionID === "string" && sessionID.length > 0 && !sessionID.includes("/") && !sessionID.includes("\\")) {
+        try {
+            const pStat = fs.statSync(path.join(stateDir(), "pending-activations", `${sessionID}.json`));
+            return `${sig || "0"}:p${pStat.mtimeMs}`;
+        } catch {}
+    }
+    return sig;
+}
+
+function killHookTree(child) {
+    if (process.platform !== "win32" && typeof child?.pid === "number" && child.pid > 0) {
+        try {
+            process.kill(-child.pid, "SIGKILL");
+            return;
+        } catch {
+            // Fall through to direct child kill.
+        }
+    }
+    try {
+        child.kill("SIGKILL");
+    } catch {
+        // Process already exited.
     }
 }
 
@@ -141,18 +192,16 @@ function runHook(op, payload) {
             env: childEnv,
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
+            detached: process.platform !== "win32",
         });
         let stdout = "";
+        let stdoutOverflow = false;
         let stderr = "";
         let settled = false;
         const timer = setTimeout(() => {
             if (settled) return;
             settled = true;
-            try {
-                child.kill("SIGKILL");
-            } catch {
-                // Process already exited.
-            }
+            killHookTree(child);
             reject(new Error(`MindIE OpenCode hook '${op}' timed out after ${HOOK_NODE_TIMEOUT_MS}ms`));
         }, HOOK_NODE_TIMEOUT_MS);
         if (typeof timer.unref === "function") {
@@ -161,7 +210,11 @@ function runHook(op, payload) {
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
         child.stdout.on("data", (chunk) => {
-            stdout += chunk;
+            if (stdout.length + chunk.length <= MAX_HOOK_STDOUT_BYTES) {
+                stdout += chunk;
+            } else {
+                stdoutOverflow = true;
+            }
         });
         child.stderr.on("data", (chunk) => {
             if (stderr.length < 8192) stderr += chunk;
@@ -180,6 +233,10 @@ function runHook(op, payload) {
                 reject(new Error(`MindIE OpenCode hook '${op}' exited with ${code}: ${stderr.trim() || stdout.trim()}`));
                 return;
             }
+            if (stdoutOverflow) {
+                reject(new Error(`MindIE OpenCode hook '${op}' exceeded ${MAX_HOOK_STDOUT_BYTES} stdout byte cap`));
+                return;
+            }
             try {
                 const line = stdout.trim();
                 resolve(line ? JSON.parse(line) : {});
@@ -195,17 +252,13 @@ function runHook(op, payload) {
 function spawnDetachedCapture(payload) {
     const py = resolveBootstrapPython();
     const capturePy = path.join(pluginRoot(), "scripts", "capture_stop.py");
-    const child = spawn(py, ["-I", capturePy], {
+    const child = spawn(py, ["-I", capturePy, "--event-json", JSON.stringify(payload ?? {})], {
         env: { ...process.env, ...buildMindieEnv() },
-        stdio: ["pipe", "ignore", "ignore"],
+        stdio: "ignore",
         windowsHide: true,
         detached: process.platform !== "win32",
     });
     child.on("error", () => {});
-    if (child.stdin) {
-        child.stdin.on("error", () => {});
-        child.stdin.end(JSON.stringify(payload));
-    }
     child.unref();
 }
 
@@ -267,6 +320,8 @@ export default {
         let summaryServerPromise = null;
         const sessionStateCache = new Map();
         const pendingShellQueue = [];
+        const pendingShellTokens = new Map();
+        const recentCaptureBySession = new Map();
 
         const defaultDirectory = () =>
             ctx?.location?.directory || ctx?.location?.worktree || process.cwd();
@@ -360,7 +415,10 @@ export default {
         }
 
         // 1. Register deterministic MCP surfaces (`mindie-remote-dev` & `mindie-tools`).
-        if (ctx?.mcp && typeof ctx.mcp.transform === "function") {
+        async function refreshMcpSurfaces() {
+            if (disposed || !ctx?.mcp || typeof ctx.mcp.transform !== "function") {
+                return;
+            }
             const py = resolveBootstrapPython();
             const launchPy = path.join(pluginRoot(), "scripts", "mindie_launch.py");
             const mcpEnv = buildMindieEnv();
@@ -383,6 +441,34 @@ export default {
                 await ctx.mcp.reload();
             }
         }
+
+        let bootstrapPollTimer = null;
+        function watchBootstrapReady() {
+            if (disposed || bootstrapPollTimer) return;
+            const startedAt = Date.now();
+            const cfgFile = configPath();
+            bootstrapPollTimer = setInterval(async () => {
+                if (disposed || Date.now() - startedAt > 560000) {
+                    clearInterval(bootstrapPollTimer);
+                    bootstrapPollTimer = null;
+                    return;
+                }
+                if (fs.existsSync(cfgFile)) {
+                    clearInterval(bootstrapPollTimer);
+                    bootstrapPollTimer = null;
+                    try {
+                        await refreshMcpSurfaces();
+                    } catch {
+                        // Ignore reload error during shutdown.
+                    }
+                }
+            }, 1500);
+            if (typeof bootstrapPollTimer.unref === "function") {
+                bootstrapPollTimer.unref();
+            }
+        }
+
+        await refreshMcpSurfaces();
         maybeTriggerBackgroundPluginSync();
 
         // 2. Register `/mindie-agent` native slash command.
@@ -409,6 +495,7 @@ export default {
                         sessionStateCache.delete(sessionID);
                         if (res.activated) {
                             await ensureSummaryServer();
+                            if (res.bootstrapping) watchBootstrapReady();
                         }
                         if (res.action === "activate" && typeof res.task_prompt === "string" && res.task_prompt.trim()) {
                             await ctx.session.prompt({
@@ -454,6 +541,7 @@ export default {
                 }
                 if (res.activated) {
                     await ensureSummaryServer();
+                    if (res.bootstrapping) watchBootstrapReady();
                 }
                 if (typeof res.task_prompt === "string" && res.task_prompt.trim()) {
                     prompt.text = res.task_prompt;
@@ -464,7 +552,7 @@ export default {
 
             // 4. Session context hook: inject `SKILL.md` strictly into activated sessions.
             ctx.session.hook("context", async ({ sessionID, system }) => {
-                const sig = admissionMtimeSignature();
+                const sig = admissionMtimeSignature(sessionID);
                 if (sig === null) {
                     sessionStateCache.clear();
                     return;
@@ -505,32 +593,76 @@ export default {
             ctx.tool.hook("execute.before", async ({ tool, sessionID, id, input }) => {
                 if (typeof tool === "string" && MCP_WIRE_RE.test(tool)) {
                     const info = await safeGetSession(ctx, sessionID);
-                    await runHook("pre-tool-use", {
+                    if (input && typeof input === "object" && !Array.isArray(input)) {
+                        try {
+                            delete input._mindie_bind_id;
+                        } catch {}
+                    }
+                    const cleanInput =
+                        input && typeof input === "object" && !Array.isArray(input) ? { ...input } : {};
+                    delete cleanInput._mindie_bind_id;
+                    const res = await runHook("pre-tool-use", {
                         sessionID,
                         id,
                         tool,
-                        input,
+                        input: cleanInput,
                         directory: info?.directory || defaultDirectory(),
                     });
+                    if (
+                        res?.bound &&
+                        typeof res.bind_id === "string" &&
+                        input &&
+                        typeof input === "object" &&
+                        !Array.isArray(input) &&
+                        Object.isExtensible(input)
+                    ) {
+                        input._mindie_bind_id = res.bind_id;
+                    }
                     return;
                 }
-                if (typeof sessionID === "string" && typeof input?.command === "string") {
+                if (typeof sessionID === "string" && input && typeof input === "object" && typeof input.command === "string") {
                     const now = Date.now();
+                    for (const [tok, meta] of pendingShellTokens.entries()) {
+                        if (meta.expiresAt <= now) {
+                            pendingShellTokens.delete(tok);
+                        }
+                    }
                     while (pendingShellQueue.length > 0 && pendingShellQueue[0].expiresAt <= now) {
                         pendingShellQueue.shift();
                     }
-                    pendingShellQueue.push({
-                        command: input.command,
-                        sessionID,
-                        expiresAt: now + SHELL_QUEUE_TTL_MS,
-                    });
+                    const origCmd = input.command;
+                    const token = crypto.randomBytes(12).toString("hex");
+                    const expiresAt = now + SHELL_QUEUE_TTL_MS;
+                    pendingShellTokens.set(token, { sessionID, command: origCmd, expiresAt });
+                    pendingShellQueue.push({ token, command: origCmd, sessionID, expiresAt });
+                    if (Object.isExtensible(input)) {
+                        try {
+                            input.command = `${origCmd}\n# __mindie_oc_sid:${token}`;
+                        } catch {
+                            // Frozen input property; unambiguous queue fallback remains active.
+                        }
+                    }
+                }
+            });
+
+            ctx.tool.hook("execute.after", ({ input }) => {
+                if (input && typeof input === "object" && typeof input.command === "string") {
+                    const m = SHELL_TOKEN_INLINE_RE.exec(input.command);
+                    if (m && Object.isExtensible(input)) {
+                        try {
+                            input.command = input.command.replace(SHELL_TOKEN_INLINE_RE, "");
+                        } catch {
+                            // Ignore read-only command field.
+                        }
+                    }
                 }
             });
         }
 
         // 6. Shell hook: inject `OPENCODE_SESSION_ID` into session-scoped child shells.
         if (ctx?.shell && typeof ctx.shell.hook === "function") {
-            ctx.shell.hook("create.before", ({ command, env }) => {
+            ctx.shell.hook("create.before", (shellInit) => {
+                const env = shellInit?.env;
                 if (!env || typeof env !== "object") {
                     return;
                 }
@@ -541,62 +673,100 @@ export default {
                     }
                 }
                 const now = Date.now();
+                for (const [tok, meta] of pendingShellTokens.entries()) {
+                    if (meta.expiresAt <= now) {
+                        pendingShellTokens.delete(tok);
+                    }
+                }
                 while (pendingShellQueue.length > 0 && pendingShellQueue[0].expiresAt <= now) {
                     pendingShellQueue.shift();
                 }
-                let idx = pendingShellQueue.findIndex(
-                    (item) =>
-                        item.command === command ||
-                        (typeof command === "string" &&
-                            item.command.length > 0 &&
-                            (command.includes(item.command) || item.command.includes(command))),
-                );
-                if (idx < 0 && pendingShellQueue.length > 0) {
-                    const distinctSessions = new Set(pendingShellQueue.map((item) => item.sessionID));
-                    if (distinctSessions.size === 1) {
-                        idx = 0;
+
+                const rawCommand = typeof shellInit.command === "string" ? shellInit.command : "";
+                const tokenMatch = SHELL_TOKEN_INLINE_RE.exec(rawCommand);
+                if (tokenMatch) {
+                    shellInit.command = rawCommand.replace(SHELL_TOKEN_INLINE_RE, "");
+                    const token = tokenMatch[1];
+                    const entry = pendingShellTokens.get(token);
+                    pendingShellTokens.delete(token);
+                    const qIdx = pendingShellQueue.findIndex((item) => item.token === token);
+                    if (qIdx >= 0) {
+                        pendingShellQueue.splice(qIdx, 1);
+                    }
+                    if (entry && entry.expiresAt > now) {
+                        env.OPENCODE_SESSION_ID = entry.sessionID;
+                    } else {
+                        delete env.OPENCODE_SESSION_ID;
+                    }
+                    return;
+                }
+
+                // Fallback for non-mutating test harnesses: bind only when command matches a single session unambiguously.
+                const matchingIndices = [];
+                for (let i = 0; i < pendingShellQueue.length; i += 1) {
+                    const cand = pendingShellQueue[i].command;
+                    if (cand === rawCommand || (cand.length > 0 && rawCommand.includes(cand))) {
+                        matchingIndices.push(i);
                     }
                 }
-                if (idx >= 0) {
-                    const [matched] = pendingShellQueue.splice(idx, 1);
+                const distinctSessions = new Set(matchingIndices.map((i) => pendingShellQueue[i].sessionID));
+                if (distinctSessions.size === 1) {
+                    const [matched] = pendingShellQueue.splice(matchingIndices[0], 1);
+                    pendingShellTokens.delete(matched.token);
                     env.OPENCODE_SESSION_ID = matched.sessionID;
+                } else {
+                    delete env.OPENCODE_SESSION_ID;
                 }
             });
         }
 
-        // 7. Event stream subscription: detached turn-end capture on `session.idle`.
+        // 7. Event stream subscription: await subscription setup synchronously so zero standalone turn events race startup.
         if (ctx?.event && typeof ctx.event.subscribe === "function") {
-            (async () => {
-                try {
-                    const stream = await ctx.event.subscribe();
-                    if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
-                        return;
-                    }
-                    for await (const event of stream) {
-                        if (disposed) {
-                            break;
-                        }
-                        if (event?.type === "session.idle") {
-                            const sessionID = event?.data?.sessionID;
-                            if (typeof sessionID === "string" && admissionMtimeSignature() !== null) {
-                                spawnDetachedCapture({
-                                    sessionID,
-                                    eventID: event.id || `${sessionID}:idle:${Date.now()}`,
-                                    opencodeDb: opencodeDbPath(),
-                                });
+            let stream = null;
+            try {
+                stream = await ctx.event.subscribe();
+            } catch {
+                stream = null;
+            }
+            if (stream && typeof stream[Symbol.asyncIterator] === "function") {
+                (async () => {
+                    try {
+                        for await (const event of stream) {
+                            if (disposed) break;
+                            const evType = event?.type;
+                            if (!TERMINAL_SESSION_EVENTS.has(evType)) continue;
+                            if (evType === "session.execution.interrupted" && event?.data?.reason === "shutdown") continue;
+                            const sessionID = event?.data?.sessionID ?? event?.properties?.sessionID;
+                            if (typeof sessionID !== "string" || admissionMtimeSignature(sessionID) === null) continue;
+                            const now = Date.now();
+                            const explicitId = typeof event?.id === "string" && event.id ? event.id : null;
+                            const prev = recentCaptureBySession.get(sessionID);
+                            if (prev && ((explicitId && prev.eventID === explicitId) || now - prev.at < CAPTURE_COALESCE_MS)) continue;
+                            const eventID = explicitId || `${sessionID}:${evType}:${now}`;
+                            recentCaptureBySession.set(sessionID, { eventID, at: now });
+                            if (recentCaptureBySession.size > 256) {
+                                const oldestKey = recentCaptureBySession.keys().next().value;
+                                if (oldestKey !== undefined) recentCaptureBySession.delete(oldestKey);
                             }
+                            spawnDetachedCapture({ sessionID, eventID, eventType: evType, opencodeDb: opencodeDbPath() });
                         }
+                    } catch {
+                        // Stream closed on host shutdown.
                     }
-                } catch {
-                    // Stream closed on host shutdown.
-                }
-            })();
+                })();
+            }
         }
 
         return async () => {
             disposed = true;
+            if (bootstrapPollTimer) {
+                clearInterval(bootstrapPollTimer);
+                bootstrapPollTimer = null;
+            }
             sessionStateCache.clear();
             pendingShellQueue.length = 0;
+            pendingShellTokens.clear();
+            recentCaptureBySession.clear();
             if (summaryServer) {
                 try {
                     summaryServer.server.close();

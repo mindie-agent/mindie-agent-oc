@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -51,9 +52,50 @@ if str(HERE) not in sys.path:
 
 from bounded import run as bounded_run
 from oc_native_compat import ensure_oc_native_support
-from paths import opencode_cli_bin, state_dir
+from paths import opencode_cli_bin, opencode_db_path, state_dir
 
 ensure_oc_native_support()
+
+_JSONC_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*[\s\S]*?\*/')
+
+
+def _loads_jsonc(raw_text: str) -> object:
+    cleaned = _JSONC_TOKEN_RE.sub(lambda m: m.group(0) if m.group(0).startswith('"') else "", raw_text)
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+    return json.loads(cleaned)
+
+
+def _seed_scratch_opencode_auth_db(src_db: Path, dst_db: Path) -> None:
+    if not src_db.is_file():
+        return
+    try:
+        src = sqlite3.connect(f"file:{src_db.resolve().as_posix()}?mode=ro", uri=True, timeout=2.0)
+        try:
+            ddl_rows = src.execute(
+                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END"
+            ).fetchall()
+            dst_db.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            dst = sqlite3.connect(str(dst_db), timeout=2.0)
+            try:
+                with dst:
+                    for (ddl,) in ddl_rows:
+                        dst.execute(ddl)
+                    for tbl in ("migration", "credential", "account", "account_state", "control_account"):
+                        if src.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (tbl,)).fetchone():
+                            rows = src.execute(f'SELECT * FROM "{tbl}"').fetchall()
+                            if rows:
+                                ph = ",".join("?" for _ in rows[0])
+                                dst.executemany(f'INSERT INTO "{tbl}" VALUES ({ph})', rows)
+            finally:
+                dst.close()
+            os.chmod(dst_db, 0o600)
+        finally:
+            src.close()
+    except TimeoutError:
+        raise
+    except (OSError, sqlite3.Error):
+        pass
 
 SUMMARY_MODEL = os.environ.get("MINDIE_SUMMARY_MODEL") or "default"
 SUMMARY_EFFORT = "low"
@@ -123,6 +165,8 @@ def _resolve_endpoint() -> dict | None:
             data = json.loads(ep_file.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("url"), str):
                 return data
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             return None
     return None
@@ -173,6 +217,7 @@ class NativeSummaryModel:
                     if ("127.0.0.1" in url or "localhost" in url)
                     else urllib.request.build_opener()
                 )
+                refused_stale_ep = False
                 try:
                     self.transmitted = True
                     with opener.open(req, timeout=budget) as resp:
@@ -182,23 +227,33 @@ class NativeSummaryModel:
                 except urllib.error.URLError as exc:
                     if isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
                         self.transmitted = False
-                        raise NativeStartError("summary endpoint connection refused") from exc
-                    raise TimeoutError("summary endpoint request failed after transmission") from exc
+                        if os.environ.get("MINDIE_SUMMARY_ENDPOINT") or opencode_cli_bin() is None:
+                            raise NativeStartError("summary endpoint connection refused") from exc
+                        try:
+                            (state_dir() / "summary-endpoint.json").unlink(missing_ok=True)
+                        except TimeoutError:
+                            raise
+                        except OSError:
+                            pass
+                        refused_stale_ep = True
+                    else:
+                        raise TimeoutError("summary endpoint request failed after transmission") from exc
 
-                envelope = json.loads(raw_bytes.decode("utf-8"))
-                if not isinstance(envelope, dict):
-                    raise summarizer.SummaryResultError("invalid endpoint response", reason="result_json_invalid")
-                if isinstance(envelope.get("usage"), dict):
-                    self.usage = summarizer.clean_usage(envelope["usage"])
-                    self.usage_known = True
-                text = envelope.get("result")
-                if isinstance(text, dict):
-                    text = json.dumps(text, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-                if not isinstance(text, str) or not text.strip():
-                    raise summarizer.SummaryResultError("empty summary response", reason="result_json_invalid")
-                cleaned = _strip_code_fence(text)
-                self.raw_result = cleaned
-                return cleaned
+                if not refused_stale_ep:
+                    envelope = json.loads(raw_bytes.decode("utf-8"))
+                    if not isinstance(envelope, dict):
+                        raise summarizer.SummaryResultError("invalid endpoint response", reason="result_json_invalid")
+                    if isinstance(envelope.get("usage"), dict):
+                        self.usage = summarizer.clean_usage(envelope["usage"])
+                        self.usage_known = True
+                    text = envelope.get("result")
+                    if isinstance(text, dict):
+                        text = json.dumps(text, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                    if not isinstance(text, str) or not text.strip():
+                        raise summarizer.SummaryResultError("empty summary response", reason="result_json_invalid")
+                    cleaned = _strip_code_fence(text)
+                    self.raw_result = cleaned
+                    return cleaned
 
             cli_bin = opencode_cli_bin()
             if cli_bin is None:
@@ -206,16 +261,64 @@ class NativeSummaryModel:
 
             scratch_cfg = Path(directory) / "xdg-config"
             scratch_state = Path(directory) / "xdg-state"
-            (scratch_cfg / "opencode").mkdir(parents=True, exist_ok=True)
-            scratch_state.mkdir(parents=True, exist_ok=True)
+            scratch_data = Path(directory) / "xdg-data"
+            scratch_cache = Path(directory) / "xdg-cache"
+            (scratch_cfg / "opencode").mkdir(mode=0o700, parents=True, exist_ok=True)
+            (scratch_data / "opencode").mkdir(mode=0o700, parents=True, exist_ok=True)
+            scratch_state.mkdir(mode=0o700, parents=True, exist_ok=True)
+            scratch_cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+            # Copy read-only provider/auth settings into the ephemeral scratch profile
+            # without touching or inheriting the host OpenCode SQLite database or plugins.
+            scratch_oc_cfg: dict = {"plugin": []}
+            orig_cfg_base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+            for cfg_name in ("opencode.json", "opencode.jsonc"):
+                orig_oc_cfg = orig_cfg_base / "opencode" / cfg_name
+                if orig_oc_cfg.is_file():
+                    try:
+                        parsed_orig = _loads_jsonc(orig_oc_cfg.read_text(encoding="utf-8"))
+                        if isinstance(parsed_orig, dict):
+                            for k in ("provider", "model", "small_model"):
+                                if k in parsed_orig:
+                                    scratch_oc_cfg[k] = parsed_orig[k]
+                        break
+                    except TimeoutError:
+                        raise
+                    except (OSError, ValueError):
+                        pass
             (scratch_cfg / "opencode" / "opencode.json").write_text(
-                json.dumps({"plugin": []}, indent=2) + "\n",
+                json.dumps(scratch_oc_cfg, indent=2) + "\n",
                 encoding="utf-8",
             )
+
+            orig_data_base = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+            orig_auth = orig_data_base / "opencode" / "auth.json"
+            if orig_auth.is_file():
+                try:
+                    dst_auth = scratch_data / "opencode" / "auth.json"
+                    shutil.copyfile(orig_auth, dst_auth)
+                    os.chmod(dst_auth, 0o600)
+                except TimeoutError:
+                    raise
+                except OSError:
+                    pass
+            _seed_scratch_opencode_auth_db(opencode_db_path(), scratch_data / "opencode" / "opencode.db")
+
             env = dict(os.environ)
+            for inherited_key in (
+                "OPENCODE_CONFIG",
+                "OPENCODE_CONFIG_DIR",
+                "OPENCODE_CONFIG_CONTENT",
+                "OPENCODE_SESSION_ID",
+                "MINDIE_OPENCODE_DB",
+            ):
+                env.pop(inherited_key, None)
             env["PWD"] = str(directory)
             env["XDG_CONFIG_HOME"] = str(scratch_cfg)
             env["XDG_STATE_HOME"] = str(scratch_state)
+            env["XDG_DATA_HOME"] = str(scratch_data)
+            env["XDG_CACHE_HOME"] = str(scratch_cache)
+            env["OPENCODE_DB"] = str(scratch_data / "opencode" / "opencode.db")
 
             full_prompt = (
                 f"{prompt_text}\n\n"
@@ -247,6 +350,8 @@ class NativeSummaryModel:
             if not core_owned:
                 try:
                     shutil.rmtree(directory)
+                except TimeoutError:
+                    raise
                 except OSError:
                     self.cleanup_failed = True
 
@@ -282,7 +387,7 @@ def execute_request(request: dict) -> dict:
             from mindie_knowledge.graded import distill
 
             prompt = distill.build_prompt(request)
-            schema = distill.decision_schema(request)
+            schema = distill.decision_schema()
             raw = model._call_once(prompt, schema)
             decision = distill.parse_validate_result(raw, request)
             return summarizer.outcome(

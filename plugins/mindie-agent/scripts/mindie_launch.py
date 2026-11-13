@@ -105,6 +105,15 @@ def _reexec_stdio(stream):
         return subprocess.DEVNULL
 
 
+def _parse_semver(raw: object) -> tuple[int, int, int] | None:
+    if not isinstance(raw, str):
+        return None
+    parts = raw.strip().lstrip("v").split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
 def main(argv: list[str] | None = None) -> int:
     apply_enterprise_transport_env()
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -113,30 +122,34 @@ def main(argv: list[str] | None = None) -> int:
 
     target_py = _preferred_python()
     target_script = Path(__file__).resolve()
+    local_manifest = target_script.parent.parent / "plugin.json"
+    local_ver = _parse_semver(read_json(local_manifest).get("version")) if local_manifest.is_file() else None
     if argv[0] in {"hook", "mcp"} and config_path().is_file():
         active = read_json(config_path())
         active_python = active.get("python")
         active_scripts = active.get("runtime_scripts")
         validation = active.get("product_validation") or {}
         expected_version = validation.get("native_version")
+        expected_ver_tuple = _parse_semver(expected_version)
         retained = active.get("source_root")
         directories = [Path(retained) / "plugins/mindie-agent/scripts"] if isinstance(retained, str) else []
         if isinstance(active_scripts, str):
             directories.append(Path(active_scripts))
         if isinstance(active_python, str) and Path(active_python).is_file():
-            for directory in directories:
-                manifest = directory.parent / "plugin.json"
-                paired_script = directory / "mindie_launch.py"
-                if (
-                    manifest.is_file()
-                    and paired_script.is_file()
-                    and read_json(manifest).get("version") == expected_version
-                ):
-                    target_py = str(_norm_python_path(active_python))
-                    target_script = paired_script.resolve()
-                    break
-            else:
-                raise RuntimeError("active plugin payload does not match its recorded version")
+            target_py = str(_norm_python_path(active_python))
+            if local_ver is None or (expected_ver_tuple is not None and expected_ver_tuple >= local_ver):
+                for directory in directories:
+                    manifest = directory.parent / "plugin.json"
+                    paired_script = directory / "mindie_launch.py"
+                    if (
+                        manifest.is_file()
+                        and paired_script.is_file()
+                        and read_json(manifest).get("version") == expected_version
+                    ):
+                        target_script = paired_script.resolve()
+                        break
+                else:
+                    raise RuntimeError("active plugin payload does not match its recorded version")
 
     if (
         not os.environ.get("_MINDIE_OC_REEXEC")

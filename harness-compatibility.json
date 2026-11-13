@@ -175,7 +175,8 @@
         "plugins/mindie-agent/scripts/capture_stop.py:main"
       ],
       "test_ids": [
-        "tests/test_oc_lifecycle.py::test_stop_requires_manual_lease_and_spools_public_transcript"
+        "tests/test_oc_lifecycle.py::test_stop_requires_manual_lease_and_spools_public_transcript",
+        "tests/test_oc_audit_regressions.py::test_concurrent_same_args_mcp_binds_and_shell_commands_never_cross_bind"
       ],
       "evidence_refs": [
         "AGENTS.md"
@@ -191,10 +192,12 @@
         }
       ],
       "code_paths": [
+        "plugins/mindie-agent/scripts/opencode_spool.py:sync_session_spool",
         "plugins/mindie-agent/scripts/opencode_transcript.py:read_material"
       ],
       "test_ids": [
-        "tests/test_oc_transcript_and_organizer.py::test_sqlite_v2_spool_and_public_transcript_filtering"
+        "tests/test_oc_transcript_and_organizer.py::test_sqlite_v2_spool_and_public_transcript_filtering",
+        "tests/test_oc_audit_regressions.py::test_real_transcript_capture_ingest_and_oversize_messages"
       ],
       "evidence_refs": [
         "AGENTS.md"

@@ -182,6 +182,15 @@ def transcript_spool_dir(config: str | Path | None = None) -> Path:
     return state_dir(config) / "transcripts"
 
 
+def installed_source_root() -> Path | None:
+    explicit = os.environ.get("MINDIE_OC_INSTALLED_ROOT")
+    if explicit and os.path.isabs(explicit):
+        cand = Path(explicit).resolve()
+        if (cand / "pyproject.toml").is_file() and (cand / "plugins/mindie-agent/plugin.json").is_file():
+            return cand
+    return None
+
+
 def opencode_db_path(config: str | Path | None = None) -> Path:
     """Return OpenCode v2's SQLite database path for strictly read-only inspection."""
     explicit = os.environ.get("MINDIE_OPENCODE_DB")
@@ -193,16 +202,21 @@ def opencode_db_path(config: str | Path | None = None) -> Path:
             custom = data.get("opencode_db")
             if isinstance(custom, str) and os.path.isabs(custom):
                 return Path(custom).resolve()
-        except ValueError:
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
             pass
     xdg_data = os.environ.get("XDG_DATA_HOME")
     if xdg_data and os.path.isabs(xdg_data):
-        base = Path(xdg_data).resolve()
+        base = Path(xdg_data).resolve() / "opencode"
     else:
         test_home = os.environ.get("OPENCODE_TEST_HOME")
         home_dir = Path(test_home).resolve() if (test_home and os.path.isabs(test_home)) else Path.home().resolve()
-        base = home_dir / ".local" / "share"
-    return base / "opencode" / "opencode.db"
+        base = home_dir / ".local" / "share" / "opencode"
+    native_db = os.environ.get("OPENCODE_DB")
+    if isinstance(native_db, str) and native_db.strip() and native_db.strip() != ":memory:":
+        return (base / native_db.strip()).resolve()
+    return base / "opencode.db"
 
 
 def opencode_cli_bin() -> str | None:
@@ -253,6 +267,8 @@ def atomic_write_json(path: str | Path, payload: dict) -> Path:
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)
+        except TimeoutError:
+            raise
         except OSError:
             pass
         raise

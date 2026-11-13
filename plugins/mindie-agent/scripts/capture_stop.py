@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detached OpenCode (`oc`) `session.idle` turn-end capture handoff helper.
+"""Detached OpenCode (`oc`) turn-end (`session.execution.*` / `session.idle`) capture helper.
 
 [Role]
 Verifies manual session lease eligibility, projects any newly appended public
@@ -76,18 +76,19 @@ def append_log(value: dict, *, config=None) -> None:
         )
 
 
-def _allows_community_capture(project_root: str, *, config=None) -> tuple[bool, str]:
+def _allows_community_capture(project_root: str, *, config=None) -> tuple[bool, str, float]:
     from mindie_knowledge.loop import settings as settings_mod
 
     comm_file = community_config_path(config)
     if not comm_file.is_file():
-        return False, "community_unconfigured"
+        return False, "community_unconfigured", 0.0
     settings = settings_mod.load(comm_file)
     if not settings.allows_capture():
-        return False, settings.capture_block_kind() or "disabled"
+        return False, settings.capture_block_kind() or "disabled", 0.0
     if not settings.in_scope(project_root):
-        return False, "out_of_scope"
-    return True, "ok"
+        return False, "out_of_scope", 0.0
+    enabled_at = float(settings.enabled_at) if isinstance(getattr(settings, "enabled_at", None), (int, float)) else 0.0
+    return True, "ok", enabled_at
 
 
 def capture_event(event: dict, *, config=None) -> dict:
@@ -106,9 +107,15 @@ def capture_event(event: dict, *, config=None) -> dict:
     if not config_path(config).is_file() or not engine_config_path(config).is_file():
         return dict(stage="inert", reason="profile_unconfigured")
 
-    allowed, block_reason = _allows_community_capture(lease["project_root"], config=config)
+    allowed, block_reason, enabled_at = _allows_community_capture(lease["project_root"], config=config)
     if not allowed:
         return dict(stage="inert", reason=block_reason)
+
+    activated_at = lease.get("activated_at")
+    auth_boundary = max(
+        enabled_at,
+        float(activated_at) if isinstance(activated_at, (int, float)) else 0.0,
+    )
 
     explicit_transcript = event.get("transcriptPath") or event.get("transcript_path")
     if isinstance(explicit_transcript, str) and os.path.isabs(explicit_transcript) and Path(explicit_transcript).is_file():
@@ -117,7 +124,15 @@ def capture_event(event: dict, *, config=None) -> dict:
         db_candidate = event.get("opencodeDb") or event.get("opencode_db")
         db_file = Path(db_candidate) if (isinstance(db_candidate, str) and os.path.isabs(db_candidate)) else opencode_db_path(config)
         try:
-            synced = sync_session_spool(session, db_path=db_file, spool_dir=transcript_spool_dir(config))
+            synced = sync_session_spool(
+                session,
+                db_path=db_file,
+                spool_dir=transcript_spool_dir(config),
+                not_before=auth_boundary if auth_boundary > 0 else None,
+                private_paths=(str(lease.get("project_root") or ""), str(Path.home())),
+            )
+        except TimeoutError:
+            raise
         except ValueError:
             return dict(stage="inert", reason="subagent_or_forked")
         if synced is None:
@@ -141,10 +156,14 @@ def capture_event(event: dict, *, config=None) -> dict:
     return receipt if isinstance(receipt, dict) else dict(stage="accepted")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     started = time.time()
+    args = list(sys.argv[1:] if argv is None else argv)
     try:
-        raw = sys.stdin.buffer.read(MAX_INPUT + 1)
+        if len(args) >= 2 and args[0] == "--event-json":
+            raw = args[1].encode("utf-8", errors="replace")
+        else:
+            raw = sys.stdin.buffer.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
             raise ValueError("capture envelope exceeds 512 KiB limit")
         event = json.loads(raw.decode("utf-8")) if raw.strip() else {}

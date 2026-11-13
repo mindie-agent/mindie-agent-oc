@@ -1,13 +1,14 @@
 """[Role] Measure repeatable OpenCode v2 SQLite public-transcript spool & parse latency.
-[Invariants] Assert reasoning/tool/synthetic sanitization before reporting latency; no productivity claim.
+[Invariants] Assert reasoning/tool/synthetic/ignored sanitization before reporting latency; no productivity claim.
 [Timeouts & Locks] Bounded in-tempdir SQLite iterations; zero network or background services.
-[Side-Effect Policy] Temporary synthetic SQLite DB, spool file, and explicit result JSON only.
+[Side-Effect Policy] Temporary synthetic SQLite DB, spool files, and explicit result JSON only.
 """
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -76,27 +77,56 @@ with tempfile.TemporaryDirectory(prefix="mindie-oc-bench-") as tmp:
                     "INSERT INTO session_part VALUES (?, ?, 1, 'tool', ?, ?, ?)",
                     (msg_id, SESSION_ID, ts, ts, json.dumps({"tool": "bash", "output": "HIDDEN_TOOL_SENTINEL"})),
                 )
+            else:
+                conn.execute(
+                    "INSERT INTO session_part VALUES (?, ?, 0, 'text', ?, ?, ?)",
+                    (
+                        msg_id,
+                        SESSION_ID,
+                        ts,
+                        ts,
+                        json.dumps({"text": "HIDDEN_SYNTHETIC_SENTINEL", "synthetic": True}),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO session_part VALUES (?, ?, 1, 'text', ?, ?, ?)",
+                    (
+                        msg_id,
+                        SESSION_ID,
+                        ts,
+                        ts,
+                        json.dumps({"text": "HIDDEN_IGNORED_SENTINEL", "ignored": True}),
+                    ),
+                )
             conn.execute(
                 "INSERT INTO session_part VALUES (?, ?, 2, 'text', ?, ?, ?)",
                 (msg_id, SESSION_ID, ts, ts, json.dumps({"text": f"Public Ascend ACLGraph observation {i}"})),
             )
         conn.commit()
 
-    spool_file = opencode_transcript.sync_session_spool(SESSION_ID, db_path=db_path, spool_dir=spool_dir)
-    assert spool_file is not None and spool_file.is_file()
-    raw_spool = spool_file.read_text(encoding="utf-8")
-    assert "HIDDEN_REASONING_SENTINEL" not in raw_spool
-    assert "HIDDEN_TOOL_SENTINEL" not in raw_spool
-
-    iterations = 100
+    iterations = 50
     started = time.perf_counter()
+    spool_file: Path | None = None
     result: dict = {}
     for _ in range(iterations):
+        if spool_dir.exists():
+            shutil.rmtree(spool_dir)
+        spool_file = opencode_transcript.sync_session_spool(SESSION_ID, db_path=db_path, spool_dir=spool_dir)
+        assert spool_file is not None
         result = opencode_transcript.read_material(str(spool_file), 0, session_id=SESSION_ID)
     elapsed = time.perf_counter() - started
+
+    assert spool_file is not None and spool_file.is_file()
+    raw_spool = spool_file.read_text(encoding="utf-8")
     assert result.get("status") == "ok" and "observation 99" in result.get("text", "")
-    assert "HIDDEN_REASONING_SENTINEL" not in result["text"]
-    assert "HIDDEN_TOOL_SENTINEL" not in result["text"]
+    for sentinel in (
+        "HIDDEN_REASONING_SENTINEL",
+        "HIDDEN_TOOL_SENTINEL",
+        "HIDDEN_SYNTHETIC_SENTINEL",
+        "HIDDEN_IGNORED_SENTINEL",
+    ):
+        assert sentinel not in raw_spool
+        assert sentinel not in result["text"]
 
 Path(os.environ["MINDIE_BENCH_RESULT_PATH"]).write_text(
     json.dumps(
