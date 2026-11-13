@@ -103,6 +103,10 @@ def test_real_transcript_capture_ingest_and_oversize_messages(isolated_oc_env: d
 
     eng_cfg = paths.read_json(paths.engine_config_path())
     redactor_exe = eng_cfg.get("redactor_executable")
+    if not redactor_exe:
+        from mindie_knowledge.loop.transcript_redaction import install_scanner
+
+        redactor_exe = install_scanner(isolated_oc_env["root"] / "gitleaks-cache")
     store = Store(isolated_oc_env["mindie_data"] / "domains" / "vllm-ascend", domain="vllm-ascend")
     try:
         engine = Engine(
@@ -114,46 +118,35 @@ def test_real_transcript_capture_ingest_and_oversize_messages(isolated_oc_env: d
             redactor_executable=redactor_exe,
             summary_command=[sys.executable, "-I", str(REPO_ROOT / "plugins/mindie-agent/scripts/organizer.py")],
         )
-        if not redactor_exe:
-            import mindie_knowledge.materials.ingest as ingest_mod
+        cap = engine.capture(session_id=session_id, turn_id="turn_real_01", transcript_path=str(spool_file), harness="opencode")
+        assert cap["status"] in {"queued", "pending"}
+        for _ in range(4):
+            due = store.due_capture()
+            if not due:
+                break
+            engine._process(due)
 
-            orig_redact = ingest_mod.redact_increment
-            ingest_mod.redact_increment = lambda text, **kw: (text, [], kw.get("state") or {})
-        else:
-            orig_redact = None
-        try:
-            cap = engine.capture(session_id=session_id, turn_id="turn_real_01", transcript_path=str(spool_file), harness="opencode")
-            assert cap["status"] in {"queued", "pending"}
-            for _ in range(4):
-                due = store.due_capture()
-                if not due:
-                    break
-                engine._process(due)
+        rows = store.db.execute("SELECT status, detail FROM captures WHERE id=?", (cap["id"],)).fetchall()
+        assert rows and rows[0][0] in {"succeeded", "organized", "captured"}, f"unexpected capture state: {[(r[0], r[1]) for r in rows]}"
 
-            rows = store.db.execute("SELECT status, detail FROM captures WHERE id=?", (cap["id"],)).fetchall()
-            assert rows and rows[0][0] in {"succeeded", "organized", "captured"}, f"unexpected capture state: {rows}"
+        stream_rows = store.db.execute("SELECT entry_id, source_cursor FROM material_streams").fetchall()
+        assert len(stream_rows) == 1
+        entry_id, finish_offset = stream_rows[0]
+        assert int(finish_offset) == spool_file.stat().st_size
+        exported = store.materials.export_task(entry_id, source="draft")["files"]
+        combined = "".join(exported.values())
+        assert "Short 112-byte prompt" in combined and tail_64k in combined and tail_320k in combined
 
-            stream_rows = store.db.execute("SELECT entry_id, source_cursor FROM material_streams").fetchall()
-            assert len(stream_rows) == 1
-            entry_id, finish_offset = stream_rows[0]
-            assert int(finish_offset) == spool_file.stat().st_size
-            exported = store.materials.export_task(entry_id, source="draft")["files"]
-            combined = "".join(exported.values())
-            assert "Short 112-byte prompt" in combined and tail_64k in combined and tail_320k in combined
-
-            with spool_file.open("ab") as f:
-                f.write(b"{corrupt_json_line\n")
-            bad_inc = opencode_transcript.read_material(spool_file, int(finish_offset), session_id=session_id)
-            assert bad_inc.get("discarded_records")
-            cap2 = engine.capture(session_id=session_id, turn_id="turn_corrupt_02", transcript_path=str(spool_file), harness="opencode")
-            engine._process(cap2["id"])
-            st2 = store.db.execute("SELECT status, detail FROM captures WHERE id=?", (cap2["id"],)).fetchone()
-            assert st2[0] != "organized" and ("incomplete" in st2[1] or "projection" in st2[1] or "discarded" in st2[1])
-            finish_after = store.db.execute("SELECT source_cursor FROM material_streams WHERE entry_id=?", (entry_id,)).fetchone()[0]
-            assert int(finish_after) == int(finish_offset)
-        finally:
-            if orig_redact is not None:
-                ingest_mod.redact_increment = orig_redact
+        with spool_file.open("ab") as f:
+            f.write(b"{corrupt_json_line\n")
+        bad_inc = opencode_transcript.read_material(spool_file, int(finish_offset), session_id=session_id)
+        assert bad_inc.get("discarded_records")
+        cap2 = engine.capture(session_id=session_id, turn_id="turn_corrupt_02", transcript_path=str(spool_file), harness="opencode")
+        engine._process(cap2["id"])
+        st2 = store.db.execute("SELECT status, detail FROM captures WHERE id=?", (cap2["id"],)).fetchone()
+        assert st2[0] != "organized" and ("incomplete" in st2[1] or "projection" in st2[1] or "discarded" in st2[1])
+        finish_after = store.db.execute("SELECT source_cursor FROM material_streams WHERE entry_id=?", (entry_id,)).fetchone()[0]
+        assert int(finish_after) == int(finish_offset)
     finally:
         store.close()
         assert settings_mod.load(paths.community_config_path()).allows_capture()
@@ -228,6 +221,19 @@ def test_organizer_c6_distill_request_executes_and_validates_schema(
         server.server_close()
 
 
+def _make_fake_cli(root: Path, stem: str, py_code: str) -> Path:
+    impl = root / f"{stem}_impl.py"
+    impl.write_text(py_code, encoding="utf-8")
+    if os.name == "nt":
+        wrapper = root / f"{stem}.cmd"
+        wrapper.write_text(f'@echo off\n"{sys.executable}" -I "{impl}" %*\n', encoding="utf-8")
+        return wrapper
+    wrapper = root / stem
+    wrapper.write_text(f"#!{sys.executable} -I\n" + py_code, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
 def test_organizer_cli_fallback_isolates_host_opencode_db_and_env(
     isolated_oc_env: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -240,11 +246,13 @@ def test_organizer_cli_fallback_isolates_host_opencode_db_and_env(
     host_db.write_bytes(b"HOST_SQLITE_SENTINEL")
 
     env_dump_file = isolated_oc_env["root"] / "cli_env_dump.json"
-    fake_cli = isolated_oc_env["root"] / "fake-opencode"
     block_id = "c" * 64
-    fake_cli.write_text(
-        f"""#!/usr/bin/env python3
-import json, os, pathlib
+    fake_cli = _make_fake_cli(
+        isolated_oc_env["root"],
+        "fake-opencode",
+        f"""import json, os, pathlib, sys
+prompt_stdin = sys.stdin.read()
+assert "Test isolation" in prompt_stdin
 db_target = pathlib.Path(os.environ["OPENCODE_DB"])
 db_target.parent.mkdir(parents=True, exist_ok=True)
 db_target.write_bytes(b"SCRATCH_DB_WRITE")
@@ -259,14 +267,14 @@ pathlib.Path({json.dumps(str(env_dump_file))}).write_text(json.dumps({{
     "OPENCODE_SESSION_ID": os.environ.get("OPENCODE_SESSION_ID"),
     "MINDIE_OPENCODE_DB": os.environ.get("MINDIE_OPENCODE_DB"),
 }}), encoding="utf-8")
-print(json.dumps({{
+reply = json.dumps({{
     "blocks": [{{"block_id": {json.dumps(block_id)}, "title": "Isolated", "summary": "CLI fallback isolated DB."}}],
     "navigation": {{"title": "Isolated", "summary": "CLI fallback isolated DB."}}
-}}))
+}})
+print(json.dumps({{"type": "text", "part": {{"type": "text", "text": reply}}}}))
+print(json.dumps({{"type": "step_finish", "part": {{"type": "step-finish", "tokens": {{"input": 42, "output": 18}}}}}}))
 """,
-        encoding="utf-8",
     )
-    fake_cli.chmod(0o755)
 
     monkeypatch.delenv("MINDIE_SUMMARY_ENDPOINT", raising=False)
     monkeypatch.setenv("MINDIE_OC_BIN", str(fake_cli))
@@ -894,9 +902,11 @@ def test_round3_deactivation_tombstone_boundary_overlap_custom_adm_and_stale_end
     sock_probe.close()
     ep_file = paths.state_dir() / "summary-endpoint.json"
     paths.atomic_write_json(ep_file, {"url": f"http://127.0.0.1:{dead_port}/v1/summary", "token": "stale"})
-    fake_oc = isolated_oc_env["root"] / "fake-opencode-stale"
-    fake_oc.write_text("#!/bin/sh\nprintf '%s\\n' '{\"ok\":true}'\n", encoding="utf-8")
-    fake_oc.chmod(0o755)
+    fake_oc = _make_fake_cli(
+        isolated_oc_env["root"],
+        "fake-opencode-stale",
+        'import json, sys\n_ = sys.stdin.read()\nprint(json.dumps({"type": "text", "part": {"type": "text", "text": "{\\"ok\\":true}"}}))\n',
+    )
     monkeypatch.setenv("MINDIE_OC_BIN", str(fake_oc))
     monkeypatch.delenv("MINDIE_SUMMARY_ENDPOINT", raising=False)
     model = organizer.NativeSummaryModel("deepseek/deepseek-flash")

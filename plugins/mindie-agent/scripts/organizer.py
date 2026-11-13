@@ -325,23 +325,49 @@ class NativeSummaryModel:
                 "Return ONLY a single valid JSON object matching this JSON Schema (no markdown fences, no commentary):\n"
                 f"{json.dumps(schema, ensure_ascii=False)}"
             )
-            argv = [cli_bin, "run", "--standalone", "--archived", "--auto"]
+            argv = [cli_bin, "run", "--standalone", "--archived", "--auto", "--format", "json"]
             if effective_model and effective_model != "default":
                 argv.extend(["-m", effective_model])
-            argv.append(full_prompt)
 
             budget = native_timeout(max_seconds=120.0)
             self.transmitted = True
             proc = bounded_run(
                 argv,
-                "",
+                full_prompt,
                 timeout=budget,
-                max_output=summarizer.MAX_RESPONSE_BYTES * 2,
+                max_output=summarizer.MAX_RESPONSE_BYTES * 4,
                 env=env,
                 cwd=directory,
             )
             self.cleanup_failed = proc.cleanup_failed
-            text = _strip_code_fence(proc.checked_stdout())
+            raw_out = proc.checked_stdout()
+            text_parts: list[str] = []
+            parsed_events = 0
+            for raw_line in raw_out.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and isinstance(ev.get("type"), str) and ("part" in ev or "error" in ev):
+                    parsed_events += 1
+                    if ev["type"] == "error":
+                        raise NativeFailure(f"opencode CLI reported error: {ev.get('error')}", reason="native_failure")
+                    part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+                    if ev["type"] == "text" and isinstance(part.get("text"), str):
+                        text_parts.append(part["text"])
+                    elif ev["type"] == "step_finish" and isinstance(part.get("tokens"), dict):
+                        toks = part["tokens"]
+                        self.usage = summarizer.clean_usage(
+                            {
+                                "input_tokens": int(toks.get("input") or 0),
+                                "output_tokens": int(toks.get("output") or 0),
+                            }
+                        )
+                        self.usage_known = True
+            text = _strip_code_fence("".join(text_parts) if parsed_events > 0 else raw_out)
             if not text:
                 raise summarizer.SummaryResultError("empty CLI summary response", reason="result_json_invalid")
             self.raw_result = text
