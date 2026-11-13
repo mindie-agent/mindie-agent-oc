@@ -1,0 +1,15 @@
+name: deployed-publication-policy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+  actions: read
+  deployments: read
+
+jobs:
+  policy:
+    uses: mindie-agent/mindie-bench/.github/workflows/publication-policy.yml@main

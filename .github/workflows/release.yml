@@ -1,17 +1,20 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  actions: read
+  checks: read
+  deployments: read
 
 jobs:
   release:
-    uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@c7d0c8a4969b3816925c0405931ae17e28ce7a34
+    uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@main
+    secrets:
+      MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
-      benchmark-ref: c7d0c8a4969b3816925c0405931ae17e28ce7a34
       release-notes-path: docs/releases/mindie-agent-oc-0.1.1.md
       node: true
       version-files: |
@@ -19,7 +22,7 @@ jobs:
         pyproject.toml
         plugins/mindie-agent/plugin.json
       setup-command: |
-        uv sync --locked --no-editable --no-install-project --all-extras
+        uv sync --frozen --no-editable --no-install-project --all-extras
       test-command: |
         .venv/bin/python .github/scripts/check_lf_eol.py
         .venv/bin/python -m pytest -q -m "not live_npu and not live_opencode"

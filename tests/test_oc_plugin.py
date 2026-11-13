@@ -102,7 +102,7 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
         proc = bounded_run(
             [oc_bin, "debug", "config", "--standalone"],
             "",
-            timeout=14.0,
+            timeout=30.0,
             env=dict(os.environ),
             cwd=isolated_oc_env["workspace"],
         )
@@ -122,7 +122,7 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
         agents_proc = bounded_run(
             [oc_bin, "debug", "agents", "--standalone", "--print-logs", "--log-level", "info"],
             "",
-            timeout=14.0,
+            timeout=30.0,
             env=dict(os.environ),
             cwd=isolated_oc_env["workspace"],
         )

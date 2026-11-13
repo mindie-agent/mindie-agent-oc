@@ -278,7 +278,7 @@ def ensure_runtime_python(
                 _copy_lf_clean(src_root / "uv.lock", build_dir / "uv.lock")
             env = apply_enterprise_transport_env(dict(os.environ))
             env["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
-            uv_argv = [uv, "sync", *(["--locked"] if has_lock else [])]
+            uv_argv = [uv, "sync", *(["--frozen"] if has_lock else [])]
             uv_argv.extend(["--no-editable", "--no-install-project", "--project", str(build_dir), "--all-extras", "--no-dev", "--python", "3.13"])
             proc = bounded_run(uv_argv, "", timeout=timeout, max_output=256 * 1024, env=env)
     if proc.returncode != 0 or not venv_py.is_file():

@@ -433,7 +433,7 @@ def test_stage_source_baseline_includes_uv_lock_and_keeps_snapshot_immutable(
     isolated_oc_env: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Item #6: `stage_source_baseline` stages `uv.lock`; `ensure_runtime_python` builds outside `src_root` with `--locked`."""
+    """Item #6: `stage_source_baseline` stages `uv.lock`; `ensure_runtime_python` builds outside `src_root` with `--frozen`."""
     staged = oc_setup.stage_source_baseline(REPO_ROOT)
     assert (staged / "uv.lock").is_file()
     digest_before = oc_setup._payload_digest(staged)
@@ -461,7 +461,7 @@ def test_stage_source_baseline_includes_uv_lock_and_keeps_snapshot_immutable(
     assert Path(resolved_py).name.startswith("python")
     sync_calls = [c for c in uv_calls if len(c) >= 2 and c[1] == "sync"]
     assert len(sync_calls) == 1
-    assert {"--locked", "--no-editable", "--no-install-project"}.issubset(sync_calls[0])
+    assert {"--frozen", "--no-editable", "--no-install-project"}.issubset(sync_calls[0])
     proj_arg = Path(sync_calls[0][sync_calls[0].index("--project") + 1]).resolve()
     assert proj_arg != staged.resolve()
     assert oc_setup._payload_digest(staged) == digest_before
