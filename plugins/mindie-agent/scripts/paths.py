@@ -115,7 +115,8 @@ def _is_wsl_linux_executable(path: Path) -> bool:
         return True
     if not head.startswith(b"#!"):
         return False
-    shebang = head.splitlines()[0][2:].strip().decode("latin1")
+    lines = head.decode("latin1").splitlines()
+    shebang = lines[0][2:].strip()
     parts = shebang.split()
     if not parts or re.match(r"^[a-zA-Z]:[\\/]", parts[0]):
         return False
@@ -130,6 +131,12 @@ def _is_wsl_linux_executable(path: Path) -> bool:
         return False
     if _PY_INTERP_RE.fullmatch(interp_base):
         return True
+    if len(lines) > 1 and lines[1].startswith("'''exec'"):
+        tramp = re.match(r"^'''exec'\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))", lines[1])
+        target = next((g for g in (tramp.groups() if tramp else ()) if g), "")
+        if target and not re.match(r"^[a-zA-Z]:[\\/]", target) and "\\windows\\" not in target.lower():
+            if _PY_INTERP_RE.fullmatch(target.rsplit("/", 1)[-1]):
+                return True
     return _WIN_SHIM_BODY_RE.search(head.decode("latin1")) is None
 
 

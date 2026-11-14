@@ -302,9 +302,9 @@ def prepare(
     baseline = source_baseline(source_root)
 
     class _RemoteCatalog(Catalog):
-        def read(self, url: str):
+        def read(self, url: str, *args, **kwargs):
             try:
-                return super().read(url)
+                return super().read(url, *args, **kwargs)
             except json.JSONDecodeError as exc:
                 from mindie_knowledge.releases_io import ReleaseFetchError
                 raise ReleaseFetchError("invalid_release_json") from exc

@@ -203,7 +203,8 @@ function isWslLinuxExecutableJs(cand) {
         }
         if (read < 2 || buf[0] !== 0x23 || buf[1] !== 0x21) return false;
         const text = buf.subarray(0, read).toString("latin1");
-        const shebang = text.split(/\r?\n/, 1)[0].slice(2).trim();
+        const lines = text.split(/\r?\n/);
+        const shebang = lines[0].slice(2).trim();
         const parts = shebang.split(/\s+/).filter(Boolean);
         if (!parts.length || /^[a-zA-Z]:[\\/]/.test(parts[0])) return false;
         const lowShebang = shebang.toLowerCase();
@@ -217,6 +218,13 @@ function isWslLinuxExecutableJs(cand) {
         const interpBase = interp.slice(interp.lastIndexOf("/") + 1);
         if (!interpBase) return false;
         if (PY_INTERP_RE.test(interpBase)) return true;
+        if (lines.length > 1 && lines[1].startsWith("'''exec'")) {
+            const m = /^'''exec'\s+(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(lines[1]);
+            const target = (m && (m[1] || m[2] || m[3])) || "";
+            if (target && !/^[a-zA-Z]:[\\/]/.test(target) && !target.toLowerCase().includes("\\windows\\")) {
+                if (PY_INTERP_RE.test(target.slice(target.lastIndexOf("/") + 1))) return true;
+            }
+        }
         return !WIN_SHIM_BODY_RE.test(text);
     } catch {
         return false;

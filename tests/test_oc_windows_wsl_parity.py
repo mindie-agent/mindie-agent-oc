@@ -122,26 +122,31 @@ def test_component_update_check_records_non_reportable_transient_tls_error(
         "release_transport_unavailable",
     )
 
-    # Verify truncated upstream Catalog.read() JSONDecodeError is wrapped into invalid_release_json
-    # (temporary_network, reportable=False) at the remote catalog boundary.
+    # Verify truncated upstream Catalog.read(..., force=...) JSONDecodeError is wrapped into invalid_release_json
+    # (temporary_network, reportable=False) through real Catalog.latest(force=...) keyword forwarding.
     import mindie_knowledge.component_releases as comp_rel
     import mindie_knowledge.component_runtime as comp_rt
     import mindie_knowledge.component_bindings as comp_bind
 
-    def truncated_http_read(_self, _url: str):
+    seen_force: list[bool] = []
+
+    def truncated_http_read(_self, _url: str, *, force: bool = False):
+        seen_force.append(force)
         raise json.JSONDecodeError("Expecting value", "{truncated", 1)
 
+    comp_name = next(iter(comp_rel.COMPONENTS))
     monkeypatch.setattr(comp_rel.Catalog, "read", truncated_http_read)
-    monkeypatch.setattr(comp_bind, "required_components", lambda *_a, **_kw: {"knowledge": "0.1.0"})
-    monkeypatch.setattr(comp_rt, "source_baseline", lambda *_a, **_kw: {"runtime": {"knowledge": "abc"}})
+    monkeypatch.setattr(comp_bind, "required_components", lambda *_a, **_kw: {comp_name: "0.1.0"})
+    monkeypatch.setattr(comp_rt, "source_baseline", lambda *_a, **_kw: {"runtime": {comp_name: "abc"}})
     monkeypatch.setattr(
         comp_rt,
         "discover",
-        lambda _py, _rt, **_kw: _kw["catalog"].read("https://api.github.com/repos/mindie-agent/knowledge/releases"),
+        lambda _py, _rt, **_kw: _kw["catalog"].latest(comp_name, force=bool(_kw.get("force"))),
     )
     try:
-        orig_prepare(source=REPO_ROOT, python=sys.executable, config=paths.config_path(), timeout=30.0)
+        orig_prepare(source=REPO_ROOT, python=sys.executable, config=paths.config_path(), force=True, timeout=30.0)
     except Exception as remote_json_exc:
+        assert seen_force == [True]
         assert diagnostic_support.classify_update_exception(remote_json_exc) == (
             "temporary_network",
             False,
@@ -238,11 +243,23 @@ def test_wsl_binary_filtering_and_windows_interpreter_parity(
     posix_basedir = drvfs_dir / "opencode-wrapper"
     posix_basedir.write_text('#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/linux-opencode" "$@"\n', encoding="utf-8")
     posix_basedir.chmod(0o755)
+    pip_trampoline = drvfs_dir / "mindie-trampoline"
+    pip_trampoline.write_text(
+        "#!/bin/sh\n"
+        '\'\'\'exec\' "/mnt/c/Users/demo/My Project/.venv/bin/python" "$0" "$@"\n'
+        "' '''\n"
+        "# -*- coding: utf-8 -*-\n"
+        "import re, sys\n"
+        "sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n",
+        encoding="utf-8",
+    )
+    pip_trampoline.chmod(0o755)
     npm_shim = drvfs_dir / "opencode-npm"
     npm_shim.write_text('#!/bin/sh\nbasedir=$(cygpath -w "$0")\nexec "$basedir/node.exe"\n', encoding="utf-8")
     npm_shim.chmod(0o755)
     assert paths._is_wsl_linux_executable(linux_console) is True
     assert paths._is_wsl_linux_executable(posix_basedir) is True
+    assert paths._is_wsl_linux_executable(pip_trampoline) is True
     assert paths._is_wsl_linux_executable(npm_shim) is False
 
     real_close = paths.os.close
