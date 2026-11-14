@@ -178,7 +178,7 @@ def _kill_process_tree(
             _close_windows_job(job_handle)
             job_handle = None
     if os.name == "nt":
-        if proc.poll() is None:
+        if getattr(proc, "pid", None) != os.getpid() and hasattr(proc, "poll") and proc.poll() is None:
             try:
                 proc.kill()
             except TimeoutError:
@@ -198,7 +198,7 @@ def _kill_process_tree(
                     pgids.append(extra)
         if pgids:
             cleanup_failed = _signal_posix_pgids(pgids, signal.SIGKILL) or cleanup_failed
-    if proc.poll() is None:
+    if hasattr(proc, "poll") and proc.poll() is None:
         try:
             proc.wait(timeout=max(0.01, kill_deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
@@ -208,6 +208,9 @@ def _kill_process_tree(
 
 def _attach_windows_job(proc: subprocess.Popen):
     if os.name != "nt":
+        return None
+    pid = getattr(proc, "pid", None)
+    if type(pid) is not int or pid <= 0 or pid == os.getpid():
         return None
     try:
         import win32api

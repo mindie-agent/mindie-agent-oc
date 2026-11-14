@@ -185,7 +185,23 @@ def test_bounded_subprocess_schema_timeout_and_persisted_diagnostics(
             assert read_json(upd_status)["status"] == "up_to_date"
             assert "TimeoutError" in read_json(upd_status)["schema_warning"]
 
-        # 3. Once `state-layout.lock` is released, recovery clears persisted warnings across all status files.
+        # 3. Non-timeout subprocess OSError persists warning, writes terminal degraded status, and preserves completed check status.
+        with monkeypatch.context() as mp:
+            mp.setattr(
+                component_update,
+                "bounded_run",
+                lambda *_a, **_kw: (_ for _ in ()).throw(PermissionError("tempdir EACCES")),
+            )
+            assert component_update.main(["--config", str(cfg), "--prepare-schema", "--timeout", "15"]) == 1
+            assert read_json(prep_status)["status"] == "degraded"
+            assert "tempdir EACCES" in read_json(prep_status)["schema_warning"]
+            assert "tempdir EACCES" in read_json(cfg)["schema_warning"]
+            res_os = component_update.check(config=cfg)
+            assert res_os["status"] == "up_to_date" and "tempdir EACCES" in res_os["schema_warning"]
+            assert read_json(upd_status)["status"] == "up_to_date"
+            assert "tempdir EACCES" in read_json(upd_status)["schema_warning"]
+
+        # 4. Once `state-layout.lock` and subprocess execution succeed, recovery clears persisted warnings across all status files.
         rec = component_update.check(config=cfg)
         assert rec["status"] == "up_to_date" and "schema_warning" not in rec
         assert read_json(cfg)["schema_ready"] is True and "schema_warning" not in read_json(cfg)

@@ -273,7 +273,16 @@ def atomic_write_json(path: str | Path, payload: dict) -> Path:
         with os.fdopen(fd, "wb") as stream:
             stream.write(serialized)
             stream.flush()
-        os.replace(tmp_path, target)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, target)
+                break
+            except TimeoutError:
+                raise
+            except PermissionError:
+                if os.name != "nt" or attempt == 4:
+                    raise
+                time.sleep(0.015)
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)

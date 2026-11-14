@@ -128,17 +128,15 @@ def _pid_running_windows(pid: int) -> bool:
     try:
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(0x1000, False, int(pid))
-        if not handle:
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        h = k32.OpenProcess(0x1000, False, int(pid))
+        if not h:
             return False
         try:
-            exit_code = ctypes.c_ulong(0)
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return False
-            return int(exit_code.value) == 259
+            code = ctypes.c_ulong(0)
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code)) and int(code.value) == 259)
         finally:
-            kernel32.CloseHandle(handle)
+            k32.CloseHandle(h)
     except Exception:
         return False
 
@@ -153,8 +151,6 @@ def _pid_running(pid: object) -> bool:
         return True
     except TimeoutError:
         raise
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True
     except OSError:
@@ -258,12 +254,14 @@ def _norm_python_path(py_exe: str | Path) -> str:
 
 def compatible_runtime(python: str, *, source=None, config=None, timeout: float = 540.0) -> str:
     """Prepare a compatible generation without changing the active profile."""
+    if timeout <= 0:
+        raise TimeoutError("runtime compatibility probe exceeded its budget")
     deadline = time.monotonic() + float(timeout)
-    imports = (
-        "import mindie_knowledge, remote_dev, mindie_diagnostics, mindie_profiler, "
-        "mindie_sim, mindie_coordinator, mindie_debugger, npu_top; "
-        "from remote_dev.mcp.outcome import operation_outcome"
-    )
+    norm_py = _norm_python_path(python)
+    req_mods = ("mindie_knowledge", "remote_dev", "mindie_diagnostics", "mindie_profiler", "mindie_sim", "mindie_coordinator", "mindie_debugger", "npu_top")
+    if norm_py == _norm_python_path(sys.executable) and all(importlib.util.find_spec(m) is not None for m in req_mods) and importlib.util.find_spec("remote_dev.mcp.outcome") is not None:
+        return norm_py
+    imports = f"import {', '.join(req_mods)}; from remote_dev.mcp.outcome import operation_outcome"
 
     def probe(interpreter):
         rem = min(15.0, deadline - time.monotonic())
@@ -274,7 +272,7 @@ def compatible_runtime(python: str, *, source=None, config=None, timeout: float 
         return bounded_run([str(interpreter), "-I", "-c", imports], "", timeout=budget, cleanup_grace=grace).returncode == 0
 
     if probe(python):
-        return _norm_python_path(python)
+        return norm_py
     remaining = deadline - time.monotonic()
     if remaining <= 20.0:
         raise TimeoutError("runtime preparation has no remaining build budget")
@@ -526,7 +524,9 @@ def sync_store_schema(
         _persist_schema_state(cpath, epath, f"TimeoutError: {err}", update_status_file=update_status_file)
         raise err
     if not in_proc and (not isinstance(py, str) or not Path(py).is_file()):
-        return False, None
+        miss_w = f"FileNotFoundError: runtime interpreter not found ({py})"
+        _persist_schema_state(cpath, epath, miss_w, update_status_file=update_status_file)
+        return False, miss_w
     warn: str | None = None
     timed_out: TimeoutError | None = None
     if in_proc:
@@ -552,9 +552,10 @@ def sync_store_schema(
                 signal.signal(signal.SIGALRM, signal.SIG_DFL)
     else:
         grace = min(2.0, max(0.5, (rem - 5.0) if rem is not None else 2.0))
+        sub_cmd = "import sys; sys.path.insert(0, sys.argv[1]); from oc_native_compat import ensure_oc_native_support; ensure_oc_native_support(); from mindie_knowledge.loop.handoff import prepare_schema; prepare_schema(sys.argv[2])"
         try:
             proc = bounded_run(
-                [str(py), "-I", "-c", "import sys; from mindie_knowledge.loop.handoff import prepare_schema; prepare_schema(sys.argv[1])", str(epath)],
+                [str(py), "-I", "-c", sub_cmd, str(HERE), str(epath)],
                 "", timeout=max(5.0, (rem - grace) if rem is not None else 75.0), cleanup_grace=grace,
             )
             if deadline is not None and time.monotonic() >= deadline:
@@ -564,6 +565,9 @@ def sync_store_schema(
                 print(f"MindIE OpenCode prepare_schema warning: {warn}", file=sys.stderr)
         except TimeoutError as exc:
             timed_out, warn = exc, f"TimeoutError: {exc}"
+            print(f"MindIE OpenCode prepare_schema warning: {warn}", file=sys.stderr)
+        except Exception as exc:
+            warn = f"{type(exc).__name__}: {exc}"
             print(f"MindIE OpenCode prepare_schema warning: {warn}", file=sys.stderr)
     _persist_schema_state(cpath, epath, warn, update_status_file=update_status_file)
     if timed_out is not None:
@@ -753,8 +757,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             try:
                 ready, warn = sync_store_schema(args.config, deadline=dl, update_status_file=True)
-            except TimeoutError as exc:
-                t_rec = {"finished_at": time.time(), "status": "degraded", "schema_warning": f"TimeoutError: {exc}"}
+            except Exception as exc:
+                t_rec = {"finished_at": time.time(), "status": "degraded", "schema_warning": f"{type(exc).__name__}: {exc}"}
                 try:
                     atomic_write_json(data_home() / "oc-schema-prepare.json", t_rec)
                 except TimeoutError:

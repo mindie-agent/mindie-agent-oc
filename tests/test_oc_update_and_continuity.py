@@ -94,35 +94,38 @@ def test_component_update_cooldown_backoff_lock_and_atomic_rebind(
 ) -> None:
     py = str(isolated_oc_env["python"])
     cfg = config_path()
+    gitleaks_stub = isolated_oc_env["home"] / ".cache" / "mindie-agent" / "gitleaks" / ("gitleaks.exe" if os.name == "nt" else "gitleaks")
+    gitleaks_stub.parent.mkdir(parents=True, exist_ok=True)
+    gitleaks_stub.write_bytes(b"stub")
     setup.ensure_default_profile(config=cfg, python_exe=py)
 
     # 1. Suppressed by default in isolated MINDIE_CONFIG_HOME unless explicitly enabled.
     assert component_update.trigger_background_update_if_due(config=cfg) is False
 
     spawned: list[list[str]] = []
-
-    class _DummyPopen:
-        def __init__(self, cmd, **_kwargs):
-            self.pid = os.getpid()
-            spawned.append([str(c) for c in cmd])
-
-    monkeypatch.setenv("MINDIE_OC_ALLOW_BG_UPDATE", "1")
-    monkeypatch.setattr(component_update.subprocess, "Popen", _DummyPopen)
-
-    # 2. First due check triggers background spawn and writes in_progress status.
-    assert component_update.trigger_background_update_if_due(config=cfg) is True
-    assert len(spawned) == 1
-    assert "--non-blocking" in spawned[0]
-    # Immediate second call within 300s cooldown is suppressed.
-    assert component_update.trigger_background_update_if_due(config=cfg) is False
-
-    # 3. Failed status uses 60s backoff instead of 300s cooldown.
     status_file = data_home() / "oc-component-update-status.json"
-    atomic_write_json(status_file, {"checked_at": time.time() - 30.0, "status": "failed"})
-    assert component_update.trigger_background_update_if_due(config=cfg) is False
-    atomic_write_json(status_file, {"checked_at": time.time() - 65.0, "status": "failed"})
-    assert component_update.trigger_background_update_if_due(config=cfg) is True
-    assert len(spawned) == 2
+    monkeypatch.setenv("MINDIE_OC_ALLOW_BG_UPDATE", "1")
+    with monkeypatch.context() as mp:
+        mp.setattr(component_update, "_pid_running", lambda pid: pid == 424242)
+        mp.setattr(
+            component_update.subprocess,
+            "Popen",
+            lambda cmd, **_kw: (spawned.append([str(c) for c in cmd]), type("_P", (), {"pid": 424242})())[1],
+        )
+
+        # 2. First due check triggers background spawn and writes in_progress status.
+        assert component_update.trigger_background_update_if_due(config=cfg) is True
+        assert len(spawned) == 1
+        assert "--non-blocking" in spawned[0]
+        # Immediate second call within 300s cooldown is suppressed.
+        assert component_update.trigger_background_update_if_due(config=cfg) is False
+
+        # 3. Failed status uses 60s backoff instead of 300s cooldown.
+        atomic_write_json(status_file, {"checked_at": time.time() - 30.0, "status": "failed"})
+        assert component_update.trigger_background_update_if_due(config=cfg) is False
+        atomic_write_json(status_file, {"checked_at": time.time() - 65.0, "status": "failed"})
+        assert component_update.trigger_background_update_if_due(config=cfg) is True
+        assert len(spawned) == 2
 
     # 4. Concurrent lock contention returns status="locked" immediately when non_blocking=True.
     lock_file = data_home() / "oc-component-update.lock"

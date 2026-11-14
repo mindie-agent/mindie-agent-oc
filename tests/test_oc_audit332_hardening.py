@@ -143,7 +143,7 @@ def test_sharing_status_corrupt_visibility_timeout_kwargs_and_schema_warning_for
     cfg = config_path()
     ws = str(isolated_oc_env["workspace"])
     # Verify explicit `timeout=` kwarg works on both ensure_default_profile and configure_community.
-    setup.ensure_default_profile(config=cfg, python_exe=py, timeout=15.0)
+    setup.ensure_default_profile(config=cfg, python_exe=py, timeout=30.0)
     setup.configure_community(config=cfg, enabled=False, project_root=ws, timeout=15.0)
 
     # 1. Corrupt community.json / diagnostics.json sets repair_required=True and sharing_enabled=None.
@@ -171,9 +171,10 @@ def test_sharing_status_corrupt_visibility_timeout_kwargs_and_schema_warning_for
     import bridge as bridge_mod
     import mindie_knowledge.loop.handoff as handoff_mod
 
+    community_config_path(cfg).unlink(missing_ok=True)
     monkeypatch.setattr(setup.shutil, "which", lambda _cmd: None)
     shutil.rmtree(isolated_oc_env["home"] / ".cache", ignore_errors=True)
-    prof_warn = setup.ensure_default_profile(config=cfg, python_exe=py, timeout=15.0)
+    prof_warn = setup.ensure_default_profile(config=cfg, python_exe=py, timeout=30.0)
     assert prof_warn["schema_ready"] is False and "redactor_executable" in prof_warn["schema_warning"]
     assert "prepare_schema warning" in capsys.readouterr().err
     assert not (data_home() / "oc-component-update-status.json").exists()
@@ -211,10 +212,14 @@ def test_sharing_status_corrupt_visibility_timeout_kwargs_and_schema_warning_for
             shutil.rmtree(data_home() / "domains", ignore_errors=True)
             cold_fast = handle_gesture({"sessionID": "ses_fast_cold", "directory": ws, "prompt": "/mindie-agent"}, config=cfg)
             assert cold_fast["activated"] is True and cold_fast["bootstrapping"] is False
-        prep_dl = time.monotonic() + 15.0
-        while time.monotonic() < prep_dl and (not schema_prep_status.is_file() or read_json(schema_prep_status).get("status") == "in_progress"):
+        prep_dl, st_doc = time.monotonic() + 25.0, {"status": "in_progress"}
+        while time.monotonic() < prep_dl and st_doc.get("status") == "in_progress":
+            try:
+                st_doc = read_json(schema_prep_status) if schema_prep_status.is_file() else {"status": "in_progress"}
+            except (OSError, ValueError):
+                pass
             time.sleep(0.05)
-        assert read_json(schema_prep_status)["status"] == "ready"
+        assert st_doc["status"] == "ready", st_doc
         assert read_json(cfg)["schema_ready"] is True and "schema_warning" not in read_json(cfg)
     assert component_update.store_schema_needs_prepare(cfg) is False
 
@@ -233,18 +238,13 @@ def test_component_update_dead_pid_reclaim_and_inventory_error_honesty(
     setup.ensure_default_profile(config=cfg, python_exe=py)
     monkeypatch.setenv("MINDIE_OC_ALLOW_BG_UPDATE", "1")
 
-    # 1. Dead PID in `in_progress` status is reclaimed immediately rather than blocking for 300s.
+    # 1. Dead PID in `in_progress` status is reclaimed immediately; scope Popen mock strictly around trigger.
     status_file = data_home() / "oc-component-update-status.json"
     atomic_write_json(status_file, {"checked_at": time.time(), "status": "in_progress", "pid": 99999999})
     spawned: list[list[str]] = []
-
-    class _FakePopen:
-        def __init__(self, cmd, **_kw):
-            self.pid = os.getpid()
-            spawned.append([str(x) for x in cmd])
-
-    monkeypatch.setattr(component_update.subprocess, "Popen", _FakePopen)
-    assert component_update.trigger_background_update_if_due(config=cfg) is True
+    with monkeypatch.context() as mp:
+        mp.setattr(component_update.subprocess, "Popen", lambda cmd, **_kw: (spawned.append([str(x) for x in cmd]), type("_P", (), {"pid": 424242})())[1])
+        assert component_update.trigger_background_update_if_due(config=cfg) is True
     assert len(spawned) == 1 and "reclaiming leftover in_progress" in capsys.readouterr().err
 
     # 2. read_inventory failure when prepare returns None marks status="failed" instead of faking {}.

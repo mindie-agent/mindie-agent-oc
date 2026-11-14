@@ -472,7 +472,7 @@ def ensure_default_profile(
         if not got:
             raise TimeoutError("timed out acquiring profile schema lock during profile setup")
         atomic_write_json(cfg_file, adapter_payload)
-    if prepare_store and (deadline - time.monotonic()) >= 5.6:
+    if prepare_store:
         ready, warn = sync_store_schema(cfg_file, eng_file, interpreter=interpreter, deadline=deadline, update_status_file=False)
         adapter_payload["schema_ready"] = ready
         adapter_payload.pop("schema_warning", None) if warn is None else adapter_payload.__setitem__("schema_warning", warn)
