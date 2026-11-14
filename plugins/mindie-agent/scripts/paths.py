@@ -27,7 +27,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
+import sys
 import tempfile
+import time
 
 MAX_CONFIG_BYTES = 65536
 
@@ -55,8 +58,8 @@ def repo_root(config: str | Path | None = None) -> Path:
             sr = data.get("source_root")
             if isinstance(sr, str) and os.path.isabs(sr) and (Path(sr) / "pyproject.toml").is_file():
                 return Path(sr).resolve()
-        except ValueError:
-            pass
+        except ValueError as exc:
+            print(f"MindIE OpenCode config ignored in repo_root ({cfg}): {exc}", file=sys.stderr)
     retained = data_home() / "oc-source"
     if (retained / "pyproject.toml").is_file():
         return retained
@@ -155,8 +158,8 @@ def state_dir(config: str | Path | None = None) -> Path:
             sd = data.get("state_dir")
             if isinstance(sd, str) and os.path.isabs(sd):
                 return Path(sd)
-        except ValueError:
-            pass
+        except ValueError as exc:
+            print(f"MindIE OpenCode config ignored in state_dir ({cfg}): {exc}", file=sys.stderr)
     return data_home() / "oc-state"
 
 
@@ -238,8 +241,16 @@ def opencode_cli_bin() -> str | None:
 
 def read_json(path: str | Path) -> dict:
     target = Path(path)
-    if not target.is_file():
-        raise FileNotFoundError(f"MindIE metadata file not found: {target}")
+    try:
+        st = os.lstat(target)
+    except TimeoutError:
+        raise
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"MindIE metadata file not found: {target}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"MindIE metadata must be a regular file: {target}")
+    if st.st_size > MAX_CONFIG_BYTES:
+        raise ValueError(f"MindIE metadata exceeds {MAX_CONFIG_BYTES} byte limit: {target}")
     with target.open("rb") as stream:
         raw = stream.read(MAX_CONFIG_BYTES + 1)
     if len(raw) > MAX_CONFIG_BYTES:
@@ -253,6 +264,10 @@ def read_json(path: str | Path) -> dict:
     return parsed
 
 
+def _is_windows_fs() -> bool:
+    return os.name == "nt"
+
+
 def atomic_write_json(path: str | Path, payload: dict) -> Path:
     target = Path(path).resolve()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -263,7 +278,16 @@ def atomic_write_json(path: str | Path, payload: dict) -> Path:
         with os.fdopen(fd, "wb") as stream:
             stream.write(serialized)
             stream.flush()
-        os.replace(tmp_path, target)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, target)
+                break
+            except TimeoutError:
+                raise
+            except PermissionError:
+                if not _is_windows_fs() or attempt == 4:
+                    raise
+                time.sleep(0.015)
     except BaseException:
         try:
             tmp_path.unlink(missing_ok=True)

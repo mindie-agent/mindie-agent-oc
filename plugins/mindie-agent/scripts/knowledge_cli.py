@@ -41,16 +41,53 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+def _positive_env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+        return val if val > 0 and val == val and val != float("inf") else default
+    except ValueError:
+        return default
+
+
+def _reexec_timeout_seconds(cli_args: list[str]) -> float:
+    if cli_args and cli_args[0] == "knowledge_distill":
+        # `outer >= distill_rpc_timeout() + 60s` startup/cleanup grace (`>= 480s` default).
+        redact_s = _positive_env_seconds("MINDIE_REDACTION_TIMEOUT_SECONDS", 30.0)
+        summary_s = _positive_env_seconds("MINDIE_SUMMARY_TIMEOUT_SECONDS", 315.0)
+        distill_rpc = (2.0 * redact_s) + 10.0 + summary_s + 30.0 + 5.0
+        return max(90.0, distill_rpc + 60.0)
+    return 90.0
+
+
 if importlib.util.find_spec("mindie_knowledge") is None and not os.environ.get("_MINDIE_KC_REEXEC"):
+    from bounded import run_supervised_reexec
     from mindie_launch import _preferred_python
 
     _target_py = _preferred_python()
     if _target_py and Path(_target_py).is_file():
         _env = dict(os.environ, _MINDIE_KC_REEXEC="1", PYTHONIOENCODING="utf-8")
-        _kwargs: dict = {"env": _env}
-        if os.name == "nt":
-            _kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        raise SystemExit(subprocess.run([_target_py, "-I", str(Path(__file__).resolve()), *sys.argv[1:]], **_kwargs).returncode)
+        try:
+            _rc = run_supervised_reexec(
+                [_target_py, "-I", str(Path(__file__).resolve()), *sys.argv[1:]],
+                timeout=_reexec_timeout_seconds(sys.argv[1:]),
+                env=_env,
+                stdin=sys.stdin,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+        except TimeoutError as _exc:
+            _err = {
+                "content": [{"type": "text", "text": str(_exc)}],
+                "structuredContent": {"code": "knowledge_timeout", "error": str(_exc), "automatic_retry": False},
+                "isError": True,
+            }
+            sys.stdout.buffer.write((json.dumps(_err, ensure_ascii=False) + "\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
+            raise SystemExit(1) from _exc
+        raise SystemExit(_rc)
 
 from admission import gate, knowledge_lease
 from identity import reject_forged_identity_args, require_session

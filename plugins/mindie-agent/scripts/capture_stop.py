@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import time
 
@@ -91,6 +92,16 @@ def _allows_community_capture(project_root: str, *, config=None) -> tuple[bool, 
     return True, "ok", enabled_at
 
 
+def _has_regular_file(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except TimeoutError:
+        raise
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
 def capture_event(event: dict, *, config=None) -> dict:
     """Validate and hand off one turn-end OpenCode event to `capture_hook`."""
     eligible, reason = is_eligible_main_session(event)
@@ -105,10 +116,12 @@ def capture_event(event: dict, *, config=None) -> dict:
     if lease is None:
         return dict(stage="inert", reason="no_manual_lease")
     if not config_path(config).is_file() or not engine_config_path(config).is_file():
-        return dict(stage="inert", reason="profile_unconfigured")
+        return dict(stage="unavailable", reason="profile_unconfigured")
 
     allowed, block_reason, enabled_at = _allows_community_capture(lease["project_root"], config=config)
     if not allowed:
+        if block_reason == "fault":
+            return dict(stage="unavailable", reason="authority-unavailable")
         return dict(stage="inert", reason=block_reason)
 
     activated_at = lease.get("activated_at")
@@ -118,11 +131,13 @@ def capture_event(event: dict, *, config=None) -> dict:
     )
 
     explicit_transcript = event.get("transcriptPath") or event.get("transcript_path")
-    if isinstance(explicit_transcript, str) and os.path.isabs(explicit_transcript) and Path(explicit_transcript).is_file():
+    if isinstance(explicit_transcript, str) and os.path.isabs(explicit_transcript) and _has_regular_file(Path(explicit_transcript)):
         transcript_file = Path(explicit_transcript)
     else:
         db_candidate = event.get("opencodeDb") or event.get("opencode_db")
         db_file = Path(db_candidate) if (isinstance(db_candidate, str) and os.path.isabs(db_candidate)) else opencode_db_path(config)
+        if not _has_regular_file(db_file):
+            return dict(stage="unavailable", reason="transcript_unavailable")
         try:
             synced = sync_session_spool(
                 session,
@@ -133,8 +148,10 @@ def capture_event(event: dict, *, config=None) -> dict:
             )
         except TimeoutError:
             raise
-        except ValueError:
-            return dict(stage="inert", reason="subagent_or_forked")
+        except ValueError as exc:
+            if "subagent or forked" in str(exc):
+                return dict(stage="inert", reason="subagent_or_forked")
+            raise
         if synced is None:
             return dict(stage="inert", reason="transcript_unavailable")
         transcript_file = synced

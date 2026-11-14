@@ -5,7 +5,7 @@
  * - Passive Default: unactivated sessions incur zero subprocess spawns on ordinary prompts/contexts (`!fs.existsSync(admission.sqlite3)` fast-path) and zero system-prompt additions.
  * - Session Isolation: `SKILL.md` system guidance, `OPENCODE_SESSION_ID` shell env, and `session.idle` capture activate strictly per-`sessionID` after an explicit `/mindie-agent` or `$mindie-agent` gesture in a top-level session (`!parentID && !forkSessionID`).
  * - Zero Console Popup (P1.5): every `spawn` uses `windowsHide: true`, and Windows background spawns never combine `detached: true` with `windowsHide: true`.
- * [Timeouts & Locks] Hook subprocess calls enforce a 10500ms outer Node deadline (`>= HOOK_TOTAL 10.0s`); loopback summary server binds `127.0.0.1:0` with `unref()`.
+ * [Timeouts & Locks] Hook subprocess calls enforce a 15000ms outer Node deadline (`>= HOOK_SUPERVISOR_BUDGET 10.0s + HOOK_CLEANUP_GRACE 2.0s + 3.0s grace`); loopback summary server binds `127.0.0.1:0` with `unref()`.
  * [Side-Effect Policy] Delegates state mutations to MindIE Python scripts (`mindie_launch.py`, `capture_stop.py`) and writes only `summary-endpoint.json` under MindIE `stateDir()`.
  */
 
@@ -15,68 +15,30 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import {
-    admissionPath,
-    atomicWriteJson,
-    configPath,
-    dataHome,
-    opencodeDbPath,
-    pluginRoot,
-    readJsonSafe,
-    resolveBootstrapPython,
-    stateDir,
-    summaryEndpointPath,
+    admissionPath, atomicWriteJson, configPath, dataHome, isNewerSemver,
+    opencodeDbPath, pidAlive, pluginRoot, readJsonSafe, resolveBootstrapPython,
+    stateDir, summaryEndpointPath,
 } from "./paths.mjs";
 
 const GESTURE_PREFIX_RE = /^\s*(?:\/mindie-agent(?::mindie-agent)?|\$mindie-agent(?::mindie-agent)?)(?=\s|$)/;
 const MCP_WIRE_RE = /^(?:mcp[_:])?(?:mindie[-_]agent[-_:])?(mindie[-_]remote[-_]dev|mindie[-_]tools)[_:]([A-Za-z0-9_.-]+)$/;
 const SHELL_TOKEN_INLINE_RE = /\r?\n# __mindie_oc_sid:([0-9a-f]{24})(?=$|['"\s])/;
 const TERMINAL_SESSION_EVENTS = new Set([
-    "session.execution.succeeded",
-    "session.execution.failed",
-    "session.execution.interrupted",
-    "session.idle",
+    "session.execution.succeeded", "session.execution.failed",
+    "session.execution.interrupted", "session.idle",
 ]);
-const HOOK_NODE_TIMEOUT_MS = 10500;
+const HOOK_NODE_TIMEOUT_MS = 15000;
 const MAX_HOOK_STDOUT_BYTES = 1024 * 1024;
 const SHELL_QUEUE_TTL_MS = 30000;
 const CAPTURE_COALESCE_MS = 250;
 const BG_UPGRADE_BACKOFF_MS = 60000;
 const MAX_SUMMARY_BODY_BYTES = 512 * 1024;
 const FORWARDED_ENV_KEYS = [
-    "MINDIE_CONFIG_HOME",
-    "MINDIE_DATA_HOME",
-    "MINDIE_AGENT_CONFIG",
-    "MINDIE_DIAGNOSTICS_ROOT",
-    "MINDIE_OPENCODE_DB",
-    "MINDIE_OC_INSTALLED_ROOT",
-    "MINDIE_OC_PYTHON",
-    "MINDIE_OC_BIN",
-    "MINDIE_SUMMARY_MODEL",
-    "MINDIE_SUMMARY_ENDPOINT",
-    "MINDIE_SUMMARY_TOKEN",
-    "OPENCODE_DB",
-    "OPENCODE_TEST_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_STATE_HOME",
+    "MINDIE_CONFIG_HOME", "MINDIE_DATA_HOME", "MINDIE_AGENT_CONFIG", "MINDIE_DIAGNOSTICS_ROOT",
+    "MINDIE_OPENCODE_DB", "MINDIE_OC_INSTALLED_ROOT", "MINDIE_OC_PYTHON", "MINDIE_OC_BIN",
+    "MINDIE_SUMMARY_MODEL", "MINDIE_SUMMARY_ENDPOINT", "MINDIE_SUMMARY_TOKEN",
+    "OPENCODE_DB", "OPENCODE_TEST_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
 ];
-
-function parseSemverTuple(raw) {
-    if (typeof raw !== "string") return null;
-    const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-
-function isNewerSemver(candidate, active) {
-    const c = parseSemverTuple(candidate);
-    const a = parseSemverTuple(active);
-    if (!c) return false;
-    if (!a) return true;
-    for (let i = 0; i < 3; i += 1) {
-        if (c[i] !== a[i]) return c[i] > a[i];
-    }
-    return false;
-}
 
 function resolveInstalledCheckoutRoot() {
     const explicit = process.env.MINDIE_OC_INSTALLED_ROOT;
@@ -106,10 +68,13 @@ function maybeTriggerBackgroundPluginSync() {
         const statusFile = path.join(dataHome(), "oc-component-update-status.json");
         const prevStatus = readJsonSafe(statusFile);
         const nowSec = Date.now() / 1000;
-        if (prevStatus && typeof prevStatus.checked_at === "number" && (nowSec - prevStatus.checked_at) * 1000 < BG_UPGRADE_BACKOFF_MS) {
+        if (prevStatus && prevStatus.status === "in_progress") {
+            if (pidAlive(prevStatus.pid) && typeof prevStatus.checked_at === "number" && nowSec - prevStatus.checked_at < 540) {
+                return false;
+            }
+        } else if (prevStatus && typeof prevStatus.checked_at === "number" && (nowSec - prevStatus.checked_at) * 1000 < BG_UPGRADE_BACKOFF_MS) {
             return false;
         }
-        atomicWriteJson(statusFile, { checked_at: nowSec, status: "in_progress" });
         const py = resolveBootstrapPython();
         const candUpdatePy = path.join(installedRoot, "plugins", "mindie-agent", "scripts", "component_update.py");
         const updatePy = fs.existsSync(candUpdatePy)
@@ -121,10 +86,31 @@ function maybeTriggerBackgroundPluginSync() {
             windowsHide: true,
             detached: process.platform !== "win32",
         });
-        child.on("error", () => {});
+        let spawnFailed = false;
+        child.on("error", (err) => {
+            spawnFailed = true;
+            process.stderr.write(`MindIE OpenCode background plugin sync spawn failed: ${err?.message || err}\n`);
+            try {
+                atomicWriteJson(statusFile, { checked_at: Date.now() / 1000, status: "failed", error: String(err?.message || err) });
+            } catch {}
+        });
         child.unref();
-        return true;
-    } catch {
+        if (!spawnFailed && Number.isInteger(child.pid) && child.pid > 0) {
+            try {
+                atomicWriteJson(statusFile, { checked_at: nowSec, status: "in_progress", pid: child.pid });
+            } catch (writeErr) {
+                if (Number.isInteger(child.pid) && child.pid > 0) {
+                    try {
+                        child.kill();
+                    } catch {}
+                }
+                throw writeErr;
+            }
+            return true;
+        }
+        return false;
+    } catch (err) {
+        process.stderr.write(`MindIE OpenCode background plugin sync warning: ${err?.message || err}\n`);
         return false;
     }
 }
@@ -155,8 +141,11 @@ function admissionMtimeSignature(sessionID = null) {
             walMtime = 0;
         }
         sig = `${mainStat.mtimeMs}:${walMtime}`;
-    } catch {
-        sig = null;
+    } catch (err) {
+        if (err && err.code !== "ENOENT") {
+            process.stderr.write(`MindIE OpenCode admission stat failed (${base}): ${err.message || err}\n`);
+            sig = "unreadable";
+        }
     }
     if (typeof sessionID === "string" && sessionID.length > 0 && !sessionID.includes("/") && !sessionID.includes("\\")) {
         try {
@@ -168,7 +157,10 @@ function admissionMtimeSignature(sessionID = null) {
 }
 
 function killHookTree(child) {
-    if (process.platform !== "win32" && typeof child?.pid === "number" && child.pid > 0) {
+    if (!Number.isInteger(child?.pid) || child.pid <= 0) {
+        return;
+    }
+    if (process.platform !== "win32") {
         try {
             process.kill(-child.pid, "SIGKILL");
             return;
@@ -178,9 +170,7 @@ function killHookTree(child) {
     }
     try {
         child.kill("SIGKILL");
-    } catch {
-        // Process already exited.
-    }
+    } catch {}
 }
 
 function runHook(op, payload) {
@@ -195,6 +185,7 @@ function runHook(op, payload) {
             detached: process.platform !== "win32",
         });
         let stdout = "";
+        let stdoutBytes = 0;
         let stdoutOverflow = false;
         let stderr = "";
         let settled = false;
@@ -210,8 +201,10 @@ function runHook(op, payload) {
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
         child.stdout.on("data", (chunk) => {
-            if (stdout.length + chunk.length <= MAX_HOOK_STDOUT_BYTES) {
+            const chunkBytes = Buffer.byteLength(chunk, "utf8");
+            if (!stdoutOverflow && stdoutBytes + chunkBytes <= MAX_HOOK_STDOUT_BYTES) {
                 stdout += chunk;
+                stdoutBytes += chunkBytes;
             } else {
                 stdoutOverflow = true;
             }
@@ -234,6 +227,7 @@ function runHook(op, payload) {
                 return;
             }
             if (stdoutOverflow) {
+                killHookTree(child);
                 reject(new Error(`MindIE OpenCode hook '${op}' exceeded ${MAX_HOOK_STDOUT_BYTES} stdout byte cap`));
                 return;
             }
@@ -258,7 +252,9 @@ function spawnDetachedCapture(payload) {
         windowsHide: true,
         detached: process.platform !== "win32",
     });
-    child.on("error", () => {});
+    child.on("error", (err) => {
+        process.stderr.write(`MindIE OpenCode capture spawn failed: ${err?.message || err}\n`);
+    });
     child.unref();
 }
 
@@ -279,13 +275,21 @@ function parseModelSpec(rawModel) {
     return spec;
 }
 
+function extractGestureTaskPrompt(rawText) {
+    const rem = String(rawText || "").replace(GESTURE_PREFIX_RE, "").trim();
+    if (!rem) return "";
+    const first = rem.split(/\s+/, 2)[0].toLowerCase();
+    return rem === first && (first === "activate" || first === "deactivate" || first === "status") ? "" : rem;
+}
+
 async function safeGetSession(ctx, sessionID) {
     if (!sessionID || typeof ctx?.session?.get !== "function") {
         return null;
     }
     try {
         return await ctx.session.get({ sessionID });
-    } catch {
+    } catch (err) {
+        process.stderr.write(`MindIE OpenCode session.get warning (${sessionID}): ${err?.message || err}\n`);
         return null;
     }
 }
@@ -383,7 +387,8 @@ export default {
                         }
                     });
                 });
-                server.on("error", () => {
+                server.on("error", (err) => {
+                    process.stderr.write(`MindIE OpenCode summary endpoint error: ${err?.message || err}\n`);
                     summaryServerPromise = null;
                     resolve(null);
                 });
@@ -401,8 +406,8 @@ export default {
                                 pid: process.pid,
                                 model: process.env.MINDIE_SUMMARY_MODEL || "default",
                             });
-                        } catch {
-                            // Endpoint file write failure leaves organizer CLI fallback intact.
+                        } catch (err) {
+                            process.stderr.write(`MindIE OpenCode summary endpoint write failed (${epPath}): ${err?.message || err}\n`);
                         }
                         summaryServer = { server, endpointPath: epPath };
                         resolve(summaryServer);
@@ -479,72 +484,67 @@ export default {
                     description: "Activate, inspect, or deactivate the MindIE Agent knowledge flywheel for this OpenCode session",
                     execute: async ({ sessionID, prompt, delivery }) => {
                         const rawArg = typeof prompt?.text === "string" ? prompt.text.trim() : "";
-                        const gestureText = GESTURE_PREFIX_RE.test(rawArg)
-                            ? rawArg
-                            : rawArg
-                                ? `/mindie-agent ${rawArg}`
-                                : "/mindie-agent";
+                        const gestureText = GESTURE_PREFIX_RE.test(rawArg) ? rawArg : rawArg ? `/mindie-agent ${rawArg}` : "/mindie-agent";
                         const info = await safeGetSession(ctx, sessionID);
-                        const res = await runHook("gesture", {
-                            sessionID,
-                            directory: info?.directory || defaultDirectory(),
-                            parentID: info?.parentID,
-                            forkSessionID: info?.forkSessionID,
-                            prompt: gestureText,
-                        });
+                        let res;
+                        try {
+                            res = await runHook("gesture", { sessionID, directory: info?.directory || defaultDirectory(), parentID: info?.parentID, forkSessionID: info?.forkSessionID, prompt: gestureText });
+                        } catch (err) {
+                            const errMsg = `MindIE session control unavailable: ${err?.message || err}`;
+                            process.stderr.write(`MindIE OpenCode command gesture failed (${sessionID}): ${err?.message || err}\n`);
+                            if (typeof ctx?.session?.synthetic === "function") await ctx.session.synthetic({ sessionID, text: errMsg, resume: false });
+                            const fallbackTask = extractGestureTaskPrompt(gestureText);
+                            if (fallbackTask && typeof ctx?.session?.prompt === "function") {
+                                await ctx.session.prompt({ sessionID, prompt: { ...prompt, text: fallbackTask }, ...(delivery ? { delivery } : {}) });
+                            }
+                            return;
+                        }
                         sessionStateCache.delete(sessionID);
                         if (res.activated) {
                             await ensureSummaryServer();
                             if (res.bootstrapping) watchBootstrapReady();
                         }
                         if (res.action === "activate" && typeof res.task_prompt === "string" && res.task_prompt.trim()) {
-                            await ctx.session.prompt({
-                                sessionID,
-                                prompt: { ...prompt, text: res.task_prompt },
-                                ...(delivery ? { delivery } : {}),
-                            });
+                            if ((res.schema_warning || res.status === "degraded") && typeof ctx?.session?.synthetic === "function" && res.message) {
+                                await ctx.session.synthetic({ sessionID, text: res.message, resume: false });
+                            }
+                            await ctx.session.prompt({ sessionID, prompt: { ...prompt, text: res.task_prompt }, ...(delivery ? { delivery } : {}) });
                             return;
                         }
                         if (typeof ctx?.session?.synthetic === "function" && res.message) {
-                            await ctx.session.synthetic({
-                                sessionID,
-                                text: res.message,
-                                resume: false,
-                            });
+                            await ctx.session.synthetic({ sessionID, text: res.message, resume: false });
                         }
                     },
                 });
             });
-            if (typeof ctx.command.reload === "function") {
-                await ctx.command.reload();
-            }
+            if (typeof ctx.command.reload === "function") await ctx.command.reload();
         }
 
         // 3. Session prompt hook for `/mindie-agent` or `$mindie-agent` prefixes in direct prompts.
         if (ctx?.session && typeof ctx.session.hook === "function") {
             ctx.session.hook("prompt", async ({ sessionID, prompt }) => {
                 const rawText = typeof prompt?.text === "string" ? prompt.text : "";
-                if (!GESTURE_PREFIX_RE.test(rawText)) {
-                    return;
-                }
+                if (!GESTURE_PREFIX_RE.test(rawText)) return;
                 const info = await safeGetSession(ctx, sessionID);
-                const res = await runHook("gesture", {
-                    sessionID,
-                    directory: info?.directory || defaultDirectory(),
-                    parentID: info?.parentID,
-                    forkSessionID: info?.forkSessionID,
-                    prompt: rawText,
-                });
-                sessionStateCache.delete(sessionID);
-                if (!res.matched) {
+                let res;
+                try {
+                    res = await runHook("gesture", { sessionID, directory: info?.directory || defaultDirectory(), parentID: info?.parentID, forkSessionID: info?.forkSessionID, prompt: rawText });
+                } catch (err) {
+                    process.stderr.write(`MindIE OpenCode prompt gesture failed (${sessionID}): ${err?.message || err}\n`);
+                    const fallbackTask = extractGestureTaskPrompt(rawText);
+                    prompt.text = fallbackTask
+                        ? `${fallbackTask}\n\n[MindIE Unavailable: ${err?.message || err}]`
+                        : `[MindIE Session Control] MindIE session control unavailable: ${err?.message || err}\nAcknowledge this status in one short sentence without calling tools.`;
                     return;
                 }
+                sessionStateCache.delete(sessionID);
+                if (!res.matched) return;
                 if (res.activated) {
                     await ensureSummaryServer();
                     if (res.bootstrapping) watchBootstrapReady();
                 }
                 if (typeof res.task_prompt === "string" && res.task_prompt.trim()) {
-                    prompt.text = res.task_prompt;
+                    prompt.text = res.schema_warning ? `${res.task_prompt}\n\n[MindIE Warning: ${res.schema_warning}]` : res.task_prompt;
                 } else if (res.message) {
                     prompt.text = `[MindIE Session Control] ${res.message}\nAcknowledge this status in one short sentence without calling tools.`;
                 }
@@ -563,17 +563,19 @@ export default {
                     state = cached.state;
                 } else {
                     const info = await safeGetSession(ctx, sessionID);
-                    state = await runHook("session-state", {
-                        sessionID,
-                        directory: info?.directory || defaultDirectory(),
-                        parentID: info?.parentID,
-                        forkSessionID: info?.forkSessionID,
-                    });
-                    sessionStateCache.set(sessionID, { sig, state });
+                    try {
+                        state = await runHook("session-state", { sessionID, directory: info?.directory || defaultDirectory(), parentID: info?.parentID, forkSessionID: info?.forkSessionID });
+                        if (state?.status === "unavailable") {
+                            process.stderr.write(`MindIE OpenCode session-state unavailable (${sessionID}): ${state.error || state.reason || "unavailable"}\n`);
+                        } else {
+                            sessionStateCache.set(sessionID, { sig, state });
+                        }
+                    } catch (err) {
+                        process.stderr.write(`MindIE OpenCode session-state hook failed (${sessionID}): ${err?.message || err}\n`);
+                        return;
+                    }
                 }
-                if (!state?.activated || !Array.isArray(system)) {
-                    return;
-                }
+                if (!state?.activated || !Array.isArray(system)) return;
                 await ensureSummaryServer();
                 const marker = `<mindie-agent-skill session="${sessionID}">`;
                 const alreadyPresent = system.some(
@@ -608,9 +610,10 @@ export default {
                         input: cleanInput,
                         directory: info?.directory || defaultDirectory(),
                     });
+                    if (res?.decision === "deny" || !res?.bound || typeof res.bind_id !== "string") {
+                        throw new Error(res?.reason || `MindIE MCP pre-tool-use failed to publish session bind for '${tool}'`);
+                    }
                     if (
-                        res?.bound &&
-                        typeof res.bind_id === "string" &&
                         input &&
                         typeof input === "object" &&
                         !Array.isArray(input) &&
@@ -750,8 +753,10 @@ export default {
                             }
                             spawnDetachedCapture({ sessionID, eventID, eventType: evType, opencodeDb: opencodeDbPath() });
                         }
-                    } catch {
-                        // Stream closed on host shutdown.
+                    } catch (err) {
+                        if (!disposed) {
+                            process.stderr.write(`MindIE OpenCode event stream error: ${err?.message || err}\n`);
+                        }
                     }
                 })();
             }

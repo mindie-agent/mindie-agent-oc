@@ -29,6 +29,7 @@ import math
 import os
 from pathlib import Path
 import secrets
+import sys
 import time
 
 from bounded import run as bounded_run
@@ -40,6 +41,7 @@ from paths import (
     community_config_path,
     config_path,
     consent_path,
+    data_home,
     engine_config_path,
     read_json,
     state_dir,
@@ -130,29 +132,44 @@ def _read_pending_lease(session: str, config: str | Path | None = None) -> dict 
     return data
 
 
-def flush_pending_cold_activations(python_exe: str | None = None, *, config: str | Path | None = None) -> int:
+def flush_pending_cold_activations(
+    python_exe: str | None = None,
+    *,
+    config: str | Path | None = None,
+    timeout: float = 10.0,
+) -> int:
     """Promote any pre-bootstrap pending session activations into `admission.sqlite3`."""
+    if timeout <= 0:
+        raise TimeoutError("flush_pending_cold_activations timeout must be positive")
+    deadline = time.monotonic() + float(timeout)
     pdir = _pending_dir(config)
     if not pdir.is_dir():
         return 0
     if _has_mindie_knowledge():
-        with _pending_lock(config):
+        lock_budget = min(2.0, deadline - time.monotonic())
+        if lock_budget <= 0:
+            raise TimeoutError("timed out before acquiring pending admission lock")
+        with _pending_lock(config, timeout=lock_budget):
             pending_files = sorted(pdir.glob("*.json"))
             if not pending_files:
                 return 0
             adm = gate(config)
+            adm._deadline = deadline
             adm.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             promoted = 0
             for pfile in pending_files:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError("flush_pending_cold_activations exceeded its budget")
                 try:
                     item = read_json(pfile)
                     sid = require_session(item.get("session"))
                     if int(item.get("enabled") or 0) != 1:
                         if adm.path.is_file():
-                            adm.deactivate(sid)
+                            adm.deactivate(sid, timeout=rem)
                         pfile.unlink(missing_ok=True)
                         continue
-                    if adm.path.is_file() and adm.inspect(sid).get("status") == "inactive":
+                    if adm.path.is_file() and adm.inspect(sid, deadline=deadline).get("status") == "inactive":
                         pfile.unlink(missing_ok=True)
                         continue
                     root = str(Path(str(item.get("project_root") or os.getcwd())).resolve())
@@ -162,7 +179,10 @@ def flush_pending_cold_activations(python_exe: str | None = None, *, config: str
                         if isinstance(raw_at, (int, float)) and math.isfinite(float(raw_at)) and float(raw_at) > 0
                         else None
                     )
+                    adm._write_committed = False
                     adm.activate(sid, project_root=root, root_session=sid, not_before=not_before)
+                    if not getattr(adm, "_write_committed", False) and time.monotonic() >= deadline:
+                        raise TimeoutError("flush_pending_cold_activations exceeded its budget")
                     pfile.unlink(missing_ok=True)
                     promoted += 1
                 except TimeoutError:
@@ -171,24 +191,52 @@ def flush_pending_cold_activations(python_exe: str | None = None, *, config: str
                     continue
             return promoted
     if python_exe and Path(python_exe).exists() and os.path.realpath(python_exe) != os.path.realpath(os.sys.executable):
+        rem = deadline - time.monotonic()
+        if rem <= 0.3:
+            raise TimeoutError("insufficient remaining budget to flush pending cold activations")
+        grace = min(1.0, max(0.15, rem * 0.25))
+        exec_budget = max(0.15, rem - grace)
         code = (
             "import sys; sys.path.insert(0, sys.argv[1]); "
-            "import admission; print(admission.flush_pending_cold_activations(config=sys.argv[2] or None))"
+            "import admission; print(admission.flush_pending_cold_activations(config=sys.argv[2] or None, timeout=float(sys.argv[3])))"
         )
         res = bounded_run(
-            [str(python_exe), "-I", "-c", code, str(Path(__file__).resolve().parent), str(config or "")],
+            [str(python_exe), "-I", "-c", code, str(Path(__file__).resolve().parent), str(config or ""), f"{exec_budget:.2f}"],
             "",
-            timeout=10.0,
+            timeout=exec_budget,
+            cleanup_grace=grace,
         )
         if res.returncode == 0:
             return int((res.stdout or "0").strip() or "0")
     return 0
 
 
-def gate(config: str | Path | None = None):
+def _bounded_gate(path: str | Path, *, deadline: float | None = None):
     from mindie_knowledge.loop.activation import Admission
 
-    return Admission(str(admission_path(config)))
+    class _BoundedAdmission(Admission):
+        _deadline: float | None = deadline
+        _write_committed: bool = False
+
+        def _write(self, fn, *, initialize_missing=False, missing_error=None, timeout=None):
+            dl = self._deadline
+            if dl is not None:
+                rem = dl - time.monotonic()
+                timeout = rem if timeout is None else min(float(timeout), rem)
+            res = super()._write(
+                fn,
+                initialize_missing=initialize_missing,
+                missing_error=missing_error,
+                timeout=timeout,
+            )
+            self._write_committed = True
+            return res
+
+    return _BoundedAdmission(str(path))
+
+
+def gate(config: str | Path | None = None):
+    return _bounded_gate(admission_path(config))
 
 
 def knowledge_lease(session: str, *, config: str | Path | None = None) -> dict | None:
@@ -207,13 +255,23 @@ def activate(
     *,
     domain: str | None = None,
     config: str | Path | None = None,
+    timeout: float = 6.0,
 ) -> dict:
+    if timeout <= 0:
+        raise TimeoutError("session activation timeout must be positive")
+    deadline = time.monotonic() + float(timeout)
     session = require_session(session)
     root = str(Path(project_root).resolve())
     if not os.path.isabs(root):
         raise ValueError("project_root must be an absolute path")
+    rem_init = deadline - time.monotonic()
+    if rem_init <= 0:
+        raise TimeoutError("session activation exceeded its budget")
     if not _has_mindie_knowledge():
-        with _pending_lock(config):
+        lock_budget = min(2.0, rem_init)
+        with _pending_lock(config, timeout=lock_budget):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("session activation exceeded its budget")
             existing = _read_pending_lease(session, config)
             now = float(existing["activated_at"]) if (existing and existing.get("project_root") == root and isinstance(existing.get("activated_at"), (int, float))) else time.time()
             tok = str(existing["token"]) if (existing and existing.get("project_root") == root and isinstance(existing.get("token"), str)) else secrets.token_hex(16)
@@ -245,7 +303,12 @@ def activate(
             activated_at=now,
             project_root=root,
         )
-    with _pending_lock(config):
+    lock_budget = min(2.0, rem_init - 5.05) if rem_init > 5.2 else min(2.0, rem_init)
+    if lock_budget <= 0:
+        raise TimeoutError("timed out before acquiring pending admission lock")
+    with _pending_lock(config, timeout=lock_budget):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("session activation exceeded its budget")
         pending_existing = _read_pending_lease(session, config)
         raw_pending_at = pending_existing.get("activated_at") if pending_existing and pending_existing.get("project_root") == root else None
         preserved_at = (
@@ -256,40 +319,47 @@ def activate(
         cfg_file = config_path(config)
         if domain is not None and cfg_file.is_file():
             adapter = read_json(cfg_file)
-            from mindie_knowledge.loop.domain_routes import activate_selected_domain
+            from mindie_knowledge.loop.cli import config_at
+            from mindie_knowledge.loop.domain_routes import select_engine_config
+            from mindie_knowledge.loop.settings import from_engine_config
 
-            selected = activate_selected_domain(
+            selected_cfg = select_engine_config(
                 adapter["engine_config"],
                 domain=domain,
                 domain_configs=adapter.get("domain_configs"),
-                session=session,
-                project_root=root,
-                root_session=session,
             )
-            lease = selected["lease"]
+            eng_cfg = config_at(selected_cfg)
+            dom_settings = from_engine_config(eng_cfg)
+            if not dom_settings.allows_capture():
+                raise ValueError("selected domain contribution is not authorized: " + dom_settings.contribution_block_reason())
+            if not dom_settings.in_scope(root):
+                raise ValueError("native project scope is outside the selected domain contribution authorization")
+            dom_adm_path = eng_cfg.get("admission_path")
+            if not isinstance(dom_adm_path, str) or not Path(dom_adm_path).is_absolute():
+                raise ValueError("selected domain requires an explicit absolute admission_path")
+            dom_adm = _bounded_gate(dom_adm_path, deadline=deadline)
+            dom_adm.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lease = dom_adm.activate(session, project_root=root, root_session=session, not_before=preserved_at)
+            if not getattr(dom_adm, "_write_committed", False) and time.monotonic() >= deadline:
+                raise TimeoutError("session activation exceeded its budget")
             _pending_file(session, config).unlink(missing_ok=True)
             return dict(
                 status="active",
-                domain=selected["domain"],
-                engine_config=selected["engine_config"],
-                generation=selected["generation"],
+                domain=eng_cfg["domain"],
+                engine_config=str(selected_cfg),
+                generation=dom_settings.generation,
                 mindie_session_id=lease["session"],
                 mindie_activation=lease["token"],
                 activated_at=lease["activated_at"],
                 project_root=lease["project_root"],
             )
         adm = gate(config)
+        adm._deadline = deadline
         adm.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         lease = adm.activate(session, project_root=root, root_session=session, not_before=preserved_at)
+        if not getattr(adm, "_write_committed", False) and time.monotonic() >= deadline:
+            raise TimeoutError("session activation exceeded its budget")
         _pending_file(session, config).unlink(missing_ok=True)
-    eng_file = engine_config_path(config)
-    if eng_file.is_file():
-        try:
-            from mindie_knowledge.loop.handoff import prepare_schema
-
-            prepare_schema(str(eng_file))
-        except Exception:
-            pass
     return dict(
         status="active",
         mindie_session_id=lease["session"],
@@ -299,9 +369,16 @@ def activate(
     )
 
 
-def deactivate(session: str, *, config: str | Path | None = None) -> dict:
+def deactivate(session: str, *, config: str | Path | None = None, timeout: float = 6.0) -> dict:
+    if timeout <= 0:
+        raise TimeoutError("session deactivation timeout must be positive")
+    deadline = time.monotonic() + float(timeout)
     session = require_session(session)
-    with _pending_lock(config):
+    rem_init = deadline - time.monotonic()
+    lock_budget = min(2.0, rem_init - 5.05) if rem_init > 5.2 else min(2.0, rem_init)
+    if lock_budget <= 0:
+        raise TimeoutError("timed out before acquiring pending admission lock")
+    with _pending_lock(config, timeout=lock_budget):
         pfile = _pending_file(session, config)
         if not _has_mindie_knowledge():
             if pfile.is_file():
@@ -315,20 +392,29 @@ def deactivate(session: str, *, config: str | Path | None = None) -> dict:
             if isinstance(domain_configs, dict) and domain_configs:
                 from mindie_knowledge.loop.domain_routes import deactivate_registered_domains
 
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError("session deactivation exceeded its budget")
                 return deactivate_registered_domains(
                     adapter["engine_config"],
                     domain_configs=domain_configs,
                     session=session,
+                    timeout=rem,
                 )
         path = admission_path(config)
         if not path.is_file():
             return dict(status="inactive", session=session)
-        gate(config).deactivate(session)
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("session deactivation exceeded its budget")
+        gate(config).deactivate(session, timeout=rem)
         return dict(status="inactive", session=session)
 
 
 def status_facts(session: str | None = None, *, config: str | Path | None = None) -> dict:
     """Return factual control-plane status without onboarding prompts or activation."""
+    from setup import sharing_status
+
     cfg_file = config_path(config)
     configured = cfg_file.is_file()
     lease = None
@@ -337,23 +423,28 @@ def status_facts(session: str | None = None, *, config: str | Path | None = None
             lease = knowledge_lease(session, config=config)
         except ValueError:
             lease = None
-    consent_state = "unconfigured"
-    cpath = consent_path(config)
-    if cpath.is_file():
-        try:
-            cdata = read_json(cpath)
-            consent_state = str(cdata.get("choice") or cdata.get("status") or "configured")
-        except ValueError:
-            consent_state = "invalid"
-    community_enabled = False
-    comm_path = community_config_path(config)
-    if comm_path.is_file():
-        try:
-            comm_data = read_json(comm_path)
-            community_enabled = bool(comm_data.get("enabled"))
-        except ValueError:
-            community_enabled = False
-    return dict(
+    sharing = sharing_status(config)
+    c_state = sharing["consent_state"]
+    c_choice = (
+        "unconfigured"
+        if c_state == "missing"
+        else ("invalid" if c_state in {"corrupt", "unreadable"} else str(sharing["consent_choice"] or "configured"))
+    )
+    schema_ready: bool | None = None
+    schema_warning: str | None = None
+    for src_idx, src_file in enumerate((cfg_file, data_home() / "oc-component-update-status.json")):
+        if src_file.is_file():
+            try:
+                src_data = read_json(src_file)
+                if src_idx == 0 and type(src_data.get("schema_ready")) is bool:
+                    schema_ready = src_data["schema_ready"]
+                if schema_warning is None and isinstance(src_data.get("schema_warning"), str) and src_data["schema_warning"]:
+                    schema_warning = src_data["schema_warning"]
+            except TimeoutError:
+                raise
+            except (OSError, ValueError):
+                pass
+    facts = dict(
         harness="opencode",
         configured=configured,
         config_path=str(cfg_file),
@@ -362,6 +453,15 @@ def status_facts(session: str | None = None, *, config: str | Path | None = None
         session_id=lease["session"] if lease else session,
         project_root=lease.get("project_root") if lease else None,
         activated_at=lease.get("activated_at") if lease else None,
-        consent_choice=consent_state,
-        community_sharing_enabled=community_enabled,
+        consent_choice=c_choice,
+        consent_state=c_state,
+        community_state=sharing["community_state"],
+        diagnostics_state=sharing["diagnostics_state"],
+        community_sharing_enabled=sharing["sharing_enabled"],
+        reporting_enabled=sharing["reporting_enabled"],
+        repair_required=sharing["repair_required"],
+        schema_ready=schema_ready,
     )
+    if schema_warning is not None:
+        facts["schema_warning"] = schema_warning
+    return facts

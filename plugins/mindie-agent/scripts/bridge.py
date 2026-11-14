@@ -75,7 +75,21 @@ def handle_session_state(event: dict | None = None, *, config=None) -> dict:
         session = session_from_hook(event)
     except ValueError:
         return dict(activated=False, eligible=False, reason="invalid_session")
-    lease = knowledge_lease(session, config=config)
+    try:
+        lease = knowledge_lease(session, config=config)
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        err_text = f"{type(exc).__name__}: {exc}"
+        print(f"MindIE OpenCode session-state unavailable ({session}): {err_text}", file=sys.stderr)
+        return dict(
+            activated=False,
+            eligible=True,
+            status="unavailable",
+            reason="admission_unavailable",
+            error=err_text,
+            session_id=session,
+        )
     if lease is None:
         return dict(activated=False, eligible=True, session_id=session)
     scripts_dir = Path(__file__).resolve().parent
@@ -93,32 +107,33 @@ def handle_session_state(event: dict | None = None, *, config=None) -> dict:
     )
 
 
-def _spawn_background_bootstrap(cfg_file: Path, workspace_root: str | Path | None) -> bool:
-    """Spawn a detached long-budget `setup.py init` outside the 10s hook window."""
-    status_file = data_home() / "oc-bootstrap-status.json"
+def _spawn_detached_task(argv: list[str], status_file: Path, *, cfg_file: Path, max_age: float) -> bool:
+    from component_update import _pid_running, _stop_untracked_updater
+
     now = time.time()
     if status_file.is_file():
         try:
             existing = read_json(status_file)
             started_at = float(existing.get("started_at") or 0.0)
-            if existing.get("status") == "in_progress" and (now - started_at) < 560.0:
+            rec_pid = existing.get("pid")
+            alive = True if rec_pid is None else _pid_running(rec_pid)
+            if existing.get("status") == "in_progress" and alive and (now - started_at) < max_age:
                 return True
         except TimeoutError:
             raise
         except (OSError, ValueError):
             pass
-    try:
-        atomic_write_json(status_file, {"started_at": now, "status": "in_progress", "config": str(cfg_file)})
-    except TimeoutError:
-        raise
-    except OSError:
-        pass
 
-    setup_py = Path(__file__).resolve().parent / "setup.py"
-    argv = [sys.executable, "-I", str(setup_py), "init", "--config", str(cfg_file)]
-    if workspace_root:
-        argv.extend(["--workspace-root", str(workspace_root)])
+    no_breakaway_marker = os.environ.get("_MINDIE_OC_BG_NO_BREAKAWAY")
     env = apply_enterprise_transport_env(dict(os.environ))
+    for strip_key in (
+        "_MINDIE_OC_PGID_FILE",
+        "_MINDIE_OC_PGID_FILES",
+        "_MINDIE_OC_BG_NO_BREAKAWAY",
+        "_MINDIE_OC_REEXEC",
+        "_MINDIE_OC_SUPERVISOR_DEADLINE",
+    ):
+        env.pop(strip_key, None)
     kwargs: dict = dict(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -127,20 +142,64 @@ def _spawn_background_bootstrap(cfg_file: Path, workspace_root: str | Path | Non
         env=env,
     )
     if os.name == "nt":
-        kwargs["creationflags"] = (
+        base_flags = (
             getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         )
+        kwargs["creationflags"] = base_flags | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        try:
+            proc = subprocess.Popen(argv, **kwargs)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            if getattr(exc, "winerror", None) != 5:
+                raise
+            if no_breakaway_marker:
+                Path(no_breakaway_marker).write_text("1\n", encoding="utf-8", newline="\n")
+            kwargs["creationflags"] = base_flags
+            proc = subprocess.Popen(argv, **kwargs)
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen(argv, **kwargs)
+        proc = subprocess.Popen(argv, **kwargs)
+    try:
+        atomic_write_json(
+            status_file,
+            {"started_at": now, "status": "in_progress", "pid": proc.pid, "config": str(cfg_file)},
+        )
+    except TimeoutError:
+        _stop_untracked_updater(proc)
+        raise
+    except OSError as exc:
+        print(f"MindIE OpenCode background status write warning: {exc}", file=sys.stderr)
     return True
+
+
+def _spawn_background_bootstrap(cfg_file: Path, workspace_root: str | Path | None) -> bool:
+    """Spawn a detached long-budget `setup.py init` outside the 10s hook window."""
+    setup_py = Path(__file__).resolve().parent / "setup.py"
+    argv = [sys.executable, "-I", str(setup_py), "init", "--config", str(cfg_file)]
+    if workspace_root:
+        argv.extend(["--workspace-root", str(workspace_root)])
+    return _spawn_detached_task(argv, data_home() / "oc-bootstrap-status.json", cfg_file=cfg_file, max_age=560.0)
+
+
+def _spawn_background_schema_prepare(cfg_file: Path, python_exe: str) -> bool:
+    """Spawn detached bounded `component_update.py --prepare-schema` off the critical hook path."""
+    comp_py = Path(__file__).resolve().parent / "component_update.py"
+    argv = [str(python_exe), "-I", str(comp_py), "--config", str(cfg_file), "--prepare-schema", "--timeout", "90"]
+    return _spawn_detached_task(argv, data_home() / "oc-schema-prepare.json", cfg_file=cfg_file, max_age=95.0)
 
 
 def handle_gesture(event: dict | None = None, *, config=None) -> dict:
     """Handle explicit `/mindie-agent` or `$mindie-agent` commands and prompt prefixes."""
+    hook_deadline = time.monotonic() + 7.5
     event = _read_stdin_event() if event is None else event
-    trigger_background_update_if_due(config=config)
+    try:
+        trigger_background_update_if_due(config=config)
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        print(f"MindIE OpenCode background update trigger warning: {exc}", file=sys.stderr)
     is_gesture, remainder = parse_mindie_gesture(event)
     if not is_gesture:
         return dict(matched=False)
@@ -165,7 +224,10 @@ def handle_gesture(event: dict | None = None, *, config=None) -> dict:
     first = tokens[0].lower() if tokens else "activate"
 
     if first == "deactivate" and len(tokens) == 1:
-        result = deactivate(session, config=config)
+        rem = hook_deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("hook budget exhausted before deactivation")
+        result = deactivate(session, config=config, timeout=rem)
         inactive = result.get("status") == "inactive"
         msg = (
             "MindIE knowledge is deactivated for this OpenCode session. "
@@ -199,22 +261,36 @@ def handle_gesture(event: dict | None = None, *, config=None) -> dict:
     task_prompt = "" if first == "activate" and len(tokens) == 1 else remainder
     # Activate the manual session lease FIRST (< 5ms SQLite WAL write) so cold-start
     # runtime provisioning can never prevent or outlive the hook deadline.
-    lease_info = activate(session, workspace_root, config=config)
+    rem_act = hook_deadline - time.monotonic()
+    if rem_act <= 0:
+        raise TimeoutError("hook budget exhausted before activation")
+    lease_info = activate(session, workspace_root, config=config, timeout=rem_act)
 
     cfg_file = config_path(config)
     readiness_warning = ""
     bootstrapping = False
     if not cfg_file.is_file():
         try:
-            from setup import _current_python_has_runtime, _discover_existing_mindie_python, ensure_default_profile
+            from setup import _current_python_has_runtime, ensure_default_profile
 
-            ready_py = (
-                sys.executable
-                if _current_python_has_runtime()
-                else _discover_existing_mindie_python()
-            )
-            if ready_py is not None:
-                ensure_default_profile(config=cfg_file, workspace_root=workspace_root, python_exe=str(ready_py))
+            rem_prof = hook_deadline - time.monotonic()
+            if _current_python_has_runtime() and rem_prof >= 2.5:
+                try:
+                    ensure_default_profile(
+                        config=cfg_file,
+                        workspace_root=workspace_root,
+                        python_exe=sys.executable,
+                        timeout=rem_prof - 0.3,
+                        prepare_store=False,
+                    )
+                except TimeoutError:
+                    if hook_deadline - time.monotonic() < 0.1:
+                        raise
+                    lease_info["status"] = "degraded"
+                    readiness_warning = (
+                        " Note: default profile initialization exceeded its in-hook budget; "
+                        "the session lease remains active."
+                    )
             else:
                 bootstrapping = _spawn_background_bootstrap(cfg_file, workspace_root)
                 lease_info["status"] = "bootstrapping"
@@ -230,6 +306,35 @@ def handle_gesture(event: dict | None = None, *, config=None) -> dict:
                 f" Note: default profile initialization degraded ({type(exc).__name__}); "
                 "the session lease remains active."
             )
+    schema_warning = lease_info.get("schema_warning")
+    if not schema_warning:
+        for warn_src in (cfg_file, data_home() / "oc-component-update-status.json"):
+            if warn_src.is_file():
+                try:
+                    persisted_warn = read_json(warn_src).get("schema_warning")
+                    if isinstance(persisted_warn, str) and persisted_warn:
+                        schema_warning = persisted_warn
+                        break
+                except TimeoutError:
+                    raise
+                except (OSError, ValueError):
+                    pass
+    if not bootstrapping and cfg_file.is_file():
+        try:
+            from component_update import store_schema_needs_prepare
+            from setup import _current_python_has_runtime
+
+            if store_schema_needs_prepare(cfg_file):
+                cfg_py = read_json(cfg_file).get("python")
+                target_py = str(cfg_py) if isinstance(cfg_py, str) and Path(cfg_py).is_file() else (sys.executable if _current_python_has_runtime() else None)
+                if target_py is not None:
+                    _spawn_background_schema_prepare(cfg_file, target_py)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            print(f"MindIE OpenCode deferred schema prepare schedule warning: {exc}", file=sys.stderr)
+    if isinstance(schema_warning, str) and schema_warning:
+        readiness_warning += f" Note: schema preparation warning ({schema_warning})."
 
     scripts_dir = Path(__file__).resolve().parent
     skill_path = plugin_root() / "skills" / "mindie-agent" / "SKILL.md"
@@ -240,7 +345,7 @@ def handle_gesture(event: dict | None = None, *, config=None) -> dict:
         f"Skill guidance `{skill_path}` and `OPENCODE_SESSION_ID={session}` are active for `{knowledge_cli}`."
         f"{readiness_warning}"
     )
-    return dict(
+    out_gesture = dict(
         matched=True,
         activated=True,
         eligible=True,
@@ -256,6 +361,9 @@ def handle_gesture(event: dict | None = None, *, config=None) -> dict:
         task_prompt=task_prompt,
         message=msg,
     )
+    if isinstance(schema_warning, str) and schema_warning:
+        out_gesture["schema_warning"] = schema_warning
+    return out_gesture
 
 
 def handle_pre_tool_use(event: dict | None = None, *, config=None) -> dict:

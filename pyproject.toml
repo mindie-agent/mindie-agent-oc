@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-agent-oc"
-version = "0.1.1"
+version = "0.1.2"
 description = "OpenCode native harness plugin adapter for MindIE Agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,25 +30,25 @@ test = [
 py-modules = []
 
 [tool.uv.sources]
-mindie-knowledge = { git = "https://github.com/mindie-agent/knowledge", rev = "ac4a89e993c89deba5a4a629e1cd89d61e57c843" }
-remote-dev = { git = "https://github.com/mindie-agent/remote-dev", rev = "991ef7863b2b208f94f54a29db4ac5be50884ea3" }
-mindie-diagnostics = { git = "https://github.com/mindie-agent/diagnostics", rev = "40ce12019354c26ef9006c0d4abc6ffade96afbd" }
-mindie-coordinator = { git = "https://github.com/mindie-agent/coordinator", rev = "819b0deb7bea994d4dff9c009200a48dd9300cc4" }
-mindie-debugger = { git = "https://github.com/mindie-agent/debugger", rev = "e9406b2b178335190d5cb59dff4d6985894497ba" }
-mindie-profiler = { git = "https://github.com/mindie-agent/profiler", rev = "79d97e75bff7351b0472b93c03b072c1cf47f5e7" }
-mindie-sim = { git = "https://github.com/mindie-agent/sim", rev = "6f1d5a871a7b1ef20ff7a8cab33aaf4637fb3f66" }
-npu-top = { git = "https://github.com/mindie-agent/npu-top", rev = "8f0cb3ec66393812e90e118cd73704070c6027a2" }
+mindie-knowledge = { git = "https://github.com/mindie-agent/knowledge", rev = "99d65f11d904bb945d33cf3a9e006609702d8dda" }
+remote-dev = { git = "https://github.com/mindie-agent/remote-dev", rev = "6e9882e0fa495bf2feeef29ec86492498d364531" }
+mindie-diagnostics = { git = "https://github.com/mindie-agent/diagnostics", rev = "37ed7f04a47eae8097cc286335186c3fcd9584b3" }
+mindie-coordinator = { git = "https://github.com/mindie-agent/coordinator", rev = "db9b0c6432001d6049056eabd37422d0bfb9f75a" }
+mindie-debugger = { git = "https://github.com/mindie-agent/debugger", rev = "28c558bc545680cdbad60771d1eeb902955ddd3f" }
+mindie-profiler = { git = "https://github.com/mindie-agent/profiler", rev = "f7dbca5e643db52807e12649e02291069f3d9d82" }
+mindie-sim = { git = "https://github.com/mindie-agent/sim", rev = "f0b19acdab6f5f4e952561c7ff92e4bf9c0b0c3a" }
+npu-top = { git = "https://github.com/mindie-agent/npu-top", rev = "8a68947e730b21b5ed65c50c34aec0e923b3a14c" }
 
 [tool.uv]
 override-dependencies = [
-    "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@ac4a89e993c89deba5a4a629e1cd89d61e57c843",
-    "remote-dev @ git+https://github.com/mindie-agent/remote-dev@991ef7863b2b208f94f54a29db4ac5be50884ea3",
-    "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@40ce12019354c26ef9006c0d4abc6ffade96afbd",
-    "mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@819b0deb7bea994d4dff9c009200a48dd9300cc4",
-    "mindie-debugger @ git+https://github.com/mindie-agent/debugger@e9406b2b178335190d5cb59dff4d6985894497ba",
-    "mindie-profiler @ git+https://github.com/mindie-agent/profiler@79d97e75bff7351b0472b93c03b072c1cf47f5e7",
-    "mindie-sim @ git+https://github.com/mindie-agent/sim@6f1d5a871a7b1ef20ff7a8cab33aaf4637fb3f66",
-    "npu-top @ git+https://github.com/mindie-agent/npu-top@8f0cb3ec66393812e90e118cd73704070c6027a2",
+    "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@99d65f11d904bb945d33cf3a9e006609702d8dda",
+    "remote-dev @ git+https://github.com/mindie-agent/remote-dev@6e9882e0fa495bf2feeef29ec86492498d364531",
+    "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@37ed7f04a47eae8097cc286335186c3fcd9584b3",
+    "mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@db9b0c6432001d6049056eabd37422d0bfb9f75a",
+    "mindie-debugger @ git+https://github.com/mindie-agent/debugger@28c558bc545680cdbad60771d1eeb902955ddd3f",
+    "mindie-profiler @ git+https://github.com/mindie-agent/profiler@f7dbca5e643db52807e12649e02291069f3d9d82",
+    "mindie-sim @ git+https://github.com/mindie-agent/sim@f0b19acdab6f5f4e952561c7ff92e4bf9c0b0c3a",
+    "npu-top @ git+https://github.com/mindie-agent/npu-top@8a68947e730b21b5ed65c50c34aec0e923b3a14c",
 ]
 
 [tool.pytest.ini_options]

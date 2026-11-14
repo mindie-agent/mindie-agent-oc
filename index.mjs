@@ -8,28 +8,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { configPath, readJsonSafe } from "./plugins/mindie-agent/paths.mjs";
+import { configPath, isNewerSemver, readJsonSafe } from "./plugins/mindie-agent/paths.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOCAL_PLUGIN_DIR = path.join(HERE, "plugins", "mindie-agent");
 const LOCAL_HOST = path.join(LOCAL_PLUGIN_DIR, "opencode_host.mjs");
-
-function parseSemverTuple(raw) {
-    if (typeof raw !== "string") return null;
-    const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-
-function isNewerSemver(candidate, active) {
-    const c = parseSemverTuple(candidate);
-    const a = parseSemverTuple(active);
-    if (!c) return false;
-    if (!a) return true;
-    for (let i = 0; i < 3; i += 1) {
-        if (c[i] !== a[i]) return c[i] > a[i];
-    }
-    return false;
-}
 
 export function resolveActiveHostModule(explicitConfig = null) {
     if (!process.env.MINDIE_OC_INSTALLED_ROOT) {
@@ -54,6 +37,9 @@ export function resolveActiveHostModule(explicitConfig = null) {
             if (candidateManifest?.version === expectedVersion && fs.existsSync(candidateHost)) {
                 return candidateHost;
             }
+            process.stderr.write(
+                `[mindie-agent-oc] Active oc.json payload mismatch at ${sourceRoot} (expected ${expectedVersion}, found ${candidateManifest?.version ?? "missing"}); falling back to checkout host module.\n`,
+            );
         }
     }
     return LOCAL_HOST;

@@ -190,6 +190,7 @@ class NativeSummaryModel:
             raise NativeFailure("worker attempted more than one model call", reason="native_extra_turn")
         effective_model = self.requested_model or SUMMARY_MODEL
         directory, core_owned = summary_scratch.create_profile(prefix="mindie-oc-summary-")
+        call_completed = False
         try:
             endpoint = _resolve_endpoint()
             if endpoint is not None:
@@ -253,6 +254,7 @@ class NativeSummaryModel:
                         raise summarizer.SummaryResultError("empty summary response", reason="result_json_invalid")
                     cleaned = _strip_code_fence(text)
                     self.raw_result = cleaned
+                    call_completed = True
                     return cleaned
 
             cli_bin = opencode_cli_bin()
@@ -371,15 +373,23 @@ class NativeSummaryModel:
             if not text:
                 raise summarizer.SummaryResultError("empty CLI summary response", reason="result_json_invalid")
             self.raw_result = text
+            call_completed = True
             return text
         finally:
             if not core_owned:
                 try:
                     shutil.rmtree(directory)
-                except TimeoutError:
-                    raise
-                except OSError:
+                except TimeoutError as exc:
                     self.cleanup_failed = True
+                    if not call_completed:
+                        raise
+                    print(
+                        f"MindIE OpenCode organizer scratch cleanup timed out after completed response: {exc}",
+                        file=sys.stderr,
+                    )
+                except OSError as exc:
+                    self.cleanup_failed = True
+                    print(f"MindIE OpenCode organizer scratch cleanup failed: {exc}", file=sys.stderr)
 
     def invoke(self, messages):
         from langchain_core.messages import AIMessage
