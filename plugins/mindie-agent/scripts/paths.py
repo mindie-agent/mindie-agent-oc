@@ -77,8 +77,17 @@ def _has_pe_header(path: Path) -> bool:
         if fd >= 0:
             try:
                 os.close(fd)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
+
+
+_PY_INTERP_RE = re.compile(r"^(?:python|pypy)(?:\d+(?:\.\d+)*)?$", re.IGNORECASE)
+_WIN_SHIM_BODY_RE = re.compile(
+    r"(?:[a-z0-9_./\"'$\\-]+\.(?:exe|cmd|bat)\b|\b(?:cygpath|wslpath|powershell(?:\.exe)?|cmd\.exe)\b|\\windows\\)",
+    re.IGNORECASE,
+)
 
 
 def _is_wsl_linux_executable(path: Path) -> bool:
@@ -98,17 +107,30 @@ def _is_wsl_linux_executable(path: Path) -> bool:
         if fd >= 0:
             try:
                 os.close(fd)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
     if head.startswith(b"\x7fELF"):
         return True
     if not head.startswith(b"#!"):
         return False
-    first_line = head.splitlines()[0][2:].strip().lower()
-    if not first_line or any(tok in first_line for tok in (b".exe", b".cmd", b".bat", b"powershell")):
+    shebang = head.splitlines()[0][2:].strip().decode("latin1")
+    parts = shebang.split()
+    if not parts or re.match(r"^[a-zA-Z]:[\\/]", parts[0]):
         return False
-    lowered = head.lower()
-    return not any(marker in lowered for marker in (b".exe", b"cygpath", b"$basedir/", b"\\windows\\"))
+    low_shebang = shebang.lower()
+    if any(tok in low_shebang for tok in (".exe", ".cmd", ".bat", "powershell", "\\windows\\")):
+        return False
+    interp = parts[0]
+    if interp.endswith("/env"):
+        interp = next((tok for tok in parts[1:] if not tok.startswith("-")), "")
+    interp_base = interp.rsplit("/", 1)[-1]
+    if not interp_base:
+        return False
+    if _PY_INTERP_RE.fullmatch(interp_base):
+        return True
+    return _WIN_SHIM_BODY_RE.search(head.decode("latin1")) is None
 
 
 def is_windows_host_binary(candidate) -> bool:

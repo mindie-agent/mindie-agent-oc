@@ -300,12 +300,18 @@ def prepare(
 
     required = required_components(adapter, timeout=min(15.0, remaining(5.0)))
     baseline = source_baseline(source_root)
+
+    class _RemoteCatalog(Catalog):
+        def read(self, url: str):
+            try:
+                return super().read(url)
+            except json.JSONDecodeError as exc:
+                from mindie_knowledge.releases_io import ReleaseFetchError
+                raise ReleaseFetchError("invalid_release_json") from exc
+
     selected = discover(
-        current_python,
-        baseline["runtime"],
-        force=force,
-        required_components=required,
-        catalog=Catalog(budget=min(120.0, remaining(20.0))),
+        current_python, baseline["runtime"], force=force, required_components=required,
+        catalog=_RemoteCatalog(budget=min(120.0, remaining(20.0))),
     )
     needs_binding = bool(adapter.get("component_commands")) and (
         rebind_commands(adapter, current_python, selected["runtime"]) != adapter.get("component_commands")

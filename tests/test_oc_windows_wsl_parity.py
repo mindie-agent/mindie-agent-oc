@@ -101,6 +101,7 @@ def test_component_update_check_records_non_reportable_transient_tls_error(
         return orig_failure(op, stage, category, **kwargs)
 
     monkeypatch.setattr(diagnostic_support, "failure", spy_failure)
+    orig_prepare = component_update.prepare
     monkeypatch.setattr(
         component_update,
         "prepare",
@@ -120,6 +121,34 @@ def test_component_update_check_records_non_reportable_transient_tls_error(
         False,
         "release_transport_unavailable",
     )
+
+    # Verify truncated upstream Catalog.read() JSONDecodeError is wrapped into invalid_release_json
+    # (temporary_network, reportable=False) at the remote catalog boundary.
+    import mindie_knowledge.component_releases as comp_rel
+    import mindie_knowledge.component_runtime as comp_rt
+    import mindie_knowledge.component_bindings as comp_bind
+
+    def truncated_http_read(_self, _url: str):
+        raise json.JSONDecodeError("Expecting value", "{truncated", 1)
+
+    monkeypatch.setattr(comp_rel.Catalog, "read", truncated_http_read)
+    monkeypatch.setattr(comp_bind, "required_components", lambda *_a, **_kw: {"knowledge": "0.1.0"})
+    monkeypatch.setattr(comp_rt, "source_baseline", lambda *_a, **_kw: {"runtime": {"knowledge": "abc"}})
+    monkeypatch.setattr(
+        comp_rt,
+        "discover",
+        lambda _py, _rt, **_kw: _kw["catalog"].read("https://api.github.com/repos/mindie-agent/knowledge/releases"),
+    )
+    try:
+        orig_prepare(source=REPO_ROOT, python=sys.executable, config=paths.config_path(), timeout=30.0)
+    except Exception as remote_json_exc:
+        assert diagnostic_support.classify_update_exception(remote_json_exc) == (
+            "temporary_network",
+            False,
+            "invalid_release_json",
+        )
+    else:
+        raise AssertionError("Expected ReleaseFetchError('invalid_release_json') from truncated Catalog.read()")
 
 
 def test_utf8_bom_tolerance_across_python_and_js(tmp_path: Path) -> None:
@@ -192,17 +221,46 @@ def test_wsl_binary_filtering_and_windows_interpreter_parity(
     assert paths.is_usable_venv_python(str(uv_managed).replace("/", "\\")) is False
     assert paths.is_usable_venv_python(r"C:\Users\demo\AppData\Local\Microsoft\WindowsApps\venv\python.exe") is False
 
-    # Verify DrvFS Linux console scripts/ELFs remain usable while Windows shims are rejected.
+    # Verify DrvFS Linux console scripts (with uv/distlib .exe normalization), POSIX $basedir wrappers,
+    # and TimeoutError propagation during os.close() cleanup.
     drvfs_dir = tmp_path / "drvfs_venv"
     drvfs_dir.mkdir()
     linux_console = drvfs_dir / "mindie-profiler"
-    linux_console.write_text("#!/mnt/c/proj/.venv/bin/python\nimport sys\n", encoding="utf-8")
+    linux_console.write_text(
+        "#!/mnt/c/proj/.venv/bin/python3\n"
+        "import re, sys\n"
+        'sys.argv[0] = re.sub(r"(-script\\.pyw|\\.exe)?$", "", sys.argv[0])\n'
+        'if sys.argv[0].endswith(".exe"):\n'
+        "    sys.argv[0] = sys.argv[0][:-4]\n",
+        encoding="utf-8",
+    )
     linux_console.chmod(0o755)
+    posix_basedir = drvfs_dir / "opencode-wrapper"
+    posix_basedir.write_text('#!/bin/sh\nbasedir=$(dirname "$0")\nexec "$basedir/linux-opencode" "$@"\n', encoding="utf-8")
+    posix_basedir.chmod(0o755)
     npm_shim = drvfs_dir / "opencode-npm"
     npm_shim.write_text('#!/bin/sh\nbasedir=$(cygpath -w "$0")\nexec "$basedir/node.exe"\n', encoding="utf-8")
     npm_shim.chmod(0o755)
     assert paths._is_wsl_linux_executable(linux_console) is True
+    assert paths._is_wsl_linux_executable(posix_basedir) is True
     assert paths._is_wsl_linux_executable(npm_shim) is False
+
+    real_close = paths.os.close
+
+    def close_with_timeout(fd):
+        real_close(fd)
+        raise TimeoutError("deadline during close")
+
+    monkeypatch.setattr(paths.os, "close", close_with_timeout)
+    try:
+        try:
+            paths._is_wsl_linux_executable(linux_console)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("Expected TimeoutError from os.close in _is_wsl_linux_executable")
+    finally:
+        monkeypatch.setattr(paths.os, "close", real_close)
 
     fake_nt = types.SimpleNamespace(name="nt", environ=os.environ, path=os.path, fspath=os.fspath)
     monkeypatch.setattr(paths, "os", fake_nt)

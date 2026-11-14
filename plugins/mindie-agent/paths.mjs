@@ -187,6 +187,9 @@ export function inWslJs() {
     }
 }
 
+const PY_INTERP_RE = /^(?:python|pypy)(?:\d+(?:\.\d+)*)?$/i;
+const WIN_SHIM_BODY_RE = /(?:[a-z0-9_./"'$\\-]+\.(?:exe|cmd|bat)\b|\b(?:cygpath|wslpath|powershell(?:\.exe)?|cmd\.exe)\b|\\windows\\)/i;
+
 function isWslLinuxExecutableJs(cand) {
     let fd = -1;
     try {
@@ -199,12 +202,22 @@ function isWslLinuxExecutableJs(cand) {
             return true;
         }
         if (read < 2 || buf[0] !== 0x23 || buf[1] !== 0x21) return false;
-        const text = buf.subarray(0, read).toString("latin1").toLowerCase();
-        const firstLine = text.split(/\r?\n/, 1)[0].slice(2).trim();
-        if (!firstLine || firstLine.includes(".exe") || firstLine.includes(".cmd") || firstLine.includes(".bat") || firstLine.includes("powershell")) {
+        const text = buf.subarray(0, read).toString("latin1");
+        const shebang = text.split(/\r?\n/, 1)[0].slice(2).trim();
+        const parts = shebang.split(/\s+/).filter(Boolean);
+        if (!parts.length || /^[a-zA-Z]:[\\/]/.test(parts[0])) return false;
+        const lowShebang = shebang.toLowerCase();
+        if (lowShebang.includes(".exe") || lowShebang.includes(".cmd") || lowShebang.includes(".bat") || lowShebang.includes("powershell") || lowShebang.includes("\\windows\\")) {
             return false;
         }
-        return !text.includes(".exe") && !text.includes("cygpath") && !text.includes("$basedir/") && !text.includes("\\windows\\");
+        let interp = parts[0];
+        if (interp.endsWith("/env")) {
+            interp = parts.slice(1).find((tok) => !tok.startsWith("-")) || "";
+        }
+        const interpBase = interp.slice(interp.lastIndexOf("/") + 1);
+        if (!interpBase) return false;
+        if (PY_INTERP_RE.test(interpBase)) return true;
+        return !WIN_SHIM_BODY_RE.test(text);
     } catch {
         return false;
     } finally {

@@ -350,6 +350,10 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
             status = getattr(cur, "code", None) if isinstance(cur, urllib.error.HTTPError) else getattr(cur, "status", None)
             code = getattr(cur, "code", None) if cls_name == "ReleaseFetchError" else None
             code_s = code if isinstance(code, str) else None
+            if cls_name == "ReleaseFetchError" and code_s == "release_transport_unavailable" and getattr(cur, "__cause__", None) is not None:
+                inner_cat, inner_rep, inner_code = classify_update_exception(cur.__cause__)
+                if inner_rep or inner_cat in {"timeout", "certificate", "rate_limited"}:
+                    return inner_cat, inner_rep, inner_code
             if code_s == "release_certificate_error":
                 return "certificate", False, "release_certificate_error"
             if status == 429 or (status == 403 and code_s == "release_rate_limited"):
