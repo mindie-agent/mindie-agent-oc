@@ -226,7 +226,7 @@ def test_bounded_subprocess_schema_timeout_and_persisted_diagnostics(
 
     target_json = isolated_oc_env["root"] / "win-retry.json"
     with monkeypatch.context() as mp:
-        mp.setattr(paths_mod.os, "name", "nt")
+        mp.setattr(paths_mod, "_is_windows_fs", lambda: True)
         mp.setattr(paths_mod.os, "replace", _flaky_replace)
         paths_mod.atomic_write_json(target_json, {"ok": True})
     assert attempts == 2 and read_json(target_json) == {"ok": True}

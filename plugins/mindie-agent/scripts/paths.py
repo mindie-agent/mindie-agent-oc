@@ -264,6 +264,10 @@ def read_json(path: str | Path) -> dict:
     return parsed
 
 
+def _is_windows_fs() -> bool:
+    return os.name == "nt"
+
+
 def atomic_write_json(path: str | Path, payload: dict) -> Path:
     target = Path(path).resolve()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -281,7 +285,7 @@ def atomic_write_json(path: str | Path, payload: dict) -> Path:
             except TimeoutError:
                 raise
             except PermissionError:
-                if os.name != "nt" or attempt == 4:
+                if not _is_windows_fs() or attempt == 4:
                     raise
                 time.sleep(0.015)
     except BaseException:
