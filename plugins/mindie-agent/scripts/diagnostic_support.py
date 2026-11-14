@@ -319,11 +319,6 @@ def failure(operation: str, stage: str, category: str, *, exception=None,
     return out
 
 
-_LOCAL_HTTP_BUG_NAMES = frozenset({
-    "InvalidURL", "ImproperConnectionState", "NotConnected", "UnimplementedFileMode",
-})
-
-
 def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None]:
     """Map transient transport/TLS/HTTP/DNS update failures without masking local bugs."""
     import http.client
@@ -331,6 +326,12 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
     import ssl
     import urllib.error
 
+    local_http_bugs = (
+        http.client.InvalidURL,
+        http.client.ImproperConnectionState,
+        http.client.NotConnected,
+        http.client.UnimplementedFileMode,
+    )
     if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
         return "timeout", False, None
     seen: set[int] = set()
@@ -341,7 +342,7 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
             continue
         seen.add(id(cur))
         cls_name = type(cur).__name__
-        if cls_name == "ReleaseResponseTooLarge" or cls_name in _LOCAL_HTTP_BUG_NAMES:
+        if cls_name == "ReleaseResponseTooLarge" or isinstance(cur, local_http_bugs):
             return "update", True, None
         if isinstance(cur, (TimeoutError, subprocess.TimeoutExpired)):
             return "timeout", False, None
@@ -362,8 +363,6 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
             return "temporary_network", False, "release_transport_unavailable"
         if isinstance(cur, (ssl.SSLError, ConnectionError, socket.gaierror, socket.herror, http.client.HTTPException)):
             return "temporary_network", False, "release_transport_unavailable"
-        if isinstance(cur, json.JSONDecodeError):
-            return "temporary_network", False, "invalid_release_json"
         if getattr(cur, "__cause__", None) is not None:
             pending.append(cur.__cause__)
         if getattr(cur, "__context__", None) is not None and not getattr(cur, "__suppress_context__", False):

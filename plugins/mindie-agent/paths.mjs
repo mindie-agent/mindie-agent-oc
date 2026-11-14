@@ -187,6 +187,33 @@ export function inWslJs() {
     }
 }
 
+function isWslLinuxExecutableJs(cand) {
+    let fd = -1;
+    try {
+        fd = fs.openSync(cand, "r");
+        const st = fs.fstatSync(fd);
+        if (!st.isFile() || st.size < 4) return false;
+        const buf = Buffer.alloc(Math.min(512, st.size));
+        const read = fs.readSync(fd, buf, 0, buf.length, 0);
+        if (read >= 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46) {
+            return true;
+        }
+        if (read < 2 || buf[0] !== 0x23 || buf[1] !== 0x21) return false;
+        const text = buf.subarray(0, read).toString("latin1").toLowerCase();
+        const firstLine = text.split(/\r?\n/, 1)[0].slice(2).trim();
+        if (!firstLine || firstLine.includes(".exe") || firstLine.includes(".cmd") || firstLine.includes(".bat") || firstLine.includes("powershell")) {
+            return false;
+        }
+        return !text.includes(".exe") && !text.includes("cygpath") && !text.includes("$basedir/") && !text.includes("\\windows\\");
+    } catch {
+        return false;
+    } finally {
+        if (fd >= 0) {
+            try { fs.closeSync(fd); } catch {}
+        }
+    }
+}
+
 export function isUsableBootstrapPython(cand) {
     if (typeof cand !== "string" || !cand.trim()) return false;
     const norm = cand.replace(/\\/g, "/").toLowerCase();
@@ -195,8 +222,9 @@ export function isUsableBootstrapPython(cand) {
         return false;
     }
     if (process.platform !== "win32") {
-        if (WIN_HOST_EXT_RE.test(norm) || (inWslJs() && WSL_DRVFS_RE.test(cand))) {
-            return false;
+        if (WIN_HOST_EXT_RE.test(norm)) return false;
+        if (inWslJs() && WSL_DRVFS_RE.test(cand)) {
+            return isWslLinuxExecutableJs(cand);
         }
     }
     return fs.existsSync(cand);
@@ -268,15 +296,24 @@ function resolveColdWindowsPython() {
         uvCands.push(...collectMatchingSubdirs(path.join(localApp, "Microsoft", "WinGet", "Packages"), "astral-sh.uv_", "uv.exe"));
     }
     if (userProf) uvCands.push(path.join(userProf, ".local", "bin", "uv.exe"));
+    const seenUv = new Set();
     for (const uvExe of uvCands) {
-        if (!fs.existsSync(uvExe)) continue;
-        const found = spawnSync(uvExe, ["python", "find", ">=3.11"], { timeout: 2500, windowsHide: true, encoding: "utf8" });
+        const uvKey = uvExe.toLowerCase();
+        if (seenUv.has(uvKey) || !fs.existsSync(uvExe)) continue;
+        seenUv.add(uvKey);
+        if (seenUv.size > 4) break;
+        const found = spawnSync(uvExe, ["python", "find", ">=3.11"], { timeout: 2000, windowsHide: true, encoding: "utf8" });
         const pyPath = !found.error && found.status === 0 ? String(found.stdout || "").trim() : "";
-        if (pyPath && isUsableBootstrapPython(pyPath)) {
+        if (!pyPath || !isUsableBootstrapPython(pyPath)) continue;
+        const pyProbe = spawnSync(
+            pyPath,
+            ["-S", "-c", "import sys;raise SystemExit(0 if sys.version_info>=(3,11) else 1)"],
+            { timeout: 2000, windowsHide: true, stdio: "ignore" },
+        );
+        if (!pyProbe.error && pyProbe.status === 0) {
             coldWinPythonCache = { key: cacheKey, value: pyPath };
             return pyPath;
         }
-        break;
     }
     return "python";
 }

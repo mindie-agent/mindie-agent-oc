@@ -69,14 +69,21 @@ def test_classify_update_exception_maps_transient_transport_without_masking_loca
         ReleaseFetchError("release_rate_limited", status=429)
     ) == ("rate_limited", False, "release_rate_limited")
     assert diagnostic_support.classify_update_exception(
-        json.JSONDecodeError("bad json", "{", 1)
+        ReleaseFetchError("invalid_release_json")
     ) == ("temporary_network", False, "invalid_release_json")
 
+    wrapped_local_json = ValueError("MindIE metadata is malformed JSON: product-contract.json")
+    wrapped_local_json.__cause__ = json.JSONDecodeError("bad json", "{", 1)
     for local_bug in (
         ReleaseResponseTooLarge("oversize"),
         http.client.InvalidURL("http://bad host"),
         http.client.ImproperConnectionState("double send"),
+        http.client.CannotSendRequest("cannot send request"),
+        http.client.CannotSendHeader(),
+        http.client.ResponseNotReady(),
         http.client.NotConnected("closed"),
+        json.JSONDecodeError("bad local json", "{", 1),
+        wrapped_local_json,
         ValueError("contract mismatch"),
         RuntimeError("unexpected"),
     ):
@@ -185,6 +192,18 @@ def test_wsl_binary_filtering_and_windows_interpreter_parity(
     assert paths.is_usable_venv_python(str(uv_managed).replace("/", "\\")) is False
     assert paths.is_usable_venv_python(r"C:\Users\demo\AppData\Local\Microsoft\WindowsApps\venv\python.exe") is False
 
+    # Verify DrvFS Linux console scripts/ELFs remain usable while Windows shims are rejected.
+    drvfs_dir = tmp_path / "drvfs_venv"
+    drvfs_dir.mkdir()
+    linux_console = drvfs_dir / "mindie-profiler"
+    linux_console.write_text("#!/mnt/c/proj/.venv/bin/python\nimport sys\n", encoding="utf-8")
+    linux_console.chmod(0o755)
+    npm_shim = drvfs_dir / "opencode-npm"
+    npm_shim.write_text('#!/bin/sh\nbasedir=$(cygpath -w "$0")\nexec "$basedir/node.exe"\n', encoding="utf-8")
+    npm_shim.chmod(0o755)
+    assert paths._is_wsl_linux_executable(linux_console) is True
+    assert paths._is_wsl_linux_executable(npm_shim) is False
+
     fake_nt = types.SimpleNamespace(name="nt", environ=os.environ, path=os.path, fspath=os.fspath)
     monkeypatch.setattr(paths, "os", fake_nt)
     assert paths.same_interpreter(
@@ -213,3 +232,79 @@ def test_wsl_binary_filtering_and_windows_interpreter_parity(
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert json.loads(js_wsl.stdout.strip()) == {"winApps": False, "pyw": False, "mntC": False}
+
+
+def test_js_windows_kill_hook_tree_and_cold_uv_fallback_resilience(tmp_path: Path) -> None:
+    node_bin = shutil.which("node")
+    assert node_bin is not None
+    host_js = REPO_ROOT / "plugins" / "mindie-agent" / "opencode_host.mjs"
+    paths_js = REPO_ROOT / "plugins" / "mindie-agent" / "paths.mjs"
+    script = """
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
+
+const hostSrc = fs.readFileSync(process.argv[1], "utf8");
+const killFn = hostSrc.slice(hostSrc.indexOf("function killHookTree("), hostSrc.indexOf("\\nfunction runHook("));
+
+// 1. Successful synchronous taskkill terminates tree while parent PID is still alive (no premature child.kill).
+let events = [];
+let parentAlive = true;
+vm.runInNewContext(killFn + "\\nkillHookTree(child);", {
+    process: { platform: "win32" },
+    spawnSync: (cmd, args, opts) => {
+        events.push({ cmd, args, windowsHide: opts.windowsHide, parentAlive });
+        return { status: 0, error: null };
+    },
+    child: { pid: 4242, kill: () => { parentAlive = false; events.push({ fallbackKill: true }); } },
+});
+assert.equal(events.length, 1);
+assert.equal(events[0].parentAlive, true);
+assert.equal(events[0].windowsHide, true);
+
+// 2. Missing taskkill (ENOENT) does not throw uncaught error and falls back cleanly to child.kill("SIGKILL").
+events = [];
+vm.runInNewContext(killFn + "\\nkillHookTree(child);", {
+    process: { platform: "win32" },
+    spawnSync: () => ({ status: null, error: Object.assign(new Error("spawnSync taskkill ENOENT"), { code: "ENOENT" }) }),
+    child: { pid: 4242, kill: (sig) => events.push({ fallbackSig: sig }) },
+});
+assert.deepEqual(events, [{ fallbackSig: "SIGKILL" }]);
+
+// 3. Cold uv fallback continues past a blocked/failing first uv.exe to a healthy second uv.exe.
+const pathsSrc = fs.readFileSync(process.argv[2], "utf8");
+const coldFn = pathsSrc.slice(pathsSrc.indexOf("function resolveColdWindowsPython("), pathsSrc.indexOf("\\nexport function resolveBootstrapPython("));
+const uvCalls = [];
+const res = vm.runInNewContext(coldFn + "\\nresolveColdWindowsPython();", {
+    process: {
+        platform: "win32",
+        env: { LOCALAPPDATA: "C:\\\\AppData\\\\Local", APPDATA: "", USERPROFILE: "C:\\\\Users\\\\u", PATH: "C:\\\\uv1;C:\\\\uv2" },
+    },
+    os: { homedir: () => "C:\\\\Users\\\\u" },
+    path: path.win32,
+    coldWinPythonCache: { key: "", value: "" },
+    collectMatchingSubdirs: () => [],
+    isUsableBootstrapPython: (p) => p === "C:\\\\Healthy\\\\python.exe",
+    fs: { existsSync: (p) => p === "C:\\\\uv1\\\\uv.exe" || p === "C:\\\\uv2\\\\uv.exe" || p === "C:\\\\Healthy\\\\python.exe" },
+    spawnSync: (exe, args) => {
+        uvCalls.push(exe);
+        if (exe === "C:\\\\uv1\\\\uv.exe") return { status: 1, error: new Error("SAC 4551"), stdout: "" };
+        if (exe === "C:\\\\uv2\\\\uv.exe") return { status: 0, error: null, stdout: "C:\\\\Healthy\\\\python.exe\\r\\n" };
+        if (exe === "C:\\\\Healthy\\\\python.exe") return { status: 0, error: null, stdout: "" };
+        return { status: 1, error: null, stdout: "" };
+    },
+});
+assert.equal(res, "C:\\\\Healthy\\\\python.exe");
+assert.deepEqual(uvCalls, ["C:\\\\uv1\\\\uv.exe", "C:\\\\uv2\\\\uv.exe", "C:\\\\Healthy\\\\python.exe"]);
+console.log("OK");
+"""
+    proc = subprocess.run(
+        [node_bin, "--input-type=module", "-e", script, str(host_js), str(paths_js)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert proc.stdout.strip() == "OK"

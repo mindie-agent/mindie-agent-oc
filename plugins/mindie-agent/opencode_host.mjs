@@ -9,7 +9,7 @@
  * [Side-Effect Policy] Delegates state mutations to MindIE Python scripts (`mindie_launch.py`, `capture_stop.py`) and writes only `summary-endpoint.json` under MindIE `stateDir()`.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -164,9 +164,10 @@ function killHookTree(child) {
             return;
         } catch {}
     } else {
-        try {
-            spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore", windowsHide: true }).unref();
-        } catch {}
+        const res = spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
+            stdio: "ignore", timeout: 2000, windowsHide: true,
+        });
+        if (!res.error && res.status === 0) return;
     }
     try {
         child.kill("SIGKILL");
