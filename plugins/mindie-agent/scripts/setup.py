@@ -49,7 +49,8 @@ from oc_native_compat import ensure_oc_native_support
 from paths import (
     admission_path, apply_enterprise_transport_env, atomic_write_json, community_config_path,
     config_path, consent_path, data_home, diagnostics_config_path, engine_config_path,
-    installed_source_root, plugin_root, read_json, repo_root, state_dir,
+    installed_source_root, is_usable_venv_python, norm_python_path, plugin_root, read_json,
+    repo_root, state_dir, which_host_binary,
 )
 
 ensure_oc_native_support()
@@ -176,8 +177,7 @@ def _probe_runtime_python(py_exe: str | Path, *, timeout: float = 15.0) -> bool:
 
 
 def _norm_python_path(py_exe: str | Path) -> Path:
-    p = Path(py_exe).expanduser()
-    return p.parent.resolve() / p.name
+    return Path(norm_python_path(py_exe))
 
 
 def _discover_existing_mindie_python() -> str | None:
@@ -203,7 +203,7 @@ def _discover_existing_mindie_python() -> str | None:
             if cfg_cand.is_file():
                 try:
                     py = read_json(cfg_cand).get("python")
-                    if isinstance(py, str) and ("venv" in py or ".venv" in py):
+                    if is_usable_venv_python(py):
                         candidates.append(Path(py))
                 except ValueError:
                     pass
@@ -258,7 +258,7 @@ def ensure_runtime_python(
     venv_dir = data_home() / "oc-venv"
     venv_py = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     src_root = stage_source_baseline(source_root)
-    uv = shutil.which("uv")
+    uv = which_host_binary("uv", which_fn=shutil.which)
     if uv is None:
         raise RuntimeError("uv is required to bootstrap the MindIE OpenCode runtime")
 
@@ -437,7 +437,7 @@ def ensure_default_profile(
     resolved_source = stage_source_baseline(source_dir=source_root, workspace_root=workspace_root)
     scripts_dir = (resolved_source / "plugins/mindie-agent/scripts").resolve()
     validation = validate_contracts(resolved_source)
-    gitleaks = shutil.which("gitleaks")
+    gitleaks = which_host_binary("gitleaks", which_fn=shutil.which)
     if not gitleaks:
         cache_dir = Path.home() / ".cache" / "mindie-agent" / "gitleaks"
         if cache_dir.is_dir():
@@ -582,7 +582,7 @@ def _resolve_github_fork(
     repository: str, account: str | None, *, deadline: float | None = None
 ) -> tuple[str | None, str | None]:
     dl = deadline if deadline is not None else (time.monotonic() + 45.0)
-    gh = shutil.which("gh")
+    gh = which_host_binary("gh", which_fn=shutil.which)
     if not gh:
         return account, None
     env = apply_enterprise_transport_env(dict(os.environ))
@@ -671,7 +671,7 @@ def configure_community(
         else current.raw.get("account")
         or (resolved_fork.split("/", 1)[0] if isinstance(resolved_fork, str) and "/" in resolved_fork else None)
     )
-    if enabled and resolved_fork is None and shutil.which("gh"):
+    if enabled and resolved_fork is None and which_host_binary("gh", which_fn=shutil.which):
         resolved_account, resolved_fork = _resolve_github_fork(repository, resolved_account, deadline=deadline)
 
     write_kwargs = dict(
@@ -744,7 +744,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sharing" and not (args.status or args.enable or args.disable):
         parser.error("sharing requires one of --status, --enable, or --disable")
     if bool(getattr(args, "dry_run", False)):
-        return _emit_json({"schema": "mindie-oc-setup/1", "status": "dry-run", "bootstrap": False, "cmd": args.cmd, "uv": shutil.which("uv"), "gh": shutil.which("gh")})
+        return _emit_json({"schema": "mindie-oc-setup/1", "status": "dry-run", "bootstrap": False, "cmd": args.cmd, "uv": which_host_binary("uv", which_fn=shutil.which), "gh": which_host_binary("gh", which_fn=shutil.which)})
     if args.cmd not in {"init", "sharing"}:
         parser.error("a command is required: init | sharing")
     if args.cmd == "sharing" and args.status:

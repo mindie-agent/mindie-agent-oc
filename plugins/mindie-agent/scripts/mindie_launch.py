@@ -41,7 +41,10 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from bounded import run_supervised_reexec
-from paths import apply_enterprise_transport_env, config_path, data_home, read_json
+from paths import (
+    apply_enterprise_transport_env, config_path, data_home, is_usable_venv_python,
+    is_windows_host_binary, norm_python_path, read_json, same_interpreter,
+)
 
 HOOK_EXEC_BUDGET = 8.0
 HOOK_CLEANUP_GRACE = 2.0
@@ -57,18 +60,11 @@ BOOTSTRAP_OUTER_SECONDS = 580.0
 
 
 def _norm_python_path(py_exe: str | Path) -> Path:
-    p = Path(py_exe).expanduser()
-    return p.parent.resolve() / p.name
+    return Path(norm_python_path(py_exe))
 
 
 def _is_venv_python(py: str | None) -> bool:
-    return bool(
-        isinstance(py, str)
-        and ("venv" in py or ".venv" in py)
-        and "/uv/python/" not in py
-        and "/Cellar/python" not in py
-        and Path(py).is_file()
-    )
+    return is_usable_venv_python(py)
 
 
 def _preferred_python() -> str | None:
@@ -163,10 +159,19 @@ def _setup_outer_budget(seconds: float):
         signal.signal(signal.SIGALRM, prev_handler)
 
 
+def _write_stdout_bytes(data: bytes) -> None:
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        buf.write(data)
+        buf.flush()
+    elif sys.stdout is not None:
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+
+
 def _emit_pre_tool_deny(reason: str) -> int:
     payload = {"bound": False, "decision": "deny", "reason": reason}
-    sys.stdout.buffer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-    sys.stdout.buffer.flush()
+    _write_stdout_bytes((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
     return 2
 
 
@@ -174,8 +179,7 @@ def _emit_hook_failure(hook_name: str, reason: str, exit_code: int) -> int:
     if hook_name == "pre-tool-use":
         return _emit_pre_tool_deny(reason)
     payload = {"activated": False, "matched": False, "status": "unavailable", "error": reason}
-    sys.stdout.buffer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-    sys.stdout.buffer.flush()
+    _write_stdout_bytes((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
     return exit_code
 
 
@@ -202,8 +206,8 @@ def main(argv: list[str] | None = None) -> int:
             directories = [Path(retained) / "plugins/mindie-agent/scripts"] if isinstance(retained, str) else []
             if isinstance(active_scripts, str):
                 directories.append(Path(active_scripts))
-            if isinstance(active_python, str) and Path(active_python).is_file():
-                target_py = str(_norm_python_path(active_python))
+            if isinstance(active_python, str) and not is_windows_host_binary(active_python) and Path(active_python).is_file():
+                target_py = norm_python_path(active_python)
                 if local_ver is None or (expected_ver_tuple is not None and expected_ver_tuple >= local_ver):
                     for directory in directories:
                         manifest = directory.parent / "plugin.json"
@@ -227,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     needs_reexec = (
         target_py is not None
         and (
-            _norm_python_path(sys.executable) != _norm_python_path(target_py)
+            not same_interpreter(sys.executable, target_py)
             or target_script != Path(__file__).resolve()
         )
     )

@@ -47,7 +47,7 @@ from oc_native_compat import ensure_oc_native_support
 from paths import (
     admission_path, apply_enterprise_transport_env, atomic_write_json, community_config_path,
     config_path, consent_path, data_home, engine_config_path, installed_source_root,
-    read_json, repo_root, state_dir,
+    norm_python_path as _norm_python_path, read_json, repo_root, same_interpreter, state_dir, which_host_binary,
 )
 
 ensure_oc_native_support()
@@ -238,11 +238,6 @@ def trigger_background_update_if_due(*, config: str | Path | None = None) -> boo
         return False
 
 
-def _norm_python_path(py_exe: str | Path) -> str:
-    p = Path(py_exe).expanduser()
-    return str(p.parent.resolve() / p.name)
-
-
 def compatible_runtime(python: str, *, source=None, config=None, timeout: float = 540.0) -> str:
     """Prepare a compatible generation without changing the active profile."""
     if timeout <= 0:
@@ -250,7 +245,7 @@ def compatible_runtime(python: str, *, source=None, config=None, timeout: float 
     deadline = time.monotonic() + float(timeout)
     norm_py = _norm_python_path(python)
     req_mods = ("mindie_knowledge", "remote_dev", "mindie_diagnostics", "mindie_profiler", "mindie_sim", "mindie_coordinator", "mindie_debugger", "npu_top")
-    if norm_py == _norm_python_path(sys.executable) and all(importlib.util.find_spec(m) is not None for m in req_mods) and importlib.util.find_spec("remote_dev.mcp.outcome") is not None:
+    if same_interpreter(python, sys.executable) and all(importlib.util.find_spec(m) is not None for m in req_mods) and importlib.util.find_spec("remote_dev.mcp.outcome") is not None:
         return norm_py
     imports = f"import {', '.join(req_mods)}; from remote_dev.mcp.outcome import operation_outcome"
 
@@ -305,12 +300,18 @@ def prepare(
 
     required = required_components(adapter, timeout=min(15.0, remaining(5.0)))
     baseline = source_baseline(source_root)
+
+    class _RemoteCatalog(Catalog):
+        def read(self, url: str, *args, **kwargs):
+            try:
+                return super().read(url, *args, **kwargs)
+            except json.JSONDecodeError as exc:
+                from mindie_knowledge.releases_io import ReleaseFetchError
+                raise ReleaseFetchError("invalid_release_json") from exc
+
     selected = discover(
-        current_python,
-        baseline["runtime"],
-        force=force,
-        required_components=required,
-        catalog=Catalog(budget=min(120.0, remaining(20.0))),
+        current_python, baseline["runtime"], force=force, required_components=required,
+        catalog=_RemoteCatalog(budget=min(120.0, remaining(20.0))),
     )
     needs_binding = bool(adapter.get("component_commands")) and (
         rebind_commands(adapter, current_python, selected["runtime"]) != adapter.get("component_commands")
@@ -350,7 +351,7 @@ def _candidate_plugin_is_newer(candidate_source: Path, adapter: dict) -> bool:
 
 
 def _find_gitleaks_executable() -> str | None:
-    found = shutil.which("gitleaks")
+    found = which_host_binary("gitleaks", which_fn=shutil.which)
     if found:
         return found
     cache_dir = Path.home() / ".cache" / "mindie-agent" / "gitleaks"
@@ -505,7 +506,7 @@ def sync_store_schema(
         and threading.current_thread() is threading.main_thread()
         and signal.getsignal(signal.SIGALRM) == signal.SIG_DFL
     )
-    same_py = not isinstance(py, str) or _norm_python_path(py) == _norm_python_path(sys.executable)
+    same_py = not isinstance(py, str) or same_interpreter(py, sys.executable)
     in_proc = importlib.util.find_spec("mindie_knowledge") is not None and same_py and (deadline is None or can_alarm)
     rem = None if deadline is None else (deadline - time.monotonic())
     min_budget = 5.2 if in_proc else 5.6
@@ -660,7 +661,8 @@ def check(
         except Exception as exc:
             import diagnostic_support
 
-            diag = diagnostic_support.failure("component.update", "prepare", "update", exception=exc, config=cfg_file)
+            cat, rep, code = diagnostic_support.classify_update_exception(exc)
+            diag = diagnostic_support.failure("component.update", "prepare", cat, exception=exc, config=cfg_file, reportable=rep, reason_code=code)
             try:
                 atomic_write_json(status_file, {"checked_at": time.time(), "status": "failed", "error": f"{type(exc).__name__}: {exc}", "diagnostic": diag})
             except TimeoutError:

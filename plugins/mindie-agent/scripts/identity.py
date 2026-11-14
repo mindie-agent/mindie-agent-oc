@@ -53,9 +53,10 @@ MAX_HOOK_BYTES = 16 * 1024 * 1024
 def parse_hook(raw: bytes) -> dict:
     if len(raw) > MAX_HOOK_BYTES:
         raise ValueError("native hook payload exceeds 16 MiB byte budget")
-    if not raw.strip():
+    text = raw.decode("utf-8-sig")
+    if not text.strip():
         return {}
-    event = json.loads(raw.decode("utf-8"))
+    event = json.loads(text)
     if not isinstance(event, dict):
         raise ValueError("native hook payload must be a JSON object")
     return event
@@ -120,6 +121,7 @@ def parse_mindie_gesture(event_or_prompt: dict | str) -> tuple[bool, str]:
         return False, ""
     if not isinstance(prompt, str):
         return False, ""
+    prompt = prompt.lstrip("\ufeff")
     match = GESTURE_RE.match(prompt)
     if match is None:
         return False, ""

@@ -26,13 +26,219 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
+import struct
 import sys
 import tempfile
 import time
 
 MAX_CONFIG_BYTES = 65536
+_WIN_SUFFIXES = frozenset({".exe", ".cmd", ".bat", ".ps1", ".com"})
+_WSL_DRVFS_RE = re.compile(r"^/mnt/[a-zA-Z](?:/|$)")
+_REAL_WHICH = shutil.which
+
+
+def in_wsl() -> bool:
+    """Return True when POSIX Python is running inside a WSL2 Linux environment."""
+    if os.name != "posix":
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+
+
+def _has_pe_header(path: Path) -> bool:
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size < 64:
+            return False
+        head = os.read(fd, 64)
+        if len(head) < 64 or head[:2] != b"MZ":
+            return False
+        pe_off = struct.unpack_from("<I", head, 0x3C)[0]
+        if pe_off < 64 or pe_off + 4 > info.st_size or pe_off > 16 * 1024 * 1024:
+            return False
+        os.lseek(fd, pe_off, os.SEEK_SET)
+        return os.read(fd, 4) == b"PE\x00\x00"
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+
+
+_PY_INTERP_RE = re.compile(r"^(?:python|pypy)(?:\d+(?:\.\d+)*)?$", re.IGNORECASE)
+_WIN_SHIM_BODY_RE = re.compile(
+    r"(?:[a-z0-9_./\"'$\\-]+\.(?:exe|cmd|bat)\b|\b(?:cygpath|wslpath|powershell(?:\.exe)?|cmd\.exe)\b|\\windows\\)",
+    re.IGNORECASE,
+)
+
+
+def _is_wsl_linux_executable(path: Path) -> bool:
+    """Return True only for genuine Linux ELF or POSIX shebang scripts stored on WSL DrvFS."""
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size < 4:
+            return False
+        head = os.read(fd, 512)
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+    if head.startswith(b"\x7fELF"):
+        return True
+    if not head.startswith(b"#!"):
+        return False
+    lines = head.decode("latin1").splitlines()
+    shebang = lines[0][2:].strip()
+    parts = shebang.split()
+    if not parts or re.match(r"^[a-zA-Z]:[\\/]", parts[0]):
+        return False
+    low_shebang = shebang.lower()
+    if any(tok in low_shebang for tok in (".exe", ".cmd", ".bat", "powershell", "\\windows\\")):
+        return False
+    interp = parts[0]
+    if interp.endswith("/env"):
+        interp = next((tok for tok in parts[1:] if not tok.startswith("-")), "")
+    interp_base = interp.rsplit("/", 1)[-1]
+    if not interp_base:
+        return False
+    if _PY_INTERP_RE.fullmatch(interp_base):
+        return True
+    if len(lines) > 1 and lines[1].startswith("'''exec'"):
+        tramp = re.match(r"^'''exec'\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))", lines[1])
+        target = next((g for g in (tramp.groups() if tramp else ()) if g), "")
+        if target and not re.match(r"^[a-zA-Z]:[\\/]", target) and "\\windows\\" not in target.lower():
+            if _PY_INTERP_RE.fullmatch(target.rsplit("/", 1)[-1]):
+                return True
+    return _WIN_SHIM_BODY_RE.search(head.decode("latin1")) is None
+
+
+def is_windows_host_binary(candidate) -> bool:
+    """Reject Windows PE/.exe/DrvFS shims when discovering POSIX/WSL host CLIs."""
+    if not candidate or os.name != "posix":
+        return False
+    raw = os.fspath(candidate)
+    if Path(raw).suffix.lower() in _WIN_SUFFIXES:
+        return True
+    norm = os.path.normpath(raw)
+    if in_wsl() and _WSL_DRVFS_RE.match(norm):
+        return not _is_wsl_linux_executable(Path(raw))
+    return _has_pe_header(Path(raw))
+
+
+_WINAPPS_STUB_NAMES = frozenset({"python", "python.exe", "python3", "python3.exe", "bash", "bash.exe"})
+
+
+def _is_windowsapps_stub(candidate) -> bool:
+    if not candidate or os.name != "nt":
+        return False
+    norm = os.fspath(candidate).replace("/", "\\").lower()
+    if "\\microsoft\\windowsapps\\" not in norm:
+        return False
+    if norm.rsplit("\\", 1)[-1] in _WINAPPS_STUB_NAMES:
+        return True
+    try:
+        return os.stat(candidate).st_size == 0
+    except TimeoutError:
+        raise
+    except OSError:
+        return True
+
+
+def which_host_binary(name: str, *, path: str | None = None, which_fn=None) -> str | None:
+    """Resolve a host CLI without WSL2 `/mnt/<drive>` shims or WindowsApps alias stubs."""
+    lookup = which_fn or shutil.which
+    found = lookup(name) if path is None else lookup(name, path=path)
+    if found is None:
+        return None
+    rejected = _is_windowsapps_stub if os.name == "nt" else (is_windows_host_binary if os.name == "posix" else None)
+    if rejected is None or not rejected(found):
+        return found
+    search = os.environ.get("PATH", "") if path is None else path
+    for entry in search.split(os.pathsep):
+        if not entry:
+            continue
+        cand = _REAL_WHICH(name, path=entry)
+        if cand and not rejected(cand):
+            return cand
+    return None
+
+
+def _strip_win_extended(raw: str) -> str:
+    if raw.startswith(("\\\\?\\UNC\\", "//?/UNC/")):
+        return "\\\\" + raw[8:]
+    if raw.startswith(("\\\\?\\", "//?/")):
+        return raw[4:]
+    return raw
+
+
+def norm_python_path(py_exe: str | Path) -> str:
+    """Normalize an interpreter path while preserving venv symlinks and stripping `\\\\?\\`."""
+    clean = _strip_win_extended(os.fspath(py_exe))
+    p = Path(clean).expanduser()
+    parent = _strip_win_extended(str(p.parent.resolve()))
+    return str(Path(parent) / p.name)
+
+
+def same_interpreter(left, right) -> bool:
+    """Compare two interpreter paths safely across Windows `\\\\?\\` and drive case."""
+    if not left or not right:
+        return False
+    if os.name == "nt":
+        import ntpath
+
+        a = _strip_win_extended(os.fspath(left))
+        b = _strip_win_extended(os.fspath(right))
+        if not ntpath.isabs(a):
+            a = norm_python_path(a)
+        if not ntpath.isabs(b):
+            b = norm_python_path(b)
+        return ntpath.normcase(ntpath.normpath(a)) == ntpath.normcase(ntpath.normpath(b))
+    a = norm_python_path(left)
+    b = norm_python_path(right)
+    return os.path.normpath(a) == os.path.normpath(b)
+
+
+def is_usable_venv_python(py: str | None) -> bool:
+    """Validate a candidate MindIE venv interpreter across Windows, POSIX, and WSL2."""
+    if not isinstance(py, str) or not py.strip():
+        return False
+    norm_slash = _strip_win_extended(py).replace("\\", "/").lower()
+    base_name = norm_slash.rsplit("/", 1)[-1]
+    if base_name in {"pythonw.exe", "pythonw"} or "/windowsapps/" in norm_slash:
+        return False
+    if ("venv" not in norm_slash and ".venv" not in norm_slash) or "/uv/python/" in norm_slash or "/cellar/python" in norm_slash:
+        return False
+    if is_windows_host_binary(py):
+        return False
+    return Path(_strip_win_extended(py)).is_file()
 
 
 def plugin_root() -> Path:
@@ -225,16 +431,16 @@ def opencode_db_path(config: str | Path | None = None) -> Path:
 def opencode_cli_bin() -> str | None:
     """Discover the local `opencode` CLI binary without modifying PATH."""
     explicit = os.environ.get("MINDIE_OC_BIN")
-    if explicit and Path(explicit).is_file():
+    if explicit and Path(explicit).is_file() and not is_windows_host_binary(explicit):
         return str(Path(explicit).resolve())
-    found = shutil.which("opencode")
+    found = which_host_binary("opencode", which_fn=shutil.which)
     if found:
         return found
     for cand in (
         Path.home() / ".opencode" / "bin" / ("opencode.exe" if os.name == "nt" else "opencode"),
         Path.home() / ".local" / "bin" / ("opencode.exe" if os.name == "nt" else "opencode"),
     ):
-        if cand.is_file():
+        if cand.is_file() and not is_windows_host_binary(cand):
             return str(cand.resolve())
     return None
 
@@ -256,7 +462,7 @@ def read_json(path: str | Path) -> dict:
     if len(raw) > MAX_CONFIG_BYTES:
         raise ValueError(f"MindIE metadata exceeds {MAX_CONFIG_BYTES} byte limit: {target}")
     try:
-        parsed = json.loads(raw.decode("utf-8"))
+        parsed = json.loads(raw.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"MindIE metadata is malformed JSON: {target}") from exc
     if not isinstance(parsed, dict):

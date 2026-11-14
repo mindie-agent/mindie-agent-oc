@@ -9,7 +9,7 @@
  * [Side-Effect Policy] Delegates state mutations to MindIE Python scripts (`mindie_launch.py`, `capture_stop.py`) and writes only `summary-endpoint.json` under MindIE `stateDir()`.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -20,7 +20,7 @@ import {
     stateDir, summaryEndpointPath,
 } from "./paths.mjs";
 
-const GESTURE_PREFIX_RE = /^\s*(?:\/mindie-agent(?::mindie-agent)?|\$mindie-agent(?::mindie-agent)?)(?=\s|$)/;
+const GESTURE_PREFIX_RE = /^\uFEFF?\s*(?:\/mindie-agent(?::mindie-agent)?|\$mindie-agent(?::mindie-agent)?)(?=\s|$)/;
 const MCP_WIRE_RE = /^(?:mcp[_:])?(?:mindie[-_]agent[-_:])?(mindie[-_]remote[-_]dev|mindie[-_]tools)[_:]([A-Za-z0-9_.-]+)$/;
 const SHELL_TOKEN_INLINE_RE = /\r?\n# __mindie_oc_sid:([0-9a-f]{24})(?=$|['"\s])/;
 const TERMINAL_SESSION_EVENTS = new Set([
@@ -157,16 +157,17 @@ function admissionMtimeSignature(sessionID = null) {
 }
 
 function killHookTree(child) {
-    if (!Number.isInteger(child?.pid) || child.pid <= 0) {
-        return;
-    }
+    if (!Number.isInteger(child?.pid) || child.pid <= 0) return;
     if (process.platform !== "win32") {
         try {
             process.kill(-child.pid, "SIGKILL");
             return;
-        } catch {
-            // Fall through to direct child kill.
-        }
+        } catch {}
+    } else {
+        const res = spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], {
+            stdio: "ignore", timeout: 2000, windowsHide: true,
+        });
+        if (!res.error && res.status === 0) return;
     }
     try {
         child.kill("SIGKILL");
