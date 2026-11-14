@@ -209,3 +209,34 @@ def test_bounded_subprocess_schema_timeout_and_persisted_diagnostics(
     finally:
         if hasattr(signal, "SIGALRM") and prev_handler is not None:
             signal.signal(signal.SIGALRM, prev_handler)
+
+    # 5. Windows transient PermissionError retry in atomic_write_json and post-commit reporting TimeoutError warning in configure_community.
+    import paths as paths_mod
+    from mindie_knowledge import consent_store
+
+    real_replace = paths_mod.os.replace
+    attempts = 0
+
+    def _flaky_replace(src, dst):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("WinError 5 simulated transient sharing violation")
+        return real_replace(src, dst)
+
+    target_json = isolated_oc_env["root"] / "win-retry.json"
+    with monkeypatch.context() as mp:
+        mp.setattr(paths_mod.os, "name", "nt")
+        mp.setattr(paths_mod.os, "replace", _flaky_replace)
+        paths_mod.atomic_write_json(target_json, {"ok": True})
+    assert attempts == 2 and read_json(target_json) == {"ok": True}
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            consent_store,
+            "activate_reporting",
+            lambda *_a, **_kw: (_ for _ in ()).throw(TimeoutError("reporting activation timed out")),
+        )
+        comm_out = setup.configure_community(config=cfg, enabled=False, project_root=str(isolated_oc_env["workspace"]), timeout=15.0)
+    assert comm_out["enabled"] is False
+    assert "TimeoutError: reporting activation timed out" in comm_out["reporting_warning"]

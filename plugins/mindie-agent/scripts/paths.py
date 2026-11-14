@@ -30,6 +30,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 
 MAX_CONFIG_BYTES = 65536
 

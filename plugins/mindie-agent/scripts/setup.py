@@ -690,9 +690,8 @@ def configure_community(
     if hasattr(consent_store, "activate_reporting"):
         try:
             consent_store.activate_reporting(cfile, config=diagnostics_config_path(cfg_file), roots=roots or None, ensure=False)
-        except TimeoutError:
-            raise
-        except Exception as exc:
+        except (TimeoutError, Exception) as exc:
+            # Community & consent writes already committed; preserve completed result with warning (P4 / Principle 14).
             out["reporting_warning"] = f"{type(exc).__name__}: {exc}"
             print(f"MindIE OpenCode reporting activation warning: {out['reporting_warning']}", file=sys.stderr)
     return out
