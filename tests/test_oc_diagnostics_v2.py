@@ -1,7 +1,25 @@
-"""Tier 1 provenance, MCP operational filter, and post-promotion Receipt Honesty tests for OpenCode (`mindie-agent-oc`)."""
+"""Tier 1 provenance, MCP operational filter, and post-promotion Receipt Honesty tests for OpenCode (`mindie-agent-oc`).
+
+[Role]
+Verifies Diagnostics 2.0 child-invocation token provenance, MCP operational exception filtering,
+and pre/post-promotion state & receipt honesty in `component_update.py` and `mcp_server.py`.
+
+[Invariants]
+- All filesystem writes stay strictly inside `isolated_oc_env` (`HOME`, `MINDIE_CONFIG_HOME`,
+  `MINDIE_DATA_HOME`, `MINDIE_DIAGNOSTICS_ROOT`).
+- Post-promotion faults preserve `status="updated"` with `receipt_warning` + `receipt_unconfirmed=True`;
+  pre-promotion faults never silently masquerade as `up_to_date`.
+
+[Timeouts & Locks]
+- Pure local Tier 1 execution (`<15s`); exercises bounded top-8 `.jsonl` discovery over >64 files.
+
+[Side-Effect Policy]
+- Writes only to temporary directories managed by `isolated_oc_env`; zero network or NPU calls.
+"""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -71,6 +89,10 @@ def test_oc_diagnostics_v2_provenance_mcp_and_inventory_timeout_honesty(
         )
         is None
     )
+    for idx in range(72):
+        p = ev_dir / f"old-{idx:03d}.jsonl"
+        p.write_text('{"event":"operation.start"}\n', encoding="utf-8")
+        os.utime(p, (1_700_000_000 + idx, 1_700_000_000 + idx))
     monkeypatch.setenv("MINDIE_DIAGNOSTICS_INVOCATION_TOKEN", tok)
     rec = record_failure(
         "mindie-coordinator", "mindie.hosts", stage="cli_dispatch", category="internal_exception", exception=KeyError("k")
@@ -112,10 +134,37 @@ def test_oc_diagnostics_v2_provenance_mcp_and_inventory_timeout_honesty(
         component_update.check(config=oc_cfg)
     assert json.loads(status_file.read_text(encoding="utf-8"))["status"] == "failed"
 
-    # AFTER atomic promotion (`oc.json` switched), post-promotion schema/stat TimeoutError or PermissionError preserves status="updated"!
+    # Pre-promotion (`up_to_date`) schema PermissionError must persist schema_warning and propagate (never return clean up_to_date)
+    with monkeypatch.context() as mp:
+        mp.setattr(component_update, "read_inventory", lambda *_a, **_k: {"mindie-diagnostics": {"version": "0.5.11"}})
+        mp.setattr(
+            component_update,
+            "store_schema_needs_prepare",
+            lambda *_a, **_k: (_ for _ in ()).throw(PermissionError("up_to_date_schema_eacces")),
+        )
+        with pytest.raises(PermissionError, match="up_to_date_schema_eacces"):
+            component_update.check(config=oc_cfg)
+        failed_schema_status = json.loads(status_file.read_text(encoding="utf-8"))
+        assert failed_schema_status["status"] == "up_to_date"
+        assert "PermissionError" in failed_schema_status["schema_warning"]
+
+    # AFTER atomic promotion (`oc.json` switched), post-promotion schema/stat TimeoutError, PermissionError, or returned schema_warning preserves status="updated"!
+    monkeypatch.setattr(component_update, "prepare", lambda **_k: None)
     monkeypatch.setattr(component_update, "read_inventory", lambda *_a, **_k: {"mindie-diagnostics": {"version": "0.5.11"}})
     monkeypatch.setattr(component_update, "_candidate_plugin_is_newer", lambda *_a, **_k: True)
     monkeypatch.setattr(oc_setup, "ensure_runtime_python", lambda **_k: py)
+    monkeypatch.setattr(
+        component_update,
+        "sync_store_schema",
+        lambda *_a, **_k: (False, "PermissionError: schema EACCES"),
+    )
+    promoted_warn = component_update.check(config=oc_cfg)
+    assert promoted_warn["status"] == "updated"
+    assert promoted_warn["needs_host_reload"] is True
+    assert promoted_warn["schema_warning"] == "PermissionError: schema EACCES"
+    assert promoted_warn["receipt_warning"] == "PermissionError: schema EACCES"
+    assert promoted_warn["receipt_unconfirmed"] is True
+
     monkeypatch.setattr(
         component_update,
         "sync_store_schema",

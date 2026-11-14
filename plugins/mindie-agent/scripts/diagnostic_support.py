@@ -20,7 +20,7 @@ contribution-gated reporting status to `mindie_diagnostics.integration`.
 
 from __future__ import annotations
 
-import ast
+import heapq
 import json
 import os
 from pathlib import Path
@@ -28,7 +28,6 @@ import re
 import signal
 import stat
 import subprocess
-import sys
 
 from paths import config_path, consent_path, diagnostics_config_path
 
@@ -73,10 +72,6 @@ _NON_REPORTABLE_MCP_EXC_NAMES = frozenset({
     "HostQueueUnavailable",
     "CancelledError",
 })
-_TB_FILE_RE = re.compile(
-    r'^\s*File "([^"]+)", line (\d+), in ([A-Za-z_][A-Za-z0-9_]{0,99}|<module>|<lambda>|<listcomp>|<dictcomp>|<setcomp>|<genexpr>)\s*$'
-)
-_TB_EXC_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]{0,119})(?::(?:\s.*|$)|\s*$)")
 _STDERR_INCIDENT_RE = re.compile(r"(?:^|\n)mindie-diagnostic-incident:\s*([0-9a-f]{32})\s*(?:$|\r?\n)")
 _KNOWN_COMPONENT_STAGES = {
     "profiler": frozenset({"profile", "analyze", "compare", "export", "inspect", "summary", "timeline", "doctor", "version"}),
@@ -85,11 +80,6 @@ _KNOWN_COMPONENT_STAGES = {
     "debugger": frozenset({"precision", "hang", "oom", "accuracy", "triage", "capsule", "inspect", "doctor", "version"}),
     "npu_top": frozenset({"snapshot", "watch", "top", "serve", "daemon", "status", "doctor", "version"}),
 }
-_PKG_TO_COMP = {pkg: comp for comp, pkg in _COMPONENT_PACKAGES.values()}
-_CHAIN_SEPARATORS = frozenset({
-    "During handling of the above exception, another exception occurred:",
-    "The above exception was the direct cause of the following exception:",
-})
 _DIST_VER_RE = re.compile(r"(?m)^Version:\s*([0-9A-Za-z][0-9A-Za-z.+-]{0,79})\s*$")
 _PYPROJ_VER_RE = re.compile(r'(?m)^version\s*=\s*"([0-9A-Za-z][0-9A-Za-z.+-]{0,79})"\s*$')
 
@@ -468,27 +458,6 @@ def _venv_site_dirs(venv_root: Path) -> list[Path]:
     return [venv_root / "Lib" / "site-packages", *[d / "site-packages" for d in _scan_subdirs_bounded(venv_root / "lib", prefix="python")]]
 
 
-def _trusted_package_dirs(comp_name: str, pkg_prefix: str, executable=None) -> list[Path]:
-    dist_norm, trusted = comp_name.lower().replace("-", "_"), []
-    for venv_root in _venv_roots_from_executable(executable if executable is not None else sys.executable):
-        cands: list[Path] = []
-        for sp in _venv_site_dirs(venv_root):
-            cands.append(sp / pkg_prefix)
-            if (eco := _inspect_dist_info_full(sp, dist_norm)[2]) is not None:
-                cands.extend((eco / pkg_prefix, eco / "src" / pkg_prefix))
-        if _inspect_checkout(venv_root, comp_name) != (None, None):
-            cands.extend((venv_root / pkg_prefix, venv_root / "src" / pkg_prefix))
-        for cand in cands:
-            try:
-                if cand.is_dir() and (rp := cand.resolve()) not in trusted:
-                    trusted.append(rp)
-            except TimeoutError:
-                raise
-            except OSError:
-                pass
-    return trusted
-
-
 def _resolve_child_component_build(comp_name: str, pkg_roots: list[str], executable=None) -> tuple[str | None, str | None]:
     dist_norm = comp_name.lower().replace("-", "_")
     for raw_root in pkg_roots[:4]:
@@ -550,20 +519,33 @@ def _verified_failure_ids(comp_name: str, *, invocation_token: str | None = None
         if not (raw_root := os.environ.get("MINDIE_DIAGNOSTICS_ROOT")):
             return []
         ev_dir = Path(raw_root).expanduser() / "events" / comp_name
-    cands: list[tuple[int, Path]] = []
+    top_cands: list[tuple[int, str, Path]] = []
     try:
         with os.scandir(ev_dir) as it:
             for idx, entry in enumerate(it):
-                if idx >= 64:
+                if idx >= 4096:
                     break
-                if entry.name.endswith(".jsonl") and entry.is_file(follow_symlinks=False):
-                    cands.append((entry.stat(follow_symlinks=False).st_mtime_ns, Path(entry.path)))
+                if not entry.name.endswith(".jsonl"):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
+                except TimeoutError:
+                    raise
+                except OSError:
+                    continue
+                item = (mtime_ns, entry.name, Path(entry.path))
+                if len(top_cands) < 8:
+                    heapq.heappush(top_cands, item)
+                elif item > top_cands[0]:
+                    heapq.heapreplace(top_cands, item)
     except TimeoutError:
         raise
     except OSError:
         return []
     found: list[str] = []
-    for _, fp in sorted(cands, reverse=True)[:8]:
+    for _, _, fp in sorted(top_cands, reverse=True):
         raw = _read_bytes_bounded(fp, 65536, tail_only=True)
         if not raw:
             continue

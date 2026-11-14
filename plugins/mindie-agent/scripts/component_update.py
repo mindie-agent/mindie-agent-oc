@@ -676,7 +676,7 @@ def check(
         elif receipt_warn is not None:
             result["receipt_warning"], result["receipt_unconfirmed"] = receipt_warn, True
         schema_warn: str | None = None
-        post_timeout: TimeoutError | None = None
+        post_err: Exception | None = None
         if status in {"updated", "up_to_date"}:
             try:
                 if active_eng_file.is_file():
@@ -685,15 +685,16 @@ def check(
                     elif cfg_file.is_file():
                         prev_w = read_json(cfg_file).get("schema_warning")
                         schema_warn = prev_w if isinstance(prev_w, str) and prev_w else None
-            except TimeoutError as exc:
-                post_timeout, schema_warn = exc, f"TimeoutError: {exc}"
-            except (OSError, ValueError) as exc:
-                if status == "updated":
-                    result.setdefault("receipt_warning", f"{type(exc).__name__}: {exc}")
-                    result["receipt_unconfirmed"] = True
+            except (TimeoutError, OSError, ValueError) as exc:
+                schema_warn = f"{type(exc).__name__}: {exc}"
+                if status != "updated" or isinstance(exc, TimeoutError):
+                    post_err = exc
         if schema_warn is not None:
             result["schema_warning"] = schema_warn
-        if post_timeout is None and sync_feeds and status != "failed":
+            if status == "updated":
+                result.setdefault("receipt_warning", schema_warn)
+                result["receipt_unconfirmed"] = True
+        if post_err is None and sync_feeds and status != "failed":
             try:
                 if community_config_path(cfg_file).is_file() and active_eng_file.is_file():
                     from mindie_knowledge.loop.cli import sync_feeds as run_sync_feeds
@@ -702,15 +703,15 @@ def check(
             except Exception as exc:
                 err_msg = f"{type(exc).__name__}: {exc}"
                 if isinstance(exc, TimeoutError) and status != "updated":
-                    post_timeout = exc
+                    post_err = exc
                 else:
                     result["feed_sync_error"] = err_msg
                     if status == "updated":
                         result.setdefault("receipt_warning", err_msg)
                         result["receipt_unconfirmed"] = True
-        if post_timeout is not None and status == "updated":
-            result.setdefault("receipt_warning", f"TimeoutError: {post_timeout}")
-            result["receipt_unconfirmed"], post_timeout = True, None
+        if post_err is not None and status == "updated":
+            result.setdefault("receipt_warning", f"{type(post_err).__name__}: {post_err}")
+            result["receipt_unconfirmed"], post_err = True, None
         status_record: dict = {"checked_at": time.time(), "status": status, "needs_host_reload": needs_reload, "python": target_python}
         if inventory_error is not None:
             status_record["error"], status_record["diagnostic"] = inventory_error, inventory_diag
@@ -726,8 +727,8 @@ def check(
             if status == "updated":
                 result.setdefault("receipt_warning", f"{type(exc).__name__}: {exc}")
                 result["receipt_unconfirmed"] = True
-        if post_timeout is not None:
-            raise post_timeout
+        if post_err is not None:
+            raise post_err
         return result
 
 
@@ -782,10 +783,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.buffer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         sys.stdout.buffer.flush()
         return 0
-    payload = check(
-        config=args.config, source=args.source, force=args.force,
-        sync_feeds=args.sync_feeds, non_blocking=args.non_blocking, timeout=args.timeout,
-    )
+    payload = check(config=args.config, source=args.source, force=args.force, sync_feeds=args.sync_feeds, non_blocking=args.non_blocking, timeout=args.timeout)
     sys.stdout.buffer.write((json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
     sys.stdout.buffer.flush()
     return 1 if payload.get("status") == "failed" else 0

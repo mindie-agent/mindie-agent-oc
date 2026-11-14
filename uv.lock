@@ -19,7 +19,7 @@ overrides = [
     { name = "mindie-debugger", git = "https://github.com/mindie-agent/debugger?rev=d40a250e4048ac63d4a478a5dbfa993702ceddd0" },
     { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=171623584aa812677df907518dcb55b06493241b" },
     { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=315fc4bc51ee9a7afef32a3666599d608ff59f9d" },
-    { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=f7dbca5e643db52807e12649e02291069f3d9d82" },
+    { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=1c0f28941d6adfb6579cf7b3477a1a28964be97b" },
     { name = "mindie-sim", git = "https://github.com/mindie-agent/sim?rev=f0b19acdab6f5f4e952561c7ff92e4bf9c0b0c3a" },
     { name = "npu-top", git = "https://github.com/mindie-agent/npu-top?rev=848d74da3cba383c07a0eb372a17baf35b6b944b" },
     { name = "remote-dev", git = "https://github.com/mindie-agent/remote-dev?rev=3556df571450dab481a25e0157167f1c3727dc6c" },
@@ -2077,7 +2077,7 @@ wheels = [
 
 [[package]]
 name = "mindie-agent-oc"
-version = "0.1.3"
+version = "0.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "mindie-coordinator" },
@@ -2103,7 +2103,7 @@ requires-dist = [
     { name = "mindie-debugger", git = "https://github.com/mindie-agent/debugger?rev=d40a250e4048ac63d4a478a5dbfa993702ceddd0" },
     { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=171623584aa812677df907518dcb55b06493241b" },
     { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=315fc4bc51ee9a7afef32a3666599d608ff59f9d" },
-    { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=f7dbca5e643db52807e12649e02291069f3d9d82" },
+    { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=1c0f28941d6adfb6579cf7b3477a1a28964be97b" },
     { name = "mindie-sim", git = "https://github.com/mindie-agent/sim?rev=f0b19acdab6f5f4e952561c7ff92e4bf9c0b0c3a" },
     { name = "npu-top", git = "https://github.com/mindie-agent/npu-top?rev=848d74da3cba383c07a0eb372a17baf35b6b944b" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
@@ -2147,8 +2147,8 @@ dependencies = [
 
 [[package]]
 name = "mindie-profiler"
-version = "0.5.11"
-source = { git = "https://github.com/mindie-agent/profiler?rev=f7dbca5e643db52807e12649e02291069f3d9d82#f7dbca5e643db52807e12649e02291069f3d9d82" }
+version = "0.5.12"
+source = { git = "https://github.com/mindie-agent/profiler?rev=1c0f28941d6adfb6579cf7b3477a1a28964be97b#1c0f28941d6adfb6579cf7b3477a1a28964be97b" }
 dependencies = [
     { name = "mindie-sim" },
 ]
