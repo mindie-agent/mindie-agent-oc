@@ -45,18 +45,9 @@ if str(HERE) not in sys.path:
 from bounded import run as bounded_run
 from oc_native_compat import ensure_oc_native_support
 from paths import (
-    admission_path,
-    apply_enterprise_transport_env,
-    atomic_write_json,
-    community_config_path,
-    config_path,
-    consent_path,
-    data_home,
-    engine_config_path,
-    installed_source_root,
-    read_json,
-    repo_root,
-    state_dir,
+    admission_path, apply_enterprise_transport_env, atomic_write_json, community_config_path,
+    config_path, consent_path, data_home, engine_config_path, installed_source_root,
+    read_json, repo_root, state_dir,
 )
 
 ensure_oc_native_support()
@@ -430,15 +421,14 @@ def _write_generation_and_switch_profile(
         atomic_write_json(cfg_file, updated_adapter)
 
     # Best-effort legacy mirror for external callers reading `<stem>.engine.json` directly.
+    mirror_warn: str | None = None
     default_eng = cfg_file.with_name(cfg_file.stem + ".engine.json")
     if default_eng != gen_eng_file:
         try:
             atomic_write_json(default_eng, eng_payload)
-        except TimeoutError:
-            raise
-        except OSError:
-            pass
-    return gen_eng_file
+        except (TimeoutError, OSError) as exc:
+            mirror_warn = f"{type(exc).__name__}: {exc}"
+    return gen_eng_file, mirror_warn
 
 
 def store_schema_needs_prepare(cfg_file: str | Path | None = None, eng_file: str | Path | None = None) -> bool:
@@ -632,6 +622,8 @@ def check(
             artifact = prepare(source=target_source, python=base_python, config=cfg_file, force=force, timeout=remaining(5.0))
             target_python = _norm_python_path(artifact["python"] if artifact is not None else base_python)
             inventory_error: str | None = None
+            inventory_diag: dict | None = None
+            receipt_warn: str | None = None
             if artifact is not None:
                 installed: dict | None = artifact["installed"]
             else:
@@ -640,26 +632,29 @@ def check(
                 except TimeoutError:
                     raise
                 except Exception as exc:
+                    import diagnostic_support
+
                     installed, inventory_error = None, f"{type(exc).__name__}: {exc}"
+                    inventory_diag = diagnostic_support.failure("component.update", "inventory", "update", exception=exc, config=cfg_file)
 
             if inventory_error is not None:
                 active_eng_file, status = existing_eng_file, "failed"
             elif artifact is not None or native_candidate:
-                active_eng_file = _write_generation_and_switch_profile(
+                active_eng_file, receipt_warn = _write_generation_and_switch_profile(
                     cfg_file=cfg_file, base_adapter=existing_adapter, base_engine=existing_engine,
                     target_source=target_source, target_python=target_python, validation=validation, artifact=artifact,
                     lock_timeout=min(5.0, remaining(0.0)),
                 )
-                comm_file = community_config_path(cfg_file)
-                if not comm_file.is_file():
-                    _write_initial_community_config(
-                        target_python, comm_file,
-                        dict(
-                            enabled=False, repository="mindie-agent/knowledge-vllm-ascend",
-                            project_roots=[], branch="main", idle_seconds=300, consent_config=str(consent_path(cfg_file).resolve()),
-                        ),
-                    )
                 status = "updated"
+                try:
+                    comm_file = community_config_path(cfg_file)
+                    if not comm_file.is_file():
+                        _write_initial_community_config(
+                            target_python, comm_file,
+                            dict(enabled=False, repository="mindie-agent/knowledge-vllm-ascend", project_roots=[], branch="main", idle_seconds=300, consent_config=str(consent_path(cfg_file).resolve())),
+                        )
+                except Exception as exc:
+                    receipt_warn = receipt_warn or f"{type(exc).__name__}: {exc}"
             else:
                 active_eng_file, status = existing_eng_file, "up_to_date"
         except Exception as exc:
@@ -667,10 +662,7 @@ def check(
 
             diag = diagnostic_support.failure("component.update", "prepare", "update", exception=exc, config=cfg_file)
             try:
-                atomic_write_json(
-                    status_file,
-                    {"checked_at": time.time(), "status": "failed", "error": f"{type(exc).__name__}: {exc}", "diagnostic": diag},
-                )
+                atomic_write_json(status_file, {"checked_at": time.time(), "status": "failed", "error": f"{type(exc).__name__}: {exc}", "diagnostic": diag})
             except TimeoutError:
                 raise
             except OSError:
@@ -678,55 +670,62 @@ def check(
             raise
 
         needs_reload = status == "updated"
-        result: dict = dict(
-            schema="mindie-component-update/1", harness="opencode", status=status,
-            needs_host_reload=needs_reload, python=target_python, installed=installed,
-        )
+        result: dict = dict(schema="mindie-component-update/1", harness="opencode", status=status, needs_host_reload=needs_reload, python=target_python, installed=installed)
         if inventory_error is not None:
-            result["inventory_error"] = inventory_error
+            result["inventory_error"], result["diagnostic"] = inventory_error, inventory_diag
+        elif receipt_warn is not None:
+            result["receipt_warning"], result["receipt_unconfirmed"] = receipt_warn, True
         schema_warn: str | None = None
         post_timeout: TimeoutError | None = None
-        if status in {"updated", "up_to_date"} and active_eng_file.is_file():
-            needs_schema = status == "updated" or store_schema_needs_prepare(cfg_file, active_eng_file)
-            if needs_schema:
-                try:
-                    _, schema_warn = sync_store_schema(
-                        cfg_file, active_eng_file, interpreter=target_python, deadline=deadline, update_status_file=False,
-                    )
-                except TimeoutError as exc:
-                    post_timeout, schema_warn = exc, f"TimeoutError: {exc}"
-            elif cfg_file.is_file():
-                try:
-                    prev_w = read_json(cfg_file).get("schema_warning")
-                    schema_warn = prev_w if isinstance(prev_w, str) and prev_w else None
-                except TimeoutError:
-                    raise
-                except (OSError, ValueError):
-                    pass
+        if status in {"updated", "up_to_date"}:
+            try:
+                if active_eng_file.is_file():
+                    if status == "updated" or store_schema_needs_prepare(cfg_file, active_eng_file):
+                        _, schema_warn = sync_store_schema(cfg_file, active_eng_file, interpreter=target_python, deadline=deadline, update_status_file=False)
+                    elif cfg_file.is_file():
+                        prev_w = read_json(cfg_file).get("schema_warning")
+                        schema_warn = prev_w if isinstance(prev_w, str) and prev_w else None
+            except TimeoutError as exc:
+                post_timeout, schema_warn = exc, f"TimeoutError: {exc}"
+            except (OSError, ValueError) as exc:
+                if status == "updated":
+                    result.setdefault("receipt_warning", f"{type(exc).__name__}: {exc}")
+                    result["receipt_unconfirmed"] = True
         if schema_warn is not None:
             result["schema_warning"] = schema_warn
-        if post_timeout is None and sync_feeds and status != "failed" and community_config_path(cfg_file).is_file() and active_eng_file.is_file():
+        if post_timeout is None and sync_feeds and status != "failed":
             try:
-                from mindie_knowledge.loop.cli import sync_feeds as run_sync_feeds
+                if community_config_path(cfg_file).is_file() and active_eng_file.is_file():
+                    from mindie_knowledge.loop.cli import sync_feeds as run_sync_feeds
 
-                result["feed_sync"] = run_sync_feeds(str(active_eng_file))
-            except TimeoutError as exc:
-                post_timeout = exc
+                    result["feed_sync"] = run_sync_feeds(str(active_eng_file))
             except Exception as exc:
-                result["feed_sync_error"] = f"{type(exc).__name__}: {exc}"
-        status_record: dict = {
-            "checked_at": time.time(), "status": status, "needs_host_reload": needs_reload, "python": target_python,
-        }
+                err_msg = f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, TimeoutError) and status != "updated":
+                    post_timeout = exc
+                else:
+                    result["feed_sync_error"] = err_msg
+                    if status == "updated":
+                        result.setdefault("receipt_warning", err_msg)
+                        result["receipt_unconfirmed"] = True
+        if post_timeout is not None and status == "updated":
+            result.setdefault("receipt_warning", f"TimeoutError: {post_timeout}")
+            result["receipt_unconfirmed"], post_timeout = True, None
+        status_record: dict = {"checked_at": time.time(), "status": status, "needs_host_reload": needs_reload, "python": target_python}
         if inventory_error is not None:
-            status_record["error"] = inventory_error
+            status_record["error"], status_record["diagnostic"] = inventory_error, inventory_diag
         if schema_warn is not None:
             status_record["schema_warning"] = schema_warn
+        if result.get("receipt_unconfirmed"):
+            status_record["receipt_warning"], status_record["receipt_unconfirmed"] = result.get("receipt_warning"), True
         try:
             atomic_write_json(status_file, status_record)
-        except TimeoutError:
-            raise
-        except OSError:
-            pass
+        except (TimeoutError, OSError) as exc:
+            if isinstance(exc, TimeoutError) and status != "updated":
+                raise
+            if status == "updated":
+                result.setdefault("receipt_warning", f"{type(exc).__name__}: {exc}")
+                result["receipt_unconfirmed"] = True
         if post_timeout is not None:
             raise post_timeout
         return result

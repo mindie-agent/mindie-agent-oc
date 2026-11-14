@@ -122,9 +122,10 @@ def test_cutover_defers_under_profile_schema_lock_contention(
         d[key] = "0.1.9"
         p.write_text(json.dumps(d) + "\n", encoding="utf-8")
 
+    expected_ver = read_json(REPO_ROOT / "product-contract.json")["native_version"]
     setup.ensure_default_profile(config=cfg, source_root=v1_dir, python_exe=py)
     before = read_json(cfg)
-    assert before["product_validation"]["native_version"] == "0.1.2"
+    assert before["product_validation"]["native_version"] == expected_ver
 
     lock_file = state_dir(cfg) / "oc-profile-schema.lock"
     ready_file = isolated_oc_env["root"] / "schema-lock.ready"
@@ -142,7 +143,7 @@ def test_cutover_defers_under_profile_schema_lock_contention(
                 lock_timeout=0.15,
             )
     after = read_json(cfg)
-    assert after["product_validation"]["native_version"] == "0.1.2"
+    assert after["product_validation"]["native_version"] == expected_ver
     assert after["engine_config"] == before["engine_config"]
 
 

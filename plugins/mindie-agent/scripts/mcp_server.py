@@ -355,19 +355,16 @@ def _admission_failure(exc: Exception) -> dict:
 
 def _attach_accounting_warning(result: dict, warning_key: str, exc: Exception) -> dict:
     structured = dict(result.get("structuredContent") or {})
-    structured[warning_key] = f"{type(exc).__name__}: {exc}"
+    msg = f"{type(exc).__name__}: {exc}"
+    structured[warning_key] = msg
+    structured.setdefault("receipt_warning", msg)
     structured["receipt_unconfirmed"] = True
     result["structuredContent"] = structured
     content = list(result.get("content") or [])
-    content.append(
-        dict(
-            type="text",
-            text=(
-                f"Operation completed, but local {warning_key} failed ({type(exc).__name__}). "
-                "Do not repeat the completed operation."
-            ),
-        )
-    )
+    content.append(dict(
+        type="text",
+        text=f"Operation completed, but local {warning_key} failed ({type(exc).__name__}). Do not repeat the completed operation.",
+    ))
     result["content"] = content
     return result
 
@@ -453,16 +450,14 @@ def call_tools_surface(
             child_env["MINDIE_AGENT_CONFIG"] = str(config_path(config))
             child_env.setdefault("MINDIE_DIAGNOSTICS_CONFIG", str(diagnostics_config_path(config)))
             child_env.pop("PYTHONPATH", None)
+            inv_tok = os.urandom(16).hex() if name in COMPONENT_DESCRIPTIONS else None
+            if inv_tok is not None:
+                child_env["MINDIE_DIAGNOSTICS_INVOCATION_TOKEN"] = inv_tok
 
             cmd = _resolve_component_command(component, config=config) + list(argv)
             proc = bounded_run(
-                cmd,
-                "",
-                timeout=timeout_ms / 1000.0,
-                max_output=COMPONENT_CAPTURE_LIMIT_BYTES,
-                env=child_env,
-                cwd=run_cwd,
-                strict_output_limit=False,
+                cmd, "", timeout=timeout_ms / 1000.0, max_output=COMPONENT_CAPTURE_LIMIT_BYTES,
+                env=child_env, cwd=run_cwd, strict_output_limit=False,
             )
             reply_limit = budget * 4
             stdout_bytes = proc.stdout.encode("utf-8", errors="replace")
@@ -492,7 +487,7 @@ def call_tools_surface(
 
                 diag = diagnostic_support.record_component_crash(
                     component, argv, proc.returncode, proc.stderr,
-                    parsed_result=payload.get("result"), config=config, executable=cmd[0],
+                    parsed_result=payload.get("result"), config=config, executable=cmd[0], invocation_token=inv_tok,
                 )
                 if diag is not None:
                     payload["diagnostic"] = diag

@@ -20,11 +20,15 @@ contribution-gated reporting status to `mindie_diagnostics.integration`.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
 import re
+import signal
+import stat
 import subprocess
+import sys
 
 from paths import config_path, consent_path, diagnostics_config_path
 
@@ -74,7 +78,18 @@ _TB_FILE_RE = re.compile(
 )
 _TB_EXC_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]{0,119})(?::(?:\s.*|$)|\s*$)")
 _STDERR_INCIDENT_RE = re.compile(r"(?:^|\n)mindie-diagnostic-incident:\s*([0-9a-f]{32})\s*(?:$|\r?\n)")
-_SUBCMD_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+_KNOWN_COMPONENT_STAGES = {
+    "profiler": frozenset({"profile", "analyze", "compare", "export", "inspect", "summary", "timeline", "doctor", "version"}),
+    "sim": frozenset({"solve", "calibrate", "sweep", "roofline", "predict", "inspect", "catalog", "doctor", "version"}),
+    "coordinator": frozenset({"hosts", "run", "exec", "status", "logs", "cancel", "stop", "probe", "doctor", "version"}),
+    "debugger": frozenset({"precision", "hang", "oom", "accuracy", "triage", "capsule", "inspect", "doctor", "version"}),
+    "npu_top": frozenset({"snapshot", "watch", "top", "serve", "daemon", "status", "doctor", "version"}),
+}
+_PKG_TO_COMP = {pkg: comp for comp, pkg in _COMPONENT_PACKAGES.values()}
+_CHAIN_SEPARATORS = frozenset({
+    "During handling of the above exception, another exception occurred:",
+    "The above exception was the direct cause of the following exception:",
+})
 _DIST_VER_RE = re.compile(r"(?m)^Version:\s*([0-9A-Za-z][0-9A-Za-z.+-]{0,79})\s*$")
 _PYPROJ_VER_RE = re.compile(r'(?m)^version\s*=\s*"([0-9A-Za-z][0-9A-Za-z.+-]{0,79})"\s*$')
 
@@ -85,16 +100,42 @@ def _hex(value, length: int) -> str | None:
     return None
 
 
-def _read_small(path: Path, limit: int = 8192) -> bytes | None:
+def _close_fd(fd: int) -> None:
+    if fd >= 0:
+        try:
+            os.close(fd)
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+
+
+def _read_bytes_bounded(path: Path, limit: int = 16384, *, head_only: bool = False, tail_only: bool = False) -> bytes | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    fd = -1
     try:
-        if not path.is_file() or path.stat().st_size > limit:
+        fd = os.open(str(path), flags)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (not head_only and not tail_only and st.st_size > limit):
             return None
-        raw = path.read_bytes()
-        return raw if len(raw) <= limit else None
+        if tail_only and st.st_size > limit:
+            os.lseek(fd, st.st_size - limit, os.SEEK_SET)
+        rem, chunks = (limit if (head_only or tail_only) else limit + 1), []
+        while rem > 0 and (buf := os.read(fd, min(rem, 65536))):
+            chunks.append(buf)
+            rem -= len(buf)
+        raw = b"".join(chunks)
+        return raw if (head_only or tail_only or len(raw) <= limit) else None
     except TimeoutError:
         raise
     except OSError:
         return None
+    finally:
+        _close_fd(fd)
+
+
+def _read_small(path: Path, limit: int = 8192) -> bytes | None:
+    return _read_bytes_bounded(path, limit)
 
 
 def _git_head_revision(repo_dir: Path) -> str | None:
@@ -188,7 +229,7 @@ def default_diagnostics_root() -> str:
 
 def _invoke_record(record_fn, component, operation, *, stage, category, exception,
                    revision, version, elapsed_ms, exit_code, reportable,
-                   source_root, evidence, reason_code, substage):
+                   source_root, evidence, reason_code, substage, infer_build_meta=None):
     base = dict(
         stage=stage, category=category, exception=exception, host=HOST,
         revision=revision, version=version, elapsed_ms=elapsed_ms,
@@ -200,18 +241,58 @@ def _invoke_record(record_fn, component, operation, *, stage, category, exceptio
         v2["reason_code"] = reason_code
     if substage is not None:
         v2["substage"] = substage
+    if infer_build_meta is not None:
+        v2["infer_build_meta"] = infer_build_meta
     try:
         return record_fn(component, operation, **v2)
     except TypeError:
+        if infer_build_meta is False and getattr(record_fn, "__module__", "") == "mindie_diagnostics.integration":
+            from mindie_diagnostics.fallback import record_failure as fb_record
+            return fb_record(component, operation, **base)
         try:
             return record_fn(component, operation, **extended)
         except TypeError:
             return record_fn(component, operation, **base)
 
 
+class _GatewayFailureMarker:
+    __slots__ = ("ref",)
+
+    def __init__(self, ref):
+        self.ref = ref
+
+
+def _chain_inner_diagnostic(exc):
+    if exc is None:
+        return None
+    seen: set[int] = set()
+    pending = [exc]
+    while pending and len(seen) < 32:
+        cur = pending.pop(0)
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        marker = getattr(cur, "_mindie_gateway_diag", None)
+        if type(marker) is _GatewayFailureMarker and isinstance(marker.ref, dict):
+            return dict(marker.ref)
+        diag = getattr(cur, "mindie_diagnostic", None)
+        if isinstance(diag, dict) and type(diag.get("logging_failed")) is bool:
+            if inc := _hex(diag.get("incident_id"), 32):
+                return {"incident_id": inc, "logging_failed": diag["logging_failed"]}
+            if diag == {"logging_failed": True}:
+                return {"logging_failed": True}
+        if getattr(cur, "__cause__", None) is not None:
+            pending.append(cur.__cause__)
+        if getattr(cur, "__context__", None) is not None and not getattr(cur, "__suppress_context__", False):
+            pending.append(cur.__context__)
+    return None
+
+
 def failure(operation: str, stage: str, category: str, *, exception=None,
             config=None, revision=None, elapsed_ms=None, exit_code=None,
             reportable: bool = True, reason_code=None, substage=None) -> dict:
+    if (inner := _chain_inner_diagnostic(exception)) is not None:
+        return inner
     try:
         from mindie_diagnostics.integration import record_failure
 
@@ -231,24 +312,49 @@ def failure(operation: str, stage: str, category: str, *, exception=None,
             reason_code=eff_reason, substage=eff_substage,
         )
         if not isinstance(raw, dict):
-            return {"logging_failed": True}
-        out = {"recorded": bool(raw.get("recorded")), "logging_failed": bool(raw.get("logging_failed"))}
-        if inc := _hex(raw.get("incident_id"), 32):
-            out["incident_id"] = inc
-        return out
+            out = {"logging_failed": True}
+        else:
+            out = {"recorded": bool(raw.get("recorded")), "logging_failed": bool(raw.get("logging_failed"))}
+            if inc := _hex(raw.get("incident_id"), 32):
+                out["incident_id"] = inc
     except TimeoutError:
         raise
     except Exception:
-        return {"logging_failed": True}
+        out = {"logging_failed": True}
+    if exception is not None:
+        try:
+            exception._mindie_gateway_diag = _GatewayFailureMarker(out)
+        except Exception:
+            pass
+    return out
 
 
 def is_internal_mcp_exception(exc: BaseException) -> bool:
-    if isinstance(exc, (ValueError, OSError, TimeoutError, subprocess.SubprocessError)):
-        return False
     mro_names = {cls.__name__ for cls in type(exc).__mro__}
-    if mro_names & _NON_REPORTABLE_MCP_EXC_NAMES:
-        return False
     if not (mro_names & (_REPORTABLE_EXC_TYPES.keys() | {"TypeError"})):
+        return False
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending and len(seen) < 32:
+        cur = pending.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(
+            cur,
+            (ValueError, OSError, TimeoutError, subprocess.SubprocessError, KeyboardInterrupt, SystemExit, GeneratorExit),
+        ):
+            return False
+        if {cls.__name__ for cls in type(cur).__mro__} & _NON_REPORTABLE_MCP_EXC_NAMES:
+            return False
+        cat = getattr(cur, "category", None)
+        if isinstance(cat, str) and cat:
+            return False
+        if getattr(cur, "__cause__", None) is not None:
+            pending.append(cur.__cause__)
+        if getattr(cur, "__context__", None) is not None and not getattr(cur, "__suppress_context__", False):
+            pending.append(cur.__context__)
+    if pending:
         return False
     scripts_prefix = os.path.normcase(str(Path(__file__).resolve().parent)) + os.sep
     tb = exc.__traceback__
@@ -263,99 +369,94 @@ def is_internal_mcp_exception(exc: BaseException) -> bool:
     return False
 
 
+def _scan_subdirs_bounded(parent: Path, *, prefix: str = "", suffix: str = "") -> list[Path]:
+    matches: list[Path] = []
+    try:
+        with os.scandir(parent) as it:
+            for idx, entry in enumerate(it):
+                if idx >= 512 or len(matches) >= 4:
+                    break
+                if (not prefix or entry.name.startswith(prefix)) and (not suffix or entry.name.endswith(suffix)):
+                    if entry.is_dir(follow_symlinks=False):
+                        matches.append(Path(entry.path))
+    except TimeoutError:
+        raise
+    except OSError:
+        return []
+    return sorted(matches)
+
+
 def _file_url_to_path(url: str) -> Path | None:
     if not isinstance(url, str) or not url.startswith("file://"):
         return None
     from urllib.parse import unquote, urlparse
-
-    raw_path = unquote(urlparse(url).path or "")
-    if re.match(r"^/[A-Za-z]:/", raw_path):
-        raw_path = raw_path[1:]
-    return Path(raw_path) if raw_path else None
+    raw = unquote(urlparse(url).path or "")
+    return Path(raw[1:] if re.match(r"^/[A-Za-z]:/", raw) else raw) if raw else None
 
 
-def _inspect_dist_info(site_dir: Path, dist_norm: str) -> tuple[str | None, str | None]:
-    try:
-        if not site_dir.is_dir():
-            return None, None
-        candidates = sorted(site_dir.glob(f"{dist_norm}-*.dist-info"))[:4]
-    except TimeoutError:
-        raise
-    except OSError:
-        return None, None
-    for dist_dir in candidates:
-        ver = None
-        rev = None
-        raw_meta = _read_small(dist_dir / "METADATA", 32768)
-        if raw_meta:
+def _inspect_dist_info_full(site_dir: Path, dist_norm: str) -> tuple[str | None, str | None, Path | None]:
+    for dist_dir in _scan_subdirs_bounded(site_dir, prefix=f"{dist_norm}-", suffix=".dist-info"):
+        ver = rev = editable_co = None
+        if raw_meta := _read_bytes_bounded(dist_dir / "METADATA", 32768):
             m = _DIST_VER_RE.search(raw_meta.decode("utf-8", errors="replace"))
-            if m:
-                ver = m.group(1)
-        raw_du = _read_small(dist_dir / "direct_url.json", 8192)
-        if raw_du:
+            ver = m.group(1) if m else None
+        if raw_du := _read_bytes_bounded(dist_dir / "direct_url.json", 8192):
             try:
                 du = json.loads(raw_du.decode("utf-8"))
             except (UnicodeDecodeError, ValueError):
                 du = {}
             if isinstance(du, dict):
-                vcs = du.get("vcs_info")
-                if isinstance(vcs, dict):
-                    rev = _hex(vcs.get("commit_id"), 40)
-                if not rev and isinstance(du.get("url"), str):
-                    co = _file_url_to_path(du["url"])
-                    if co is not None:
-                        rev = _git_head_revision(co)
-        if ver or rev:
-            return ver, rev
-    return None, None
+                vcs, dir_info = du.get("vcs_info"), du.get("dir_info")
+                rev = _hex(vcs.get("commit_id"), 40) if isinstance(vcs, dict) else None
+                if isinstance(dir_info, dict) and dir_info.get("editable") is True and isinstance(du.get("url"), str):
+                    editable_co = _file_url_to_path(du["url"])
+                    rev = rev or (_git_head_revision(editable_co) if editable_co is not None else None)
+        if ver or rev or editable_co is not None:
+            return ver, rev, editable_co
+    return None, None, None
+
+
+def _inspect_dist_info(site_dir: Path, dist_norm: str) -> tuple[str | None, str | None]:
+    return _inspect_dist_info_full(site_dir, dist_norm)[:2]
 
 
 def _inspect_checkout(repo_dir: Path, comp_name: str) -> tuple[str | None, str | None]:
-    raw_pp = _read_small(repo_dir / "pyproject.toml", 32768)
-    if not raw_pp:
+    if not (raw_pp := _read_bytes_bounded(repo_dir / "pyproject.toml", 32768)):
         return None, None
     text = raw_pp.decode("utf-8", errors="replace")
     if f'name = "{comp_name}"' not in text and f"name = '{comp_name}'" not in text:
         return None, None
     m = _PYPROJ_VER_RE.search(text)
-    ver = m.group(1) if m else None
-    rev = _git_head_revision(repo_dir)
-    return ver, rev
+    return (m.group(1) if m else None), _git_head_revision(repo_dir)
 
 
 def _venv_roots_from_executable(executable) -> list[Path]:
     if not isinstance(executable, (str, os.PathLike)) or not str(executable):
         return []
-    roots: list[Path] = []
     try:
         exe_abs = Path(os.path.abspath(str(Path(executable).expanduser())))
     except TimeoutError:
         raise
     except OSError:
         return []
-    if exe_abs.parent.name.lower() in {"bin", "scripts"}:
-        roots.append(exe_abs.parent.parent)
+    roots = [exe_abs.parent.parent] if exe_abs.parent.name.lower() in {"bin", "scripts"} else []
+    if (head := _read_bytes_bounded(exe_abs, 256, head_only=True)) and head.startswith(b"#!"):
+        line = head.splitlines()[0][2:].decode("utf-8", errors="replace").strip()
+        line = line[13:].strip() if line.startswith("/usr/bin/env ") else line
+        tok = line.strip("\"'").split()[0] if line else ""
+        if tok and os.path.isabs(tok):
+            try:
+                sb = Path(os.path.abspath(tok))
+                if sb.parent.name.lower() in {"bin", "scripts"} and sb.parent.parent not in roots:
+                    roots.append(sb.parent.parent)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
     try:
-        if exe_abs.is_file():
-            with exe_abs.open("rb") as stream:
-                head = stream.read(256)
-            if head.startswith(b"#!"):
-                first_line = head.splitlines()[0][2:].decode("utf-8", errors="replace").strip()
-                if first_line.startswith("/usr/bin/env "):
-                    first_line = first_line[len("/usr/bin/env "):].strip()
-                token = first_line.strip("\"'").split()[0] if first_line else ""
-                if token and os.path.isabs(token):
-                    sb = Path(os.path.abspath(token))
-                    if sb.parent.name.lower() in {"bin", "scripts"} and sb.parent.parent not in roots:
-                        roots.append(sb.parent.parent)
-    except TimeoutError:
-        raise
-    except OSError:
-        pass
-    try:
-        resolved = exe_abs.resolve()
-        if resolved.parent.name.lower() in {"bin", "scripts"} and resolved.parent.parent not in roots:
-            roots.append(resolved.parent.parent)
+        res = exe_abs.resolve()
+        if res.parent.name.lower() in {"bin", "scripts"} and res.parent.parent not in roots:
+            roots.append(res.parent.parent)
     except TimeoutError:
         raise
     except OSError:
@@ -363,128 +464,191 @@ def _venv_roots_from_executable(executable) -> list[Path]:
     return roots
 
 
+def _venv_site_dirs(venv_root: Path) -> list[Path]:
+    return [venv_root / "Lib" / "site-packages", *[d / "site-packages" for d in _scan_subdirs_bounded(venv_root / "lib", prefix="python")]]
+
+
+def _trusted_package_dirs(comp_name: str, pkg_prefix: str, executable=None) -> list[Path]:
+    dist_norm, trusted = comp_name.lower().replace("-", "_"), []
+    for venv_root in _venv_roots_from_executable(executable if executable is not None else sys.executable):
+        cands: list[Path] = []
+        for sp in _venv_site_dirs(venv_root):
+            cands.append(sp / pkg_prefix)
+            if (eco := _inspect_dist_info_full(sp, dist_norm)[2]) is not None:
+                cands.extend((eco / pkg_prefix, eco / "src" / pkg_prefix))
+        if _inspect_checkout(venv_root, comp_name) != (None, None):
+            cands.extend((venv_root / pkg_prefix, venv_root / "src" / pkg_prefix))
+        for cand in cands:
+            try:
+                if cand.is_dir() and (rp := cand.resolve()) not in trusted:
+                    trusted.append(rp)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+    return trusted
+
+
 def _resolve_child_component_build(comp_name: str, pkg_roots: list[str], executable=None) -> tuple[str | None, str | None]:
     dist_norm = comp_name.lower().replace("-", "_")
-    ver: str | None = None
-    rev: str | None = None
     for raw_root in pkg_roots[:4]:
-        root_path = Path(raw_root)
-        d_ver, d_rev = _inspect_dist_info(root_path, dist_norm)
-        ver = ver or d_ver
-        rev = rev or d_rev
-        if not ver or not rev:
-            c_ver, c_rev = _inspect_checkout(root_path, comp_name)
-            ver = ver or c_ver
-            rev = rev or c_rev
-        if ver and rev:
-            return ver, rev
+        rp = Path(raw_root)
+        d_ver, d_rev = _inspect_dist_info(rp, dist_norm)
+        if d_ver or d_rev:
+            return d_ver, d_rev
+        if rp.name != "site-packages" and (rp / ".git").exists():
+            c_ver, c_rev = _inspect_checkout(rp, comp_name)
+            if c_ver or c_rev:
+                return c_ver, c_rev
     for venv_root in _venv_roots_from_executable(executable):
-        site_dirs = [venv_root / "Lib" / "site-packages"]
-        lib_dir = venv_root / "lib"
+        for sp in _venv_site_dirs(venv_root):
+            d_ver, d_rev = _inspect_dist_info(sp, dist_norm)
+            if d_ver or d_rev:
+                return d_ver, d_rev
+    return None, None
+
+
+_FATAL_SIGNAL_REASONS = {
+    code: reason
+    for sig_name, reason in (
+        ("SIGILL", "component_sigill"), ("SIGABRT", "component_sigabrt"),
+        ("SIGBUS", "component_sigbus"), ("SIGFPE", "component_sigfpe"),
+        ("SIGSEGV", "component_sigsegv"),
+    )
+    if (sig_num := getattr(signal, sig_name, None)) is not None
+    for code in (-int(sig_num), 128 + int(sig_num))
+}
+
+
+def _verified_failure_ids(comp_name: str, *, invocation_token: str | None = None, config=None) -> list[str]:
+    tok = _hex(invocation_token, 32)
+    if not tok:
+        return []
+    if callable(cfg_fn := globals().get("diagnostics_config_path")):
         try:
-            if lib_dir.is_dir():
-                site_dirs.extend(sorted(lib_dir.glob("python*/site-packages"))[:4])
+            if config is not None:
+                os.environ["MINDIE_DIAGNOSTICS_CONFIG"] = str(cfg_fn(config))
+            else:
+                os.environ.setdefault("MINDIE_DIAGNOSTICS_CONFIG", str(cfg_fn(None)))
         except TimeoutError:
             raise
-        except OSError:
+        except Exception:
             pass
-        for sp in site_dirs:
-            d_ver, d_rev = _inspect_dist_info(sp, dist_norm)
-            ver = ver or d_ver
-            rev = rev or d_rev
-            if ver and rev:
-                return ver, rev
-    return ver, rev
-
-
-def _extract_owned_traceback_with_roots(stderr: str, pkg_prefix: str) -> tuple[list[dict], list[str], list[str]]:
-    if not isinstance(stderr, str) or "Traceback (most recent call last):" not in stderr:
-        return [], [], []
-    tail = stderr[stderr.rfind("Traceback (most recent call last):"):][:65536]
-    frames: list[dict] = []
-    roots: list[str] = []
-    saw_frame = False
-    exc_name: str | None = None
-    marker = f"/{pkg_prefix}/"
-    for line in tail.splitlines()[1:1000]:
-        normalized = line.replace("\\", "/")
-        match = _TB_FILE_RE.match(normalized)
-        if match:
-            saw_frame = True
-            raw_path, lineno_s, func = match.groups()
-            idx = raw_path.rfind(marker)
-            if idx != -1:
-                parent_dir = raw_path[:idx]
-                if parent_dir and parent_dir not in roots:
-                    roots.append(parent_dir)
-                rel = raw_path[idx + 1:]
-                if rel.endswith(".py"):
-                    rel = rel[:-3]
-                parts = [p for p in rel.split("/") if p and p != "__init__"]
-                mod = ".".join(parts) if parts else pkg_prefix
-                lineno = int(lineno_s)
-                if 1 <= lineno <= 1_000_000:
-                    frames.append({"module": mod[:120], "function": func, "line": lineno})
-            continue
-        if line and not line[0].isspace():
-            if saw_frame:
-                exc_match = _TB_EXC_RE.match(line)
-                if exc_match:
-                    candidate = exc_match.group(1).rsplit(".", 1)[-1]
-                    if candidate in _REPORTABLE_EXC_TYPES:
-                        exc_name = candidate
-            break
-    if not frames or exc_name is None:
-        return [], [], []
-    return frames[-12:], [exc_name], roots
-
-
-def _extract_owned_traceback(stderr: str, pkg_prefix: str) -> tuple[list[dict], list[str]]:
-    frames, chain, _ = _extract_owned_traceback_with_roots(stderr, pkg_prefix)
-    return frames, chain
-
-
-def record_component_crash(
-    tool_name: str, argv, exit_code, stderr: str, *, parsed_result=None, config=None, executable=None
-):
-    """Record an unhandled internal Python traceback from an owned component CLI."""
-    if isinstance(parsed_result, dict) and isinstance(parsed_result.get("diagnostic"), dict):
-        diag = parsed_result["diagnostic"]
-        if _hex(diag.get("incident_id"), 32):
-            return {"incident_id": diag["incident_id"], "logging_failed": bool(diag.get("logging_failed", False))}
-    if isinstance(stderr, str):
-        inc_match = _STDERR_INCIDENT_RE.search(stderr)
-        if inc_match:
-            return {"incident_id": inc_match.group(1), "logging_failed": False}
-    target = _COMPONENT_PACKAGES.get(tool_name)
-    if target is None or exit_code in (0, 2, None):
-        return None
-    comp_name, pkg_prefix = target
-    frames, chain, pkg_roots = _extract_owned_traceback_with_roots(stderr, pkg_prefix)
-    if not frames or not chain:
-        return None
-    stage = argv[0] if isinstance(argv, list) and argv and isinstance(argv[0], str) and _SUBCMD_RE.fullmatch(argv[0]) else "cli"
-    synth_cls = _REPORTABLE_EXC_TYPES.get(chain[0], RuntimeError)
-    synth = synth_cls("component cli unhandled traceback")
-    evidence = {"stack_frames": frames, "exception_chain": chain, "reason_code": "unhandled_component_traceback"}
+    if callable(binder := globals().get("bind_environment")):
+        try:
+            binder()
+        except TimeoutError:
+            raise
+        except Exception:
+            pass
     try:
-        from mindie_diagnostics.integration import record_failure
-
-        os.environ["MINDIE_DIAGNOSTICS_CONFIG"] = str(diagnostics_config_path(config))
-        comp_ver, comp_rev = _resolve_child_component_build(comp_name, pkg_roots, executable=executable)
-        raw = _invoke_record(
-            record_failure, comp_name, "cli.execute", stage=stage, category="internal",
-            exception=synth, revision=comp_rev, version=comp_ver, elapsed_ms=None,
-            exit_code=exit_code, reportable=True, source_root=None,
-            evidence=evidence, reason_code="unhandled_component_traceback", substage=None,
-        )
-        if isinstance(raw, dict) and _hex(raw.get("incident_id"), 32):
-            return {"incident_id": raw["incident_id"], "logging_failed": bool(raw.get("logging_failed", False))}
-        return None
+        from mindie_diagnostics.fallback import default_root
+        ev_dir = Path(default_root()) / "events" / comp_name
     except TimeoutError:
         raise
     except Exception:
+        if not (raw_root := os.environ.get("MINDIE_DIAGNOSTICS_ROOT")):
+            return []
+        ev_dir = Path(raw_root).expanduser() / "events" / comp_name
+    cands: list[tuple[int, Path]] = []
+    try:
+        with os.scandir(ev_dir) as it:
+            for idx, entry in enumerate(it):
+                if idx >= 64:
+                    break
+                if entry.name.endswith(".jsonl") and entry.is_file(follow_symlinks=False):
+                    cands.append((entry.stat(follow_symlinks=False).st_mtime_ns, Path(entry.path)))
+    except TimeoutError:
+        raise
+    except OSError:
+        return []
+    found: list[str] = []
+    for _, fp in sorted(cands, reverse=True)[:8]:
+        raw = _read_bytes_bounded(fp, 65536, tail_only=True)
+        if not raw:
+            continue
+        for raw_ln in reversed(raw.splitlines()):
+            ln = raw_ln.strip()
+            if not (ln.startswith(b"{") and ln.endswith(b"}")):
+                continue
+            try:
+                obj = json.loads(ln.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if (
+                isinstance(obj, dict)
+                and obj.get("component") == comp_name
+                and obj.get("event") == "operation.end"
+                and obj.get("status") == "error"
+                and obj.get("reportable") is True
+                and obj.get("invocation_token") == tok
+                and (oid := _hex(obj.get("operation_id"), 32))
+                and oid not in found
+            ):
+                found.append(oid)
+    return found
+
+
+def _verified_local_incident(
+    comp_name: str, inc_id: str, *, invocation_token: str | None = None, config=None
+) -> bool:
+    inc = _hex(inc_id, 32)
+    if not inc:
+        return False
+    return inc in _verified_failure_ids(comp_name, invocation_token=invocation_token, config=config)
+
+
+def record_component_crash(
+    tool_name: str,
+    argv,
+    exit_code,
+    stderr: str,
+    *,
+    parsed_result=None,
+    config=None,
+    executable=None,
+    invocation_token=None,
+):
+    """Return a provenance-verified child crash receipt or fatal native signal crash envelope."""
+    target = _COMPONENT_PACKAGES.get(tool_name)
+    if target is None or exit_code in (0, 2, None):
         return None
+    comp_name, _pkg_prefix = target
+    verified = _verified_failure_ids(comp_name, invocation_token=invocation_token, config=config)
+    if verified:
+        diag_d = parsed_result.get("diagnostic") if isinstance(parsed_result, dict) else None
+        if not isinstance(diag_d, dict) and isinstance(parsed_result, dict) and isinstance(parsed_result.get("structuredContent"), dict):
+            diag_d = parsed_result["structuredContent"].get("diagnostic")
+        parsed_inc = _hex(diag_d.get("incident_id"), 32) if isinstance(diag_d, dict) else None
+        if parsed_inc in verified:
+            return {"incident_id": parsed_inc, "logging_failed": False}
+        if isinstance(stderr, str):
+            for inc_id in reversed(_STDERR_INCIDENT_RE.findall(stderr)[-4:]):
+                if inc_id in verified:
+                    return {"incident_id": inc_id, "logging_failed": False}
+        return {"incident_id": verified[0], "logging_failed": False}
+    sig_reason = _FATAL_SIGNAL_REASONS.get(exit_code) if type(exit_code) is int else None
+    if sig_reason is None:
+        return None
+    allowed_stages = _KNOWN_COMPONENT_STAGES.get(tool_name, frozenset())
+    first_arg = argv[0] if isinstance(argv, list) and argv and isinstance(argv[0], str) else None
+    stage = first_arg if first_arg in allowed_stages else "cli"
+    c_ver, c_rev = _resolve_child_component_build(comp_name, [], executable=executable)
+    try:
+        from mindie_diagnostics.integration import record_failure
+        os.environ["MINDIE_DIAGNOSTICS_CONFIG"] = str(diagnostics_config_path(config))
+        raw = _invoke_record(
+            record_failure, comp_name, "cli.execute", stage=stage, category="subprocess", exception=None,
+            revision=c_rev, version=c_ver, elapsed_ms=None, exit_code=exit_code, reportable=True,
+            source_root=None, evidence=None, reason_code=sig_reason, substage=None,
+            infer_build_meta=False,
+        )
+        inc = _hex(raw.get("incident_id"), 32) if isinstance(raw, dict) else None
+        return {"incident_id": inc, "logging_failed": False} if inc else {"logging_failed": True}
+    except TimeoutError:
+        raise
+    except Exception:
+        return {"logging_failed": True}
 
 
 def reporting_status(*, config=None) -> dict:
