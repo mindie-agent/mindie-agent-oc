@@ -1,10 +1,11 @@
 /**
  * [Role] Canonical MindIE-owned path resolution for the OpenCode (`oc`) JS host plugin.
  * [Invariants] Byte-for-byte aligned with `scripts/paths.py`. Never mutates `~/.config/opencode` or `~/.local/share/opencode`; all MindIE state lives under MindIE-owned `configHome`, `dataHome`, and `stateDir`.
- * [Timeouts & Locks] Pure path resolution and bounded local JSON reads (`<= 64 KiB`); zero subprocesses or network calls.
+ * [Timeouts & Locks] Pure path resolution and bounded local JSON reads (`<= 64 KiB`); cold Windows fallback interpreter discovery probes candidates with `<= 2.5s` `spawnSync` (`windowsHide: true`) and caches in-memory.
  * [Side-Effect Policy] Read-only except when `atomicWriteJson` is explicitly called on a MindIE-owned path.
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -85,7 +86,8 @@ export function readJsonSafe(targetPath) {
             return null;
         }
         const raw = fs.readFileSync(targetPath, "utf8");
-        const parsed = JSON.parse(raw);
+        const clean = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
+        const parsed = JSON.parse(clean);
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
             process.stderr.write(`MindIE OpenCode config ignored (not a JSON object): ${targetPath}\n`);
             return null;
@@ -171,12 +173,120 @@ export function atomicWriteJson(targetPath, payload) {
     return resolved;
 }
 
+const WIN_HOST_EXT_RE = /\.(?:exe|cmd|bat|ps1|com)$/i;
+const WSL_DRVFS_RE = /^\/mnt\/[a-zA-Z](?:\/|$)/;
+let coldWinPythonCache = { key: "", value: "" };
+
+export function inWslJs() {
+    if (process.platform === "win32") return false;
+    if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+    try {
+        return fs.existsSync("/proc/sys/fs/binfmt_misc/WSLInterop");
+    } catch {
+        return false;
+    }
+}
+
+export function isUsableBootstrapPython(cand) {
+    if (typeof cand !== "string" || !cand.trim()) return false;
+    const norm = cand.replace(/\\/g, "/").toLowerCase();
+    const base = norm.slice(norm.lastIndexOf("/") + 1);
+    if (base === "pythonw.exe" || base === "pythonw" || norm.includes("/windowsapps/")) {
+        return false;
+    }
+    if (process.platform !== "win32") {
+        if (WIN_HOST_EXT_RE.test(norm) || (inWslJs() && WSL_DRVFS_RE.test(cand))) {
+            return false;
+        }
+    }
+    return fs.existsSync(cand);
+}
+
+function collectMatchingSubdirs(parentDir, prefix, relExe) {
+    const out = [];
+    if (!parentDir) return out;
+    try {
+        const entries = fs.readdirSync(parentDir, { withFileTypes: true })
+            .filter((d) => d.isDirectory() && d.name.toLowerCase().startsWith(prefix))
+            .map((d) => d.name)
+            .sort()
+            .reverse();
+        for (const name of entries) {
+            const full = path.join(parentDir, name, relExe);
+            if (fs.existsSync(full)) out.push(full);
+        }
+    } catch {}
+    return out;
+}
+
+function resolveColdWindowsPython() {
+    const localApp = process.env.LOCALAPPDATA || "";
+    const appData = process.env.APPDATA || "";
+    const userProf = process.env.USERPROFILE || os.homedir();
+    const pathEnv = process.env.PATH || process.env.Path || "";
+    const cacheKey = `${localApp}|${appData}|${userProf}|${pathEnv}`;
+    if (coldWinPythonCache.key === cacheKey && coldWinPythonCache.value && fs.existsSync(coldWinPythonCache.value)) {
+        return coldWinPythonCache.value;
+    }
+    const candidates = [
+        ...collectMatchingSubdirs(localApp ? path.join(localApp, "Programs", "uv-python") : "", "cpython-3.", "python.exe"),
+        ...collectMatchingSubdirs(appData ? path.join(appData, "uv", "python") : "", "cpython-3.", "python.exe"),
+        ...collectMatchingSubdirs(localApp ? path.join(localApp, "uv", "python") : "", "cpython-3.", "python.exe"),
+        ...collectMatchingSubdirs(localApp ? path.join(localApp, "Programs", "Python") : "", "python3", "python.exe"),
+    ];
+    for (const dir of pathEnv.split(path.delimiter)) {
+        if (!dir || dir.toLowerCase().includes("\\windowsapps")) continue;
+        for (const exe of ["python.exe", "python3.exe"]) {
+            const cand = path.join(dir, exe);
+            if (fs.existsSync(cand)) candidates.push(cand);
+        }
+    }
+    const seen = new Set();
+    for (const cand of candidates) {
+        const normKey = cand.toLowerCase();
+        if (seen.has(normKey)) continue;
+        seen.add(normKey);
+        if (seen.size > 10) break;
+        const probe = spawnSync(
+            cand,
+            ["-S", "-c", "import sys;raise SystemExit(0 if sys.version_info>=(3,11) else 1)"],
+            { timeout: 2500, windowsHide: true, stdio: "ignore" },
+        );
+        if (!probe.error && probe.status === 0) {
+            coldWinPythonCache = { key: cacheKey, value: cand };
+            return cand;
+        }
+    }
+    const uvCands = [];
+    for (const dir of pathEnv.split(path.delimiter)) {
+        if (dir && !dir.toLowerCase().includes("\\windowsapps") && fs.existsSync(path.join(dir, "uv.exe"))) {
+            uvCands.push(path.join(dir, "uv.exe"));
+        }
+    }
+    if (localApp) {
+        uvCands.push(path.join(localApp, "Microsoft", "WinGet", "Links", "uv.exe"));
+        uvCands.push(...collectMatchingSubdirs(path.join(localApp, "Microsoft", "WinGet", "Packages"), "astral-sh.uv_", "uv.exe"));
+    }
+    if (userProf) uvCands.push(path.join(userProf, ".local", "bin", "uv.exe"));
+    for (const uvExe of uvCands) {
+        if (!fs.existsSync(uvExe)) continue;
+        const found = spawnSync(uvExe, ["python", "find", ">=3.11"], { timeout: 2500, windowsHide: true, encoding: "utf8" });
+        const pyPath = !found.error && found.status === 0 ? String(found.stdout || "").trim() : "";
+        if (pyPath && isUsableBootstrapPython(pyPath)) {
+            coldWinPythonCache = { key: cacheKey, value: pyPath };
+            return pyPath;
+        }
+        break;
+    }
+    return "python";
+}
+
 export function resolveBootstrapPython(explicitConfig = null) {
-    if (process.env.MINDIE_OC_PYTHON && fs.existsSync(process.env.MINDIE_OC_PYTHON)) {
+    if (process.env.MINDIE_OC_PYTHON && isUsableBootstrapPython(process.env.MINDIE_OC_PYTHON)) {
         return process.env.MINDIE_OC_PYTHON;
     }
     const cfg = readJsonSafe(configPath(explicitConfig));
-    if (cfg && typeof cfg.python === "string" && fs.existsSync(cfg.python)) {
+    if (cfg && typeof cfg.python === "string" && isUsableBootstrapPython(cfg.python)) {
         return cfg.python;
     }
     const isWin = process.platform === "win32";
@@ -188,15 +298,15 @@ export function resolveBootstrapPython(explicitConfig = null) {
         path.join(dataHome(), "wb-venv", relPy),
     ];
     for (const cand of candidates) {
-        if (fs.existsSync(cand)) {
+        if (isUsableBootstrapPython(cand)) {
             return cand;
         }
     }
     for (const sibling of ["oc.json", "agy.json", "wb.json", "codex.json", "cc.json", "kimi.json"]) {
         const scfg = readJsonSafe(path.join(configHome(), sibling));
-        if (scfg && typeof scfg.python === "string" && fs.existsSync(scfg.python)) {
+        if (scfg && typeof scfg.python === "string" && isUsableBootstrapPython(scfg.python)) {
             return scfg.python;
         }
     }
-    return isWin ? "python" : "python3";
+    return isWin ? resolveColdWindowsPython() : "python3";
 }

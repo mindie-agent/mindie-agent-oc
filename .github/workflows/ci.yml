@@ -35,6 +35,8 @@ jobs:
       - name: Enforce Unix LF line endings
         run: uv run --no-sync python .github/scripts/check_lf_eol.py
       - name: Contract, update, and continuity tests
+        env:
+          PYTHONUTF8: '0'
         run: uv run --no-sync python -m pytest -q -m "not live_npu and not live_opencode"
       - name: JavaScript syntax and release metadata checks
         run: |

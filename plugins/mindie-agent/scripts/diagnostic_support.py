@@ -319,6 +319,58 @@ def failure(operation: str, stage: str, category: str, *, exception=None,
     return out
 
 
+_LOCAL_HTTP_BUG_NAMES = frozenset({
+    "InvalidURL", "ImproperConnectionState", "NotConnected", "UnimplementedFileMode",
+})
+
+
+def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None]:
+    """Map transient transport/TLS/HTTP/DNS update failures without masking local bugs."""
+    import http.client
+    import socket
+    import ssl
+    import urllib.error
+
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+        return "timeout", False, None
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending and len(seen) < 16:
+        cur = pending.pop(0)
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        cls_name = type(cur).__name__
+        if cls_name == "ReleaseResponseTooLarge" or cls_name in _LOCAL_HTTP_BUG_NAMES:
+            return "update", True, None
+        if isinstance(cur, (TimeoutError, subprocess.TimeoutExpired)):
+            return "timeout", False, None
+        if isinstance(cur, urllib.error.HTTPError) or cls_name == "ReleaseFetchError":
+            status = getattr(cur, "code", None) if isinstance(cur, urllib.error.HTTPError) else getattr(cur, "status", None)
+            code = getattr(cur, "code", None) if cls_name == "ReleaseFetchError" else None
+            code_s = code if isinstance(code, str) else None
+            if code_s == "release_certificate_error":
+                return "certificate", False, "release_certificate_error"
+            if status == 429 or (status == 403 and code_s == "release_rate_limited"):
+                return "rate_limited", False, code_s or "release_rate_limited"
+            return "temporary_network", False, code_s or "release_http_error"
+        if isinstance(cur, ssl.SSLCertVerificationError):
+            return "certificate", False, "release_certificate_error"
+        if isinstance(cur, urllib.error.URLError):
+            if isinstance(getattr(cur, "reason", None), ssl.SSLCertVerificationError):
+                return "certificate", False, "release_certificate_error"
+            return "temporary_network", False, "release_transport_unavailable"
+        if isinstance(cur, (ssl.SSLError, ConnectionError, socket.gaierror, socket.herror, http.client.HTTPException)):
+            return "temporary_network", False, "release_transport_unavailable"
+        if isinstance(cur, json.JSONDecodeError):
+            return "temporary_network", False, "invalid_release_json"
+        if getattr(cur, "__cause__", None) is not None:
+            pending.append(cur.__cause__)
+        if getattr(cur, "__context__", None) is not None and not getattr(cur, "__suppress_context__", False):
+            pending.append(cur.__context__)
+    return "update", True, None
+
+
 def is_internal_mcp_exception(exc: BaseException) -> bool:
     mro_names = {cls.__name__ for cls in type(exc).__mro__}
     if not (mro_names & (_REPORTABLE_EXC_TYPES.keys() | {"TypeError"})):
