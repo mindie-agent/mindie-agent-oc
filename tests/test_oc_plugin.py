@@ -149,6 +149,8 @@ const toolHooks = new Map();
 const shellHooks = new Map();
 const synthetics = [];
 const generateCalls = [];
+const promptCalls = [];
+let promptError = null;
 
 const sessions = {{
     ses_mainA001: {{ id: "ses_mainA001", directory: process.env.TEST_WORKSPACE }},
@@ -174,7 +176,12 @@ const mockCtx = {{
         hook(name, fn) {{ sessionHooks.set(name, fn); }},
         async get({{ sessionID }}) {{ return sessions[sessionID] || null; }},
         async synthetic(payload) {{ synthetics.push(payload); }},
-        async prompt() {{}},
+        async prompt(payload) {{
+            promptCalls.push(payload);
+            assert.equal(typeof payload.text, "string");
+            assert.ok(!Object.hasOwn(payload, "prompt"));
+            if (promptError) throw promptError;
+        }},
     }},
     tool: {{
         hook(name, fn) {{ toolHooks.set(name, fn); }},
@@ -275,6 +282,27 @@ assert.deepEqual(generateCalls[0].model, {{
     id: "deepseek-flash",
     variant: "max",
 }});
+
+// OpenCode 2.2.7 accepts a flat PromptInput, with exactly one delivery attempt.
+const inputPrompt = {{ text: "inspect task", files: [{{ url: "file:///test.txt" }}], agents: [], skills: [], sessionID: "not-the-session" }};
+await commands.get("mindie-agent").execute({{ sessionID: "ses_mainA001", prompt: inputPrompt, delivery: "queue" }});
+assert.equal(promptCalls.length, 1);
+assert.deepEqual(promptCalls[0], {{ ...inputPrompt, sessionID: "ses_mainA001", text: "inspect task", delivery: "queue" }});
+promptError = new Error("SchemaError after admission: outcome unknown");
+await assert.rejects(commands.get("mindie-agent").execute({{ sessionID: "ses_mainA001", prompt: {{ text: "no retry" }} }}), /outcome unknown/);
+assert.equal(promptCalls.length, 2);
+promptError = null;
+
+// A failed Python gesture still forwards the task using the same flat contract.
+const originalRoot = process.env.OC_PLUGIN_ROOT;
+process.env.OC_PLUGIN_ROOT = process.env.TEST_WORKSPACE;
+await commands.get("mindie-agent").execute({{ sessionID: "ses_mainA001", prompt: inputPrompt, delivery: "queue" }});
+assert.equal(promptCalls.length, 3);
+assert.deepEqual(promptCalls[2], promptCalls[0]);
+promptError = new Error("transport failed after admission");
+await assert.rejects(commands.get("mindie-agent").execute({{ sessionID: "ses_mainA001", prompt: {{ text: "fallback no retry" }} }}), /after admission/);
+assert.equal(promptCalls.length, 4);
+process.env.OC_PLUGIN_ROOT = originalRoot;
 
 await cleanup();
 assert.ok(!fs.existsSync(epPath));

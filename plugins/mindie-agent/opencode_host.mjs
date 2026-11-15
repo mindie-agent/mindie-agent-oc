@@ -496,7 +496,7 @@ export default {
                             if (typeof ctx?.session?.synthetic === "function") await ctx.session.synthetic({ sessionID, text: errMsg, resume: false });
                             const fallbackTask = extractGestureTaskPrompt(gestureText);
                             if (fallbackTask && typeof ctx?.session?.prompt === "function") {
-                                await ctx.session.prompt({ sessionID, prompt: { ...prompt, text: fallbackTask }, ...(delivery ? { delivery } : {}) });
+                                await ctx.session.prompt({ ...prompt, sessionID, text: fallbackTask, ...(delivery ? { delivery } : {}) });
                             }
                             return;
                         }
@@ -509,7 +509,7 @@ export default {
                             if ((res.schema_warning || res.status === "degraded") && typeof ctx?.session?.synthetic === "function" && res.message) {
                                 await ctx.session.synthetic({ sessionID, text: res.message, resume: false });
                             }
-                            await ctx.session.prompt({ sessionID, prompt: { ...prompt, text: res.task_prompt }, ...(delivery ? { delivery } : {}) });
+                            await ctx.session.prompt({ ...prompt, sessionID, text: res.task_prompt, ...(delivery ? { delivery } : {}) });
                             return;
                         }
                         if (typeof ctx?.session?.synthetic === "function" && res.message) {
