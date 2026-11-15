@@ -34,7 +34,6 @@
 # Channel 1: GitHub repository / release
 opencode plugin add github:mindie-agent/mindie-agent-oc
 
-# Channel 2: GitHub Release npm tarball (no external npm registry required)
 
 # Check and apply plugin updates
 opencode plugin check
