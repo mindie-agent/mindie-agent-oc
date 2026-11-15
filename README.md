@@ -5,7 +5,7 @@
 <h1 align="center">MindIE Agent for OpenCode (<code>mindie-agent-oc</code>)</h1>
 
 <p align="center">
-  <b>OpenCode (<code>v2.2.x+</code>) 原生客户端适配器：支持 GitHub 与 npm 双通道插件分发、默认暴露 34 项确定性昇腾远端与诊断 MCP 工具，并通过 <code>/mindie-agent</code> 按会话隔离激活分级知识飞轮</b>
+  <b>OpenCode (<code>v2.2.x+</code>) 原生客户端适配器：支持 GitHub 插件安装与本地目录加载、默认暴露 34 项确定性昇腾远端与诊断 MCP 工具，并通过 <code>/mindie-agent</code> 按会话隔离激活分级知识飞轮</b>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 `mindie-agent-oc`（npm 包标识 `@mindie-agent/oc`，当前正式版本为 `v0.1.6`）基于 OpenCode v2 Promise Plugin API（`@opencode-ai/plugin`）原生构建，与其他手动入口 Harness（`mindie-agent-agy` / `mindie-agent-codex`）保持严格的边界一致性：
 
-1. **双通道原生安装与无感升级**：同时支持 GitHub 仓库通道（`opencode plugin add github:mindie-agent/mindie-agent-oc`）（OpenCode 2.2.7 不接受直接 tarball URL，Release tarball 仅作为分发产物）以及本地开发目录引用（`"plugin": ["file:///abs/path/to/mindie-agent-oc"]`）；支持 `opencode plugin update` 原生升级，并在后台按 `300s` 周期单调发现并原子切换共享组件独立更新（`max(installed, baseline, latest)`）。
+1. **GitHub / 本地安装与无感升级**：同时支持 GitHub 仓库通道（`opencode plugin add github:mindie-agent/mindie-agent-oc`）（OpenCode 2.2.7 不接受直接 tarball URL，Release tarball 仅作为分发产物）以及本地开发目录引用（`"plugin": ["file:///abs/path/to/mindie-agent-oc"]`）；支持 `opencode plugin update` 原生升级，并在后台按 `300s` 周期单调发现并原子切换共享组件独立更新（`max(installed, baseline, latest)`）。
 2. **默认全量开放确定性 MCP 工具（共 34 项，零 `knowledge_*` 污染）**：
    - `mindie-remote-dev`（20 项 `remote_*` 远端开发与异步任务工具，`timeout.execution = 660000ms`）
    - `mindie-tools`（14 项确定性工具：`mindie_status`、`profiler`、`sim`、`coordinator`、`debugger`、`npu_top` 及 6 项实时观测工具、`diagnostics_status`、`diagnostics_bundle`）
@@ -38,7 +38,7 @@
 
 ## 3. 安装、升级与初始化
 
-### 方式 A：通过 OpenCode CLI 安装与升级（GitHub / npm Tarball 双通道）
+### 方式 A：通过 OpenCode CLI 安装与升级（GitHub）
 
 ```bash
 # 通道 1：GitHub 仓库源码 / Release

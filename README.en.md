@@ -20,7 +20,7 @@
 
 `mindie-agent-oc` (npm package `@mindie-agent/oc`, current release [`v0.1.6`](https://github.com/mindie-agent/mindie-agent-oc/releases/tag/v0.1.6)) targets OpenCode's v2 Promise Plugin API (`@opencode-ai/plugin`) directly and enforces the same strict boundary as `mindie-agent-agy` and `mindie-agent-codex`:
 
-1. **Dual-Channel Distribution & Automatic Updates**: Supports `opencode plugin add github:mindie-agent/mindie-agent-oc` (OpenCode 2.2.7 rejects direct tarball URLs; release tarballs remain distribution artifacts), and local directory URIs (`"plugin": ["file:///abs/path/to/mindie-agent-oc"]`), native `opencode plugin update`, and monotonic `300s` background updates (`max(installed, baseline, latest)`) for shared runtime components.
+1. **GitHub / Local Installation & Automatic Updates**: Supports `opencode plugin add github:mindie-agent/mindie-agent-oc` (OpenCode 2.2.7 rejects direct tarball URLs; release tarballs remain distribution artifacts), and local directory URIs (`"plugin": ["file:///abs/path/to/mindie-agent-oc"]`), native `opencode plugin update`, and monotonic `300s` background updates (`max(installed, baseline, latest)`) for shared runtime components.
 2. **Always-On Deterministic MCP Tools (34 Tools, Zero `knowledge_*` in Default `tools/list`)**:
    - `mindie-remote-dev`: 20 `remote_*` development and background job tools (`timeout.execution = 660000ms`).
    - `mindie-tools`: 14 deterministic tools (`mindie_status`, `profiler`, `sim`, `coordinator`, `debugger`, `npu_top` + 6 live observation tools, `diagnostics_status`, `diagnostics_bundle`).
