@@ -145,6 +145,7 @@ def capture_event(event: dict, *, config=None) -> dict:
                 spool_dir=transcript_spool_dir(config),
                 not_before=auth_boundary if auth_boundary > 0 else None,
                 private_paths=(str(lease.get("project_root") or ""), str(Path.home())),
+                config=config,
             )
         except TimeoutError:
             raise

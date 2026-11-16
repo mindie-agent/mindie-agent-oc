@@ -251,10 +251,18 @@ def main(argv: list[str] | None = None) -> int:
         stdout_s = _reexec_stdio(sys.stdout)
         stderr_s = _reexec_stdio(sys.stderr)
         if argv[0] == "mcp":
+            from storage_gc import acquire_service_lease, release_service_lease
+
             mcp_kwargs: dict = {"env": env, "stdin": stdin_s, "stdout": stdout_s, "stderr": stderr_s}
             if os.name == "nt":
                 mcp_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            return int(subprocess.run(cmd, **mcp_kwargs).returncode)
+            # This supervisor stays resident for the whole MCP session, so it holds the
+            # shared runtime lease that keeps its disposable generation unretired.
+            lease = acquire_service_lease()
+            try:
+                return int(subprocess.run(cmd, **mcp_kwargs).returncode)
+            finally:
+                release_service_lease(lease)
         if argv[0] == "hook":
             budget, grace = HOOK_SUPERVISOR_BUDGET, HOOK_CLEANUP_GRACE
         else:

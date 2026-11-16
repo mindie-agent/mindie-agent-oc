@@ -44,8 +44,11 @@ from admission import status_facts
 from bounded import run as bounded_run
 from component_update import trigger_background_update_if_due
 from identity import claim_bind, finish_bind, reject_forged_identity_args, require_session
+from mcp_stdio import iter_stdio_messages as _iter_stdio_messages
+from mcp_stdio import write_rpc_frame as _write_rpc_frame
 from oc_native_compat import ensure_oc_native_support
 from paths import bind_db_path, config_path, diagnostics_config_path, plugin_root, read_json, remote_receipts_path, state_dir
+from storage_gc import acquire_service_lease, release_service_lease
 
 ensure_oc_native_support()
 
@@ -684,83 +687,17 @@ def handle_rpc(request: dict, surface: str, *, config=None, receipts: RemoteRece
 MAX_STDIO_FRAME_BYTES = 16 * 1024 * 1024
 
 
-def _discard_bytes(stream, count: int) -> None:
-    rem = count
-    while rem > 0:
-        chunk = stream.read(min(65536, rem))
-        if not chunk:
-            break
-        rem -= len(chunk)
-
-
-def _iter_stdio_messages(stream):
-    """Yield `(framed, request_dict)` supporting bounded newline-delimited and Content-Length JSON-RPC."""
-    while True:
-        first = stream.readline(MAX_STDIO_FRAME_BYTES + 1)
-        if not first:
-            return
-        if len(first) > MAX_STDIO_FRAME_BYTES and not first.endswith(b"\n"):
-            while True:
-                tail = stream.readline(65536)
-                if not tail or tail.endswith(b"\n"):
-                    break
-            yield False, {"__parse_error__": f"Parse error: line exceeds {MAX_STDIO_FRAME_BYTES} byte limit"}
-            continue
-        stripped = first.strip()
-        if not stripped:
-            continue
-        if stripped.lower().startswith(b"content-length:"):
-            try:
-                length = int(stripped.split(b":", 1)[1].strip())
-                if length < 0:
-                    raise ValueError("negative Content-Length")
-            except ValueError as exc:
-                yield True, {"__parse_error__": f"Parse error: invalid Content-Length ({exc})"}
-                continue
-            for _ in range(64):
-                hdr = stream.readline(8192)
-                if not hdr or hdr in (b"\r\n", b"\n"):
-                    break
-            if length > MAX_STDIO_FRAME_BYTES:
-                _discard_bytes(stream, length)
-                yield True, {"__parse_error__": f"Parse error: Content-Length {length} exceeds {MAX_STDIO_FRAME_BYTES} byte limit"}
-                continue
-            buf = bytearray()
-            while len(buf) < length:
-                chunk = stream.read(min(65536, length - len(buf)))
-                if not chunk:
-                    break
-                buf.extend(chunk)
-            if len(buf) < length:
-                return
-            try:
-                yield True, json.loads(buf.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                yield True, {"__parse_error__": f"Parse error: {exc}"}
-        else:
-            try:
-                yield False, json.loads(stripped.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                yield False, {"__parse_error__": f"Parse error: {exc}"}
-
-
-def _write_rpc_frame(out_stream, resp: dict, *, framed: bool) -> None:
-    encoded = json.dumps(resp, ensure_ascii=False).encode("utf-8")
-    if framed:
-        out_stream.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii") + encoded)
-    else:
-        out_stream.write(encoded + b"\n")
-    out_stream.flush()
-
-
 def serve(surface: str, *, config=None, stdin=None, stdout=None) -> int:
     if surface not in {"remote", "tools"}:
         raise ValueError(f"unsupported MCP surface: {surface}")
     in_stream = sys.stdin.buffer if stdin is None else stdin
     out_stream = sys.stdout.buffer if stdout is None else stdout
     receipts = RemoteReceipts(remote_receipts_path(config))
+    # A resident MCP process keeps the shared runtime lease of the disposable
+    # generation owning its interpreter, so a concurrent sweep never retires it.
+    lease = acquire_service_lease()
     try:
-        for framed, req in _iter_stdio_messages(in_stream):
+        for framed, req in _iter_stdio_messages(in_stream, max_frame_bytes=MAX_STDIO_FRAME_BYTES):
             if isinstance(req, dict) and "__parse_error__" in req:
                 _write_rpc_frame(
                     out_stream,
@@ -777,6 +714,8 @@ def serve(surface: str, *, config=None, stdin=None, stdout=None) -> int:
         except Exception:
             pass
         return 0
+    finally:
+        release_service_lease(lease)
     return 0
 
 

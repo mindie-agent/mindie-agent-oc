@@ -11,13 +11,13 @@
     "verified_commit": "911ed567a1011e6ee6578f008c522bde4ac55b4e"
   },
   "components": {
-    "mindie-knowledge": "0.13.20",
-    "remote-dev": "0.11.10",
-    "mindie-diagnostics": "0.5.11",
-    "mindie-coordinator": "0.7.9",
-    "mindie-debugger": "0.1.2",
-    "mindie-profiler": "0.5.12",
-    "mindie-sim": "0.9.11",
-    "npu-top": "0.3.3"
+    "mindie-knowledge": "0.13.22",
+    "remote-dev": "0.11.12",
+    "mindie-diagnostics": "0.5.15",
+    "mindie-coordinator": "0.7.11",
+    "mindie-debugger": "0.1.3",
+    "mindie-profiler": "0.5.15",
+    "mindie-sim": "0.9.15",
+    "npu-top": "0.3.4"
   }
 }

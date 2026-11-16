@@ -14,10 +14,15 @@ per-session JSONL spool files under `<state_dir>/transcripts/<session_id>.jsonl`
   redaction before writing local spool JSONL.
 - Truncates any torn non-newline tail and reconciles the highest committed `seq`
   before appending, preventing crash-induced duplicate entries.
+- Spool bundles are bounded: cold `transcripts/*.jsonl` files (older than
+  `SPOOL_MAX_AGE_SECONDS` or beyond `SPOOL_SESSION_LIMIT` sessions) are retired as
+  a unit with their `.seq`/lock only while the lock is free and never while admitted.
 
 [Timeouts & Locks]
 - Serializes writers per session via in-process thread lock + OS file lock
   (`<spool_dir>/.<session_id>.lock`) within a shared `max_seconds=2.0s` deadline.
+- Eviction is throttled by a `<= 1.0s` non-blocking budget and a one-hour cooldown
+  marker; a contended lock or an exhausted budget is a keep, never a failure.
 - Enforces SQLite wall-clock deadline via `set_progress_handler` and paginates
   `session_message` in 500-row batches (`<= 501` SQLite bind parameters).
 
@@ -36,9 +41,12 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import threading
 import time
 from urllib.parse import quote
+
+import storage_gc
 
 SPOOL_PAGE_SIZE = 500
 SPOOL_SCHEMA = "mindie-oc-spool/1"
@@ -63,6 +71,9 @@ _OPAQUE_BLOB_RE = re.compile(r"(?<![A-Za-z0-9+/=._-])[A-Za-z0-9+/=._-]{4096,}")
 
 _THREAD_LOCKS_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
+_SPOOL_MAINTENANCE_GUARD = threading.Lock()
+SPOOL_MAINTENANCE_INTERVAL = 3600.0
+SPOOL_MAINTENANCE_BUDGET_SECONDS = storage_gc.SPOOL_BUDGET_SECONDS
 
 
 def to_seconds(raw) -> float | None:
@@ -182,8 +193,37 @@ def _thread_lock_for(lock_file: Path) -> threading.Lock:
         return lock
 
 
+def _lock_stream(handle, lock_file: Path) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        if lock_file.stat().st_size == 0:
+            handle.write(b"0")
+            handle.flush()
+            handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_stream(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def _session_spool_lock(lock_file: Path, *, deadline: float):
+    """Hold the live `.<session>.lock` inode, retrying after a concurrent unlink."""
     tlock = _thread_lock_for(lock_file)
     wait = max(0.0, deadline - time.monotonic())
     if not tlock.acquire(timeout=wait):
@@ -191,44 +231,39 @@ def _session_spool_lock(lock_file: Path, *, deadline: float):
     handle = None
     os_locked = False
     try:
-        handle = lock_file.open("a+b")
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    handle.seek(0)
-                    if lock_file.stat().st_size == 0:
-                        handle.write(b"0")
-                        handle.flush()
-                        handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os_locked = True
+        for attempt in range(3):
+            handle = lock_file.open("a+b")
+            while True:
+                try:
+                    _lock_stream(handle, lock_file)
+                    os_locked = True
+                    break
+                except TimeoutError:
+                    raise
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for session spool OS lock")
+                    time.sleep(0.02)
+            if storage_gc.lock_inode_matches(handle, lock_file):
                 break
+            # A concurrent spool eviction unlinked the inode we locked; retry on
+            # the live path so two writers can never hold old/new lock inodes.
+            try:
+                _unlock_stream(handle)
             except TimeoutError:
                 raise
             except OSError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("timed out waiting for session spool OS lock")
-                time.sleep(0.02)
+                pass
+            handle.close()
+            handle, os_locked = None, False
+            if time.monotonic() >= deadline or attempt + 1 >= 3:
+                raise TimeoutError("timed out re-verifying session spool OS lock inode")
         yield
     finally:
         if handle is not None:
             if os_locked:
                 try:
-                    if os.name == "nt":
-                        import msvcrt
-
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    _unlock_stream(handle)
                 except TimeoutError:
                     raise
                 except OSError:
@@ -287,6 +322,12 @@ def _recover_spool_tail_and_seq(spool_file: Path) -> int:
 
 
 def _read_cursor_seq(cursor_file: Path, *, spool_exists: bool, boundary: float | None) -> int:
+    """Highest committed sequence, or -1 when the projection identity is gone.
+
+    `boundary` is retained for callers, but a missing `<session>.jsonl` always
+    restarts at sequence 0: a spool rebuilt after eviction has a new inode and
+    prefix, so honoring a stale cursor would silently drop the retired prefix.
+    """
     if not cursor_file.is_file():
         return -1
     try:
@@ -302,12 +343,9 @@ def _read_cursor_seq(cursor_file: Path, *, spool_exists: bool, boundary: float |
             parsed = json.loads(raw)
             if not isinstance(parsed, dict) or type(parsed.get("seq")) is not int or int(parsed["seq"]) < -1:
                 raise ValueError(f"corrupt transcript cursor: {cursor_file}")
-            saved_boundary = parsed.get("not_before")
-            if not spool_exists and isinstance(saved_boundary, (int, float)):
-                if boundary is None or boundary + 1e-3 < float(saved_boundary):
-                    return -1
-            return int(parsed["seq"])
-        seq_val = int(raw)
+            seq_val = int(parsed["seq"])
+        else:
+            seq_val = int(raw)
     except ValueError as exc:
         raise ValueError(f"corrupt transcript cursor: {cursor_file}") from exc
     if seq_val < -1:
@@ -409,7 +447,95 @@ def _is_incomplete_assistant_row(mtype: str, parsed_data: dict, extracted: tuple
     return False
 
 
+def _spool_lock_key(out_dir: Path, session_id: str) -> str:
+    return str(out_dir / f".{session_id}.lock")
+
+
+def _busy_thread_sessions(out_dir: Path) -> set[str]:
+    """Session ids whose in-process writer lock under `out_dir` is currently held."""
+    suffix = ".lock"
+    prefix = "."
+    busy: set[str] = set()
+    with _THREAD_LOCKS_GUARD:
+        for key, lock in _THREAD_LOCKS.items():
+            if not lock.locked():
+                continue
+            name = Path(key).name
+            if len(name) > len(prefix) + len(suffix) and name.startswith(prefix) and name.endswith(suffix):
+                session_id = name[len(prefix): -len(suffix)]
+                if Path(key).parent == out_dir:
+                    busy.add(session_id)
+    return busy
+
+
+def _forget_thread_locks(out_dir: Path, session_ids) -> None:
+    """Drop idle `_THREAD_LOCKS` entries of evicted sessions (never a held lock)."""
+    with _THREAD_LOCKS_GUARD:
+        for session_id in session_ids or ():
+            key = _spool_lock_key(out_dir, session_id)
+            lock = _THREAD_LOCKS.get(key)
+            if lock is not None and not lock.locked():
+                _THREAD_LOCKS.pop(key, None)
+
+
+def _run_spool_maintenance(out_dir: Path, session_id: str, config=None) -> None:
+    """Bounded, throttled eviction of cold spool projections; never fails a capture."""
+    if not _SPOOL_MAINTENANCE_GUARD.acquire(blocking=False):
+        return
+    try:
+        if not storage_gc.spool_maintenance_due(out_dir, interval_seconds=SPOOL_MAINTENANCE_INTERVAL):
+            return
+        excluded = _busy_thread_sessions(out_dir)
+        excluded.add(session_id)
+        result = storage_gc.prune_spool_transcripts(
+            out_dir, exclude=excluded, budget_seconds=SPOOL_MAINTENANCE_BUDGET_SECONDS,
+            config=config,
+        )
+        _forget_thread_locks(out_dir, result.get("removed_sessions"))
+        storage_gc.write_spool_maintenance_marker(
+            out_dir,
+            dict(
+                at=time.time(),
+                removed=len(result.get("removed_sessions") or ()),
+                status=result.get("status"),
+                warnings=list(result.get("warnings") or ())[:3],
+            ),
+        )
+    except TimeoutError as exc:
+        print(f"MindIE OpenCode spool maintenance timeout: {exc}", file=sys.stderr)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"MindIE OpenCode spool maintenance warning: {type(exc).__name__}: {exc}", file=sys.stderr)
+    finally:
+        _SPOOL_MAINTENANCE_GUARD.release()
+
+
 def sync_session_spool(
+    session_id: str,
+    *,
+    db_path: str | Path,
+    spool_dir: str | Path,
+    not_before: float | str | None = None,
+    private_paths: tuple[str, ...] | list[str] = (),
+    max_seconds: float = 2.0,
+    config: str | Path | None = None,
+) -> Path | None:
+    """Project one session, then apply bounded cold-projection eviction."""
+    spool_file = _sync_session_spool(
+        session_id,
+        db_path=db_path,
+        spool_dir=spool_dir,
+        not_before=not_before,
+        private_paths=private_paths,
+        max_seconds=max_seconds,
+    )
+    try:
+        _run_spool_maintenance(Path(spool_dir).resolve(), session_id, config=config)
+    except TimeoutError as exc:
+        print(f"MindIE OpenCode spool maintenance timeout: {exc}", file=sys.stderr)
+    return spool_file
+
+
+def _sync_session_spool(
     session_id: str,
     *,
     db_path: str | Path,

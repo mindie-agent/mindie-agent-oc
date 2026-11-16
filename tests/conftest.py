@@ -2,15 +2,16 @@
 
 [Role]
 Isolates `MINDIE_CONFIG_HOME`, `MINDIE_DATA_HOME`, `MINDIE_DIAGNOSTICS_ROOT`,
-`MINDIE_OPENCODE_DB`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and
-`HOME` inside `tmp_path` so tests never read or mutate host `~/.config/opencode`,
-`~/.local/share/opencode`, or `~/.config/mindie-agent`.
+`MINDIE_OPENCODE_DB`, every `XDG_*` root, `HOME`, and the sibling harness homes
+(`CODEX_HOME`, `CLAUDE_CONFIG_DIR`/`CLAUDE_PLUGIN_DATA`, `KIMI_SHARE_DIR`,
+`KIMI_CODE_HOME`, `DSH_HOME`, `OPENCODE_CONFIG_DIR`, `WORKBUDDY_HOME`) inside
+`tmp_path`, so no test enumerates the host's cross-harness borrowed runtimes.
 
 [Invariants]
 - Adds `plugins/mindie-agent/scripts` to `sys.path` once and activates
   `ensure_oc_native_support()`.
-- Preserves host `XDG_CACHE_HOME` when available so standalone OpenCode CLI checks
-  do not redownload cached runtime metadata.
+- Every storage/config root a test may enumerate is redirected into `tmp_path`;
+  a regression test never reads host `~/.config/*` or `~/.local/share/*`.
 
 [Timeouts & Locks]
 - Pure filesystem setup per test (`< 10ms`).
@@ -44,6 +45,7 @@ def isolated_oc_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
     xdg_cfg = tmp_path / "xdg-config"
     xdg_data = tmp_path / "xdg-data"
     xdg_state = tmp_path / "xdg-state"
+    xdg_cache = tmp_path / "xdg-cache"
     workspace = tmp_path / "workspace"
     opencode_db = xdg_data / "opencode" / "opencode.db"
 
@@ -55,6 +57,7 @@ def isolated_oc_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
         xdg_cfg / "opencode",
         xdg_data / "opencode",
         xdg_state,
+        xdg_cache,
         workspace,
     ):
         directory.mkdir(parents=True, exist_ok=True)
@@ -74,11 +77,23 @@ def isolated_oc_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
         "XDG_CONFIG_HOME": str(xdg_cfg),
         "XDG_DATA_HOME": str(xdg_data),
         "XDG_STATE_HOME": str(xdg_state),
+        "XDG_CACHE_HOME": str(xdg_cache),
+        "XDG_RUNTIME_DIR": str(xdg_state / "runtime"),
+        "CODEX_HOME": str(home / ".codex"),
+        "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+        "CLAUDE_PLUGIN_DATA": str(home / ".claude" / "plugins" / "data"),
+        "KIMI_SHARE_DIR": str(home / ".kimi-share"),
+        "KIMI_CODE_HOME": str(home / ".kimi-code"),
+        "DSH_HOME": str(home / ".dsh"),
+        "OPENCODE_CONFIG_DIR": str(xdg_cfg / "opencode"),
+        "WORKBUDDY_HOME": str(home / ".workbuddy"),
     }
     for key, val in env_map.items():
         monkeypatch.setenv(key, val)
     for drop_key in (
         "MINDIE_AGENT_CONFIG",
+        "MINDIE_OC_FORCE_CLEANUP",
+        "CLAUDE_PLUGIN_ROOT",
         "MINDIE_OC_ALLOW_BG_UPDATE",
         "MINDIE_OC_INSTALLED_ROOT",
         "OPENCODE_SESSION_ID",
