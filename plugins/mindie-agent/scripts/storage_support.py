@@ -127,35 +127,35 @@ def _is_junction(path: Path) -> bool:
         return True
 
 
+def _is_system_root_link(path: Path) -> bool:
+    """macOS `/var`, `/tmp` and `/etc` are root firmlinks, not user symlinks."""
+    import sys
+
+    return sys.platform == "darwin" and path.parent == Path("/") and path.name in {"var", "tmp", "etc"}
+
+
 def link_free(path, *, bases=()) -> bool:
-    """True when `path` and every segment down from a trusted base is a real dir."""
+    """True when `path` and every ancestor up to the filesystem root is a real dir.
+
+    `bases` is accepted for call-site compatibility, but the walk never stops at a
+    caller base: a symlinked/junction parent above a custom `state_dir` must be
+    caught. The only exemptions are the three macOS root firmlinks.
+    """
     try:
         probe = Path(os.path.abspath(os.fspath(path)))
     except TimeoutError:
         raise
     except (OSError, ValueError):
         return False
-    stops: list[Path] = []
-    for base in bases:
-        if base is None:
-            continue
-        try:
-            candidate = Path(os.path.abspath(os.fspath(base)))
-        except TimeoutError:
-            raise
-        except (OSError, ValueError):
-            return False
-        if probe == candidate or candidate in probe.parents:
-            stops.append(candidate)
     while True:
         try:
-            if probe.is_symlink() or _is_junction(probe):
+            if not _is_system_root_link(probe) and (probe.is_symlink() or _is_junction(probe)):
                 return False
         except TimeoutError:
             raise
         except OSError:
             return False
-        if probe in stops or probe.parent == probe:
+        if probe.parent == probe:
             return True
         probe = probe.parent
 
@@ -314,7 +314,12 @@ def _strings(value, depth: int = 0):
 
 
 def referenced_json_paths(documents) -> set[str]:
-    """Every absolute `*.json` path a scanned config document mentions."""
+    """Every absolute `*.json` path a scanned config document mentions.
+
+    Both the unresolved spelling a config uses and its symlink-resolved identity
+    are recorded, so a reference through an aliased parent still protects the
+    real snapshot the GC enumerates.
+    """
     found: set[str] = set()
     for _path, value in documents:
         for text in _strings(value):
@@ -322,6 +327,13 @@ def referenced_json_paths(documents) -> set[str]:
             if not stripped.lower().endswith(".json") or not is_absolute(stripped):
                 continue
             found.add(path_key(stripped))
+            try:
+                resolved = path_key(Path(path_text(stripped)).resolve())
+            except TimeoutError:
+                raise
+            except (OSError, ValueError):
+                continue
+            found.add(resolved)
     return found
 
 

@@ -478,7 +478,7 @@ def _forget_thread_locks(out_dir: Path, session_ids) -> None:
                 _THREAD_LOCKS.pop(key, None)
 
 
-def _run_spool_maintenance(out_dir: Path, session_id: str) -> None:
+def _run_spool_maintenance(out_dir: Path, session_id: str, config=None) -> None:
     """Bounded, throttled eviction of cold spool projections; never fails a capture."""
     if not _SPOOL_MAINTENANCE_GUARD.acquire(blocking=False):
         return
@@ -489,6 +489,7 @@ def _run_spool_maintenance(out_dir: Path, session_id: str) -> None:
         excluded.add(session_id)
         result = storage_gc.prune_spool_transcripts(
             out_dir, exclude=excluded, budget_seconds=SPOOL_MAINTENANCE_BUDGET_SECONDS,
+            config=config,
         )
         _forget_thread_locks(out_dir, result.get("removed_sessions"))
         storage_gc.write_spool_maintenance_marker(
@@ -516,6 +517,7 @@ def sync_session_spool(
     not_before: float | str | None = None,
     private_paths: tuple[str, ...] | list[str] = (),
     max_seconds: float = 2.0,
+    config: str | Path | None = None,
 ) -> Path | None:
     """Project one session, then apply bounded cold-projection eviction."""
     spool_file = _sync_session_spool(
@@ -527,7 +529,7 @@ def sync_session_spool(
         max_seconds=max_seconds,
     )
     try:
-        _run_spool_maintenance(Path(spool_dir).resolve(), session_id)
+        _run_spool_maintenance(Path(spool_dir).resolve(), session_id, config=config)
     except TimeoutError as exc:
         print(f"MindIE OpenCode spool maintenance timeout: {exc}", file=sys.stderr)
     return spool_file

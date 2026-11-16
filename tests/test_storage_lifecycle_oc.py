@@ -8,12 +8,10 @@ single-`.venv` `native_candidate` upgrade path, post-switch cleanup warnings tha
 never roll back a committed switch, and the `< 800` line module cap.
 
 [Invariants]
-- Reclamation never touches the active `oc.json` pointer, the active interpreter,
-  a generation leased by a real subprocess, a session projection whose
-  `.lock` is held, or a `source_root` still referenced by a harness config.
-- `native_candidate` upgrades reuse a healthy existing interpreter and build
-  exactly one component runtime; the baseline bootstrap only runs when
-  `prepare()` reports nothing to build.
+- Reclamation never touches the active `oc.json` pointer, active interpreter, a
+  leased generation, a locked projection, or a referenced `source_root` tree.
+- `native_candidate` upgrades reuse a healthy interpreter and build exactly one
+  component runtime; the baseline bootstrap only runs when `prepare()` is empty.
 - Every assertion stays inside `isolated_oc_env`, including `TMPDIR` and
   `UV_CACHE_DIR`; no test writes to the host `~`.
 
@@ -774,6 +772,7 @@ def test_post_switch_cleanup_exception_keeps_updated_status(
 
     for exc, version in ((PermissionError("EACCES component-runtimes"), "0.1.12"), (TimeoutError("cleanup deadline"), "0.1.13")):
         before = read_json(cfg)
+        before_summary = read_json(before["engine_config"])["summary_command"]
         candidate = _stage_candidate(storage_env["root"] / f"candidate-{version}", version=version)
         monkeypatch.setattr(storage_gc, "post_switch_reclaim", lambda **_kw: (_ for _ in ()).throw(exc))
         result = component_update.check(config=cfg, source=candidate)
@@ -783,7 +782,8 @@ def test_post_switch_cleanup_exception_keeps_updated_status(
         switched = read_json(cfg)
         assert switched["product_validation"]["native_version"] == version
         assert switched["previous_python"] == before["python"]
-        assert switched["previous_generation"] == before["engine_config"]
+        prior_file = Path(switched["previous_generation"])
+        assert prior_file.parent.name == "generations" and prior_file.is_file() and read_json(prior_file)["summary_command"] == before_summary
 
 
 def test_core_sources_stay_under_the_line_cap() -> None:

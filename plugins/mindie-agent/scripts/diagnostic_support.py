@@ -320,6 +320,23 @@ def failure(operation: str, stage: str, category: str, *, exception=None,
 
 
 _NON_REPORTABLE_CATEGORIES = frozenset({"resolver", "busy", "deferred", "prerequisite"})
+# Exceptions raised by bounded subprocess/config helpers carry an explicit
+# `category`; honoring it keeps local resolver/disk/permission/network failures
+# out of the upstream bug report even when wrapped by a plain RuntimeError.
+_EXCEPTION_CATEGORY_CODES = {
+    "resolver": "release_transport_unavailable",
+    "busy": "update_resource_busy",
+    "deferred": "update_deferred",
+    "prerequisite": "update_environment_unavailable",
+    "temporary_network": "release_transport_unavailable",
+    "rate_limited": "release_rate_limited",
+    "certificate": "release_certificate_error",
+    "authentication": "update_authentication_required",
+    "permission": "update_permission_denied",
+    "hook_trust": "update_hook_trust_rejected",
+    "cancelled": "update_cancelled",
+    "deadline": "update_deadline_exceeded",
+}
 _LOCAL_EXC_CATEGORIES = {
     "LockTimeout": ("busy", "update_resource_busy"),
     "LockBusy": ("busy", "update_resource_busy"),
@@ -353,6 +370,27 @@ def _classified(category: str, reportable: bool, code: str | None) -> tuple[str,
     return category, bool(reportable), code
 
 
+def _chain_explicit_category(exc: BaseException) -> tuple[str, str] | None:
+    """First explicit `.category` found on the exception cause/context chain."""
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending and len(seen) < 16:
+        cur = pending.pop(0)
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        explicit = getattr(cur, "category", None)
+        if isinstance(explicit, str) and explicit in _EXCEPTION_CATEGORY_CODES:
+            detail = getattr(cur, "code", None)
+            code = detail if isinstance(detail, str) and detail else _EXCEPTION_CATEGORY_CODES[explicit]
+            return explicit, code
+        if getattr(cur, "__cause__", None) is not None:
+            pending.append(cur.__cause__)
+        if getattr(cur, "__context__", None) is not None and not getattr(cur, "__suppress_context__", False):
+            pending.append(cur.__context__)
+    return None
+
+
 def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None]:
     """Map transient transport/TLS/HTTP/DNS update failures without masking local bugs."""
     import http.client
@@ -360,14 +398,15 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
     import ssl
     import urllib.error
 
+    explicit = _chain_explicit_category(exc)
+    if explicit is not None:
+        return explicit[0], False, explicit[1]
     local_http_bugs = (
         http.client.InvalidURL,
         http.client.ImproperConnectionState,
         http.client.NotConnected,
         http.client.UnimplementedFileMode,
     )
-    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
-        return "timeout", False, None
     seen: set[int] = set()
     pending: list[BaseException | None] = [exc]
     while pending and len(seen) < 16:

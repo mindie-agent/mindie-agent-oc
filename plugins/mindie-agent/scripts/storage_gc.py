@@ -28,13 +28,16 @@ background maintenance: excess `component-runtimes` generations, historical
 
 [Side-Effect Policy]
 - Deletes only disposable generations, stale engine snapshots and cold spool
-  bundles under the MindIE-owned roots it is given; never rewrites `oc.json`,
-  never touches `opencode.db`, and never starts a subprocess or network call.
+  bundles under the MindIE-owned roots it is given; preserves a mutable rollback
+  engine payload as an immutable `generations/` snapshot before it is rewritten;
+  never rewrites `oc.json`, touches `opencode.db`, or starts a subprocess.
 """
 
 from __future__ import annotations
 
 from contextlib import ExitStack
+import hashlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -62,7 +65,7 @@ from storage_support import expired as _expired
 from storage_support import merge as _merge
 from storage_support import normalize_windows_path as _normalize_windows_path
 from storage_support import note as _note
-from paths import config_path, data_home, read_json, state_dir
+from paths import atomic_write_json, config_path, data_home, read_json, state_dir
 
 COMPONENT_BUDGET_SECONDS = 2.5
 LEGACY_BUDGET_SECONDS = 3.0
@@ -97,23 +100,35 @@ def _identity(value) -> str:
         return guards.path_key(text)
 
 
-def _trusted_base(path: Path, candidates=()):
-    """Shallowest ancestor of `path` among `candidates` (link-guard walk stop)."""
-    probe = Path(os.path.abspath(os.fspath(path)))
-    best: Path | None = None
-    for base in candidates:
-        if base is None:
-            continue
-        try:
-            candidate = Path(os.path.abspath(os.fspath(base)))
-        except TimeoutError:
-            raise
-        except (OSError, ValueError):
-            continue
-        if probe == candidate or candidate in probe.parents:
-            if best is None or len(candidate.parts) < len(best.parts):
-                best = candidate
-    return best
+def _has_git_ancestor_any(value) -> bool:
+    """True when either the raw or the symlink-resolved spelling sits in Git."""
+    if guards.has_git_ancestor(value):
+        return True
+    try:
+        resolved = Path(os.fspath(value)).resolve()
+    except TimeoutError:
+        raise
+    except OSError:
+        return True
+    return guards.has_git_ancestor(resolved)
+
+
+def _within_forbidden(value, forbidden) -> bool:
+    """True when the raw or resolved spelling lands inside a user source tree."""
+    if not forbidden:
+        return False
+    try:
+        from mindie_knowledge.storage.lifecycle import is_within_roots
+    except ImportError:
+        return True
+    try:
+        if is_within_roots(Path(os.fspath(value)), forbidden):
+            return True
+        return is_within_roots(Path(os.fspath(value)).resolve(), forbidden)
+    except TimeoutError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        return True
 
 
 def _keep_state(config, *, extras=(), homes=None) -> tuple[list[str], bool]:
@@ -226,8 +241,7 @@ def prune_component_generations(
         return _account("absent")
     if not pins_complete:
         return _account("partial", partial=True, warnings=["protected pins incomplete; component reclamation skipped"])
-    if not guards.link_free(root, bases=_trusted_bases(root, (root.parent,))) \
-            or guards.has_git_ancestor(root):
+    if not guards.link_free(root) or _has_git_ancestor_any(root):
         return _account("protected", warnings=["component root is linked or inside a Git checkout"])
     try:
         from mindie_knowledge.storage import prune_component_runtimes as _prune
@@ -250,11 +264,6 @@ def prune_component_generations(
     _merge(account, result)
     account["status"] = str(result.get("status") or "completed")
     return account
-
-
-def _trusted_bases(path: Path, extra=()) -> tuple[Path, ...]:
-    base = _trusted_base(path, (data_home(), *extra))
-    return (base,) if base is not None else tuple(item for item in extra if item is not None)
 
 
 def sweep_legacy_baggage(
@@ -352,26 +361,54 @@ def _engine_documents(cfg: Path, homes, deadline: float | None) -> tuple[list, b
 
 def _snapshot_removable(item: Path, cfg: Path, forbidden) -> bool:
     """True only when the snapshot is link-free, Git-free and outside user roots."""
-    if not guards.link_free(item, bases=_trusted_bases(item, (cfg.parent,))):
+    if not guards.link_free(item):
         return False
-    try:
-        resolved = item.resolve()
-    except TimeoutError:
-        raise
-    except OSError:
+    if _has_git_ancestor_any(item):
         return False
-    if guards.has_git_ancestor(resolved):
+    if _within_forbidden(item, forbidden):
         return False
-    if not forbidden:
-        return True
-    try:
-        from mindie_knowledge.storage.lifecycle import is_within_roots
+    return True
 
-        return not is_within_roots(resolved, forbidden)
+
+def preserve_engine_snapshot(cfg_file: Path, prior_gen) -> str | None:
+    """Copy a mutable prior engine config into `generations/` before overwriting it.
+
+    A default install keeps its rollback payload in the mutable `oc.engine.json`;
+    the legacy mirror rewrites that file with the NEW interpreter, so the old
+    payload must be preserved under a content-addressed snapshot first. An
+    immutable `generations/<stem>.engine.<id>.json` is returned unchanged.
+    """
+    if not isinstance(prior_gen, str) or not os.path.isabs(prior_gen):
+        return None
+    prior = Path(prior_gen)
+    try:
+        if not prior.is_file():
+            return None
+        generations = (cfg_file.parent / "generations").resolve()
+        resolved = prior.resolve()
+        if (
+            resolved.parent == generations
+            and resolved.name.startswith(f"{cfg_file.stem}.engine.")
+            and resolved.suffix == ".json"
+        ):
+            return prior_gen
+        raw = prior.read_bytes()
     except TimeoutError:
         raise
-    except (ImportError, OSError, RuntimeError, ValueError):
-        return False
+    except OSError as exc:
+        raise OSError(f"cannot preserve rollback engine config {prior}: {exc}") from exc
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"rollback engine config is not valid JSON ({prior}): {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"rollback engine config is not a JSON object: {prior}")
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    snapshot = cfg_file.parent / "generations" / f"{cfg_file.stem}.engine.{digest}.json"
+    if not snapshot.is_file():
+        snapshot.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write_json(snapshot, payload)
+    return str(snapshot)
 
 
 def prune_engine_snapshots(
@@ -414,9 +451,13 @@ def prune_engine_snapshots(
     except OSError as exc:
         return _account("error", warnings=[f"{type(exc).__name__}: {exc}"])
     candidates.sort(key=lambda item: (_mtime(item) or 0.0, item.name), reverse=True)
-    historical = [item for item in candidates if _identity(item) not in referenced]
-    retained = {_identity(item) for item in historical[:max(0, int(keep_recent))]}
-    retained.update(_identity(item) for item in candidates if _identity(item) in referenced)
+
+    def _referenced(item: Path) -> bool:
+        return guards.path_key(item) in referenced or _identity(item) in referenced
+
+    historical = [item for item in candidates if not _referenced(item)]
+    retained = {id(item) for item in historical[:max(0, int(keep_recent))]}
+    retained.update(id(item) for item in candidates if _referenced(item))
     account = _account("completed")
     account["removed"] = 0
     for item in candidates:
@@ -424,7 +465,7 @@ def prune_engine_snapshots(
             account["partial"] = True
             _note(account, "engine snapshot budget exhausted")
             break
-        if _identity(item) in retained:
+        if id(item) in retained:
             account["kept_dirs"] += 1
             continue
         if not _snapshot_removable(item, cfg, forbidden):
@@ -567,6 +608,7 @@ __all__ = [
     "acquire_service_lease",
     "lock_inode_matches",
     "post_switch_reclaim",
+    "preserve_engine_snapshot",
     "prune_component_generations",
     "prune_engine_snapshots",
     "prune_spool_transcripts",

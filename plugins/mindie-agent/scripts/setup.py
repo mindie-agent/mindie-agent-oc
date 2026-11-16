@@ -216,6 +216,85 @@ def _discover_existing_mindie_python() -> str | None:
     return None
 
 
+_PROCESS_FAILURE_PHRASES = (
+    ("certificate", (
+        "certificate verify failed", "certificate_verify_failed", "ssl certificate problem",
+        "self-signed certificate", "self signed certificate", "unable to get local issuer",
+        "certificate has expired", "tls handshake", "sslcertverificationerror",
+    )),
+    ("resolver", (
+        "no solution found when resolving dependencies", "requirements contain conflicting urls",
+        "version solving failed", "no matching distribution", "unsatisfiable",
+        "cannot install", "depends on", "dependency resolution failed",
+    )),
+    ("permission", (
+        "permission denied", "access is denied", "operation not permitted", "eacces", "eperm",
+        "read-only file system", "os error 13",
+    )),
+    ("prerequisite", (
+        "no space left on device", "disk quota exceeded", "enospc", "edquot", "os error 28",
+        "no module named", "not a valid python", "unsupported python", "command not found",
+    )),
+    ("busy", (
+        "resource temporarily unavailable", "text file busy", "database is locked",
+        "os error 11", "os error 16", "another process is using", "lock is held",
+        "could not acquire lock",
+    )),
+    ("deferred", (
+        "already in progress", "operation in progress", "update in progress",
+    )),
+    ("temporary_network", (
+        "could not resolve host", "temporary failure in name resolution",
+        "name or service not known", "connection reset", "connection refused",
+        "network is unreachable", "connection timed out", "operation timed out",
+        "failed to fetch", "tls", "ssl", "http error", "502 bad gateway", "503 service",
+    )),
+)
+_FAILURE_REASON_CODES = {
+    "resolver": "update_resolver_conflict",
+    "busy": "update_resource_busy",
+    "deferred": "update_deferred",
+    "prerequisite": "update_environment_unavailable",
+    "temporary_network": "update_transport_unavailable",
+    "certificate": "update_certificate_error",
+    "permission": "update_permission_denied",
+}
+
+
+def _child_text(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value if isinstance(value, str) else ""
+
+
+def _process_failure_category(*texts) -> str | None:
+    """Map bounded child stdout/stderr to a non-reportable failure category."""
+    haystack = "\n".join(_child_text(text) for text in texts)[:65536].lower()
+    if not haystack:
+        return None
+    for category, needles in _PROCESS_FAILURE_PHRASES:
+        for needle in needles:
+            if needle in haystack:
+                return category
+    return None
+
+
+def _raise_process_failure(action: str, proc, *, category: str | None = None) -> None:
+    """Raise a classified `RuntimeError` without leaking raw child output."""
+    if category is None:
+        category = _process_failure_category(
+            getattr(proc, "stderr", None), getattr(proc, "stdout", None),
+        )
+    detail = (_child_text(getattr(proc, "stderr", None)) or _child_text(getattr(proc, "stdout", None))).strip()[:1000]
+    summary = f"{category} failure" if category else "unclassified failure"
+    error = RuntimeError(f"{action} (exit {getattr(proc, 'returncode', None)}): {summary}")
+    if category is not None:
+        error.category = category
+        error.reason_code = _FAILURE_REASON_CODES.get(category)
+    error.process_detail = detail
+    raise error
+
+
 def _current_python_has_runtime() -> bool:
     return all(
         importlib.util.find_spec(mod) is not None
@@ -260,7 +339,10 @@ def ensure_runtime_python(
     src_root = stage_source_baseline(source_root)
     uv = which_host_binary("uv", which_fn=shutil.which)
     if uv is None:
-        raise RuntimeError("uv is required to bootstrap the MindIE OpenCode runtime")
+        error = RuntimeError("uv is required to bootstrap the MindIE OpenCode runtime")
+        error.category = "prerequisite"
+        error.reason_code = _FAILURE_REASON_CODES["prerequisite"]
+        raise error
 
     data_home().mkdir(mode=0o700, parents=True, exist_ok=True)
     verify_reserve = min(15.0, max(1.0, float(timeout) * 0.15))
@@ -284,8 +366,7 @@ def ensure_runtime_python(
             uv_argv.extend(["--no-editable", "--no-install-project", "--project", str(build_dir), "--all-extras", "--no-dev", "--python", "3.13"])
             proc = bounded_run(uv_argv, "", timeout=_rem_budget(deadline, verify_reserve), max_output=256 * 1024, env=env)
     if proc.returncode != 0 or not venv_py.is_file():
-        detail = (proc.stderr or proc.stdout or "").strip()[-1000:]
-        raise RuntimeError(f"uv sync failed while bootstrapping oc-venv (exit {proc.returncode}): {detail}")
+        _raise_process_failure("uv sync failed while bootstrapping oc-venv", proc)
     return verified(_norm_python_path(venv_py))
 
 
@@ -311,7 +392,7 @@ def _write_initial_community_config(interpreter: str, comm_file: Path, payload: 
     grace = min(2.0, max(0.2, total * 0.2))
     proc = bounded_run([interpreter, "-I", "-c", code, str(comm_file), json.dumps(payload)], "", timeout=max(0.5, total - grace), cleanup_grace=grace)
     if proc.returncode != 0:
-        raise RuntimeError(f"failed to initialize community config via {interpreter}: {proc.stderr or proc.stdout}")
+        _raise_process_failure(f"failed to initialize community config via {interpreter}", proc)
 
 
 def ensure_default_profile(
@@ -551,7 +632,7 @@ def configure_community(
                 argv.extend([flag, val])
         proc = bounded_run(argv, "", timeout=inner_t, cleanup_grace=grace)
         if proc.returncode != 0:
-            raise RuntimeError(f"failed to configure community sharing via {interpreter}: {proc.stderr or proc.stdout}")
+            _raise_process_failure(f"failed to configure community sharing via {interpreter}", proc)
         return json.loads(proc.stdout.strip())
 
     from mindie_knowledge import consent_store

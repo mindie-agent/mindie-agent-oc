@@ -7,9 +7,13 @@ cursor and `.<session>.lock` sibling, plus the spool maintenance cooldown marker
 [Invariants]
 - A bundle is evicted only as a unit: deleting the projection while keeping the
   cursor makes a resumed session skip its retired prefix.
-- A session that is still admitted (`admission.sqlite3` lease `enabled=1`) or has a
-  pending activation is never evicted. An unreadable admission store aborts the
-  whole pass instead of guessing.
+- Every configured `mindie_knowledge` SQLite store is consulted under the held
+  `<session>.lock`: an unreadable store, a partial cursor or a pending capture
+  keeps the projection; fully consumed cursor rows are deleted before the unlink.
+- A session that is still admitted (`enabled=1`) or has a pending activation is
+  never evicted. An unreadable admission store or adapter config aborts the whole
+  pass instead of guessing, and a caller-configured external `admission_path` is
+  honored regardless of its directory.
 - Expiry (`>= 14 days`) is required for age-driven eviction; count pressure may
   only retire bundles past `SPOOL_BUNDLE_MIN_AGE_SECONDS` when the caller disables
   the age rule explicitly.
@@ -18,12 +22,13 @@ cursor and `.<session>.lock` sibling, plus the spool maintenance cooldown marker
   a held lock file is unlinked before it is unlocked (POSIX inode safety).
 
 [Timeouts & Locks]
-- One absolute `deadline` bounds the scan, the admission check and every lock
-  attempt. Lock probes are non-blocking; a contended lock is a keep, and an
-  exhausted budget reports `partial`.
+- One absolute `deadline` bounds the scan, admission/knowledge SQLite reads, and
+  every lock attempt. SQLite uses `busy_timeout=5000` plus a deadline progress
+  handler; lock probes are non-blocking and an exhausted budget reports `partial`.
 
 [Side-Effect Policy]
-- Unlinks only files under the given spool directory and writes the advisory
+- Unlinks only files under the given spool directory, deletes fully consumed
+  `cursors` rows from configured knowledge stores, and writes the advisory
   `.spool-maintenance.json` marker. Never touches `opencode.db` or a harness config.
 """
 
@@ -33,17 +38,26 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import time
 from urllib.parse import quote
 
-from paths import admission_path, atomic_write_json
-from storage_support import account, expired, note, unlink_file
+from paths import atomic_write_json, config_path, read_json
+from storage_support import account, expired, is_absolute, note, path_key, path_text, unlink_file
 
 SPOOL_BUDGET_SECONDS = 1.0
 SPOOL_SESSION_LIMIT = 128
 SPOOL_MAX_AGE_SECONDS = 14 * 24 * 60 * 60.0
 SPOOL_BUNDLE_MIN_AGE_SECONDS = 1800.0
 _LOCK_RETRIES = 3
+_SQLITE_BUSY_TIMEOUT_MS = 5000
+_KNOWLEDGE_DB_NAME = "state-v4.sqlite3"
+_KNOWLEDGE_ENGINE_KEYS = (
+    "engine_config", "previous_generation", "previous_engine_config", "rollback_engine_config",
+)
+_PENDING_CAPTURE_STATUSES = frozenset({"queued", "pending", "deferred"})
+_DOMAIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_MAX_KNOWLEDGE_DATABASES = 64
 
 
 def _spool_entries(root: Path, deadline: float | None, record: dict) -> list[tuple[float, str]]:
@@ -196,30 +210,80 @@ def _sqlite_ro_uri(database: Path) -> str:
     return f"file:{quote(posix, safe='/:')}?mode=ro"
 
 
-def _default_admission_db(state: Path) -> Path:
+def _open_sqlite(database: Path, deadline: float | None, *, readonly: bool):
+    """Open one SQLite store with a 5s busy timeout and the caller's deadline."""
+    import sqlite3
+
+    if readonly:
+        connection = sqlite3.connect(_sqlite_ro_uri(database), uri=True, timeout=5.0)
+    else:
+        connection = sqlite3.connect(os.fspath(database), timeout=5.0)
     try:
-        configured = admission_path()
+        connection.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS};")
+        connection.set_progress_handler(lambda: 1 if expired(deadline) else 0, 1000)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _admission_database(state: Path, config, admission_db) -> tuple[Path | None, bool]:
+    """Resolve the admission store; `(path, False)` means the config is unreadable."""
+    if admission_db is not None:
+        try:
+            return Path(admission_db).expanduser(), True
+        except (TypeError, ValueError):
+            return None, False
+    try:
+        cfg = config_path(config)
     except TimeoutError:
         raise
     except (OSError, ValueError):
-        configured = None
-    if configured is not None and Path(configured).parent == state:
-        return Path(configured)
-    return state / "admission.sqlite3"
+        return None, False
+    if not cfg.is_file():
+        return state / "admission.sqlite3", True
+    try:
+        payload = read_json(cfg)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return None, False
+    if "admission_path" not in payload:
+        return state / "admission.sqlite3", True
+    configured = payload.get("admission_path")
+    if not isinstance(configured, str) or not is_absolute(configured):
+        return None, False
+    return Path(path_text(configured)), True
 
 
 def _admission_sessions(root: Path, record: dict, deadline: float | None, *,
-                        admission_db=None) -> set[str] | None:
+                        admission_db=None, config=None) -> set[str] | None:
     """Sessions still admitted or pending capture; `None` means unknown (skip)."""
     import sqlite3
 
     state = root.parent
-    database = Path(admission_db) if admission_db is not None else _default_admission_db(state)
+    database, known = _admission_database(state, config, admission_db)
+    if not known or database is None:
+        record["partial"] = True
+        note(record, "admission configuration is unreadable; spool eviction skipped")
+        return None
     live: set[str] = set()
-    if database.is_file():
+    try:
+        exists = database.exists()
+        regular = database.is_file()
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        note(record, exc)
+        return None
+    if exists and not regular:
+        record["partial"] = True
+        note(record, "configured admission store is not a regular file")
+        return None
+    if regular:
         connection = None
         try:
-            connection = sqlite3.connect(_sqlite_ro_uri(database), uri=True, timeout=0.5)
+            connection = _open_sqlite(database, deadline, readonly=True)
             rows = connection.execute("SELECT session FROM leases WHERE enabled=1").fetchall()
         except TimeoutError:
             raise
@@ -248,6 +312,241 @@ def _admission_sessions(root: Path, record: dict, deadline: float | None, *,
     return live
 
 
+def _engine_config_candidates(cfg: Path) -> tuple[list[Path], bool]:
+    """Engine configs that may describe a configured knowledge store."""
+    try:
+        adapter = read_json(cfg)
+    except FileNotFoundError:
+        adapter = {}
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return [], False
+    candidates: list[Path] = [cfg] if adapter else []
+    complete = True
+    for key in _KNOWLEDGE_ENGINE_KEYS:
+        value = adapter.get(key)
+        if isinstance(value, str) and is_absolute(value):
+            candidate = Path(path_text(value))
+            candidates.append(candidate)
+            if key == "engine_config" and not candidate.is_file():
+                complete = False
+    mappings = adapter.get("domain_configs")
+    if isinstance(mappings, dict):
+        for value in mappings.values():
+            if isinstance(value, str) and is_absolute(value):
+                candidates.append(Path(path_text(value)))
+    for pattern_root, pattern in (
+        (cfg.parent, f"{cfg.stem}.engine.json"),
+        (cfg.parent, f"{cfg.stem}.engine.*.json"),
+        (cfg.parent, "oc.engine.json"),
+        (cfg.parent, "oc.engine.*.json"),
+        (cfg.parent / "generations", f"{cfg.stem}.engine.*.json"),
+        (cfg.parent / "generations", "oc.engine.*.json"),
+    ):
+        try:
+            candidates.extend(sorted(pattern_root.glob(pattern)))
+        except TimeoutError:
+            raise
+        except OSError:
+            complete = False
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = path_key(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    if len(unique) > _MAX_KNOWLEDGE_DATABASES:
+        return unique[:_MAX_KNOWLEDGE_DATABASES], False
+    return unique, complete
+
+
+def _state_databases(root: str, domain: str) -> tuple[list[Path], bool]:
+    """Knowledge SQLite databases for one engine `root`/`domain` pair."""
+    if not is_absolute(root) or not isinstance(domain, str) or not _DOMAIN_RE.fullmatch(domain):
+        return [], False
+    base = Path(path_text(root)) / domain
+    try:
+        from mindie_knowledge.state_layout import DATABASE, state_root
+
+        return [state_root(root, domain) / DATABASE], True
+    except TimeoutError:
+        raise
+    except ImportError:
+        pass
+    except ValueError:
+        pass
+    except OSError:
+        return [], False
+    try:
+        found = sorted(base.glob(f"state-v*/{_KNOWLEDGE_DB_NAME}"))
+    except TimeoutError:
+        raise
+    except OSError:
+        return [], False
+    databases = [item for item in found if item.is_file()]
+    return (databases or [base / "state-v4" / _KNOWLEDGE_DB_NAME]), True
+
+
+def knowledge_databases(config=None, *, deadline: float | None = None) -> tuple[list[Path], bool]:
+    """All configured knowledge SQLite stores plus a completeness flag."""
+    try:
+        cfg = config_path(config)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return [], False
+    engines, complete = _engine_config_candidates(cfg)
+    databases: list[Path] = []
+    seen: set[str] = set()
+    for engine in engines:
+        if expired(deadline):
+            return databases, False
+        try:
+            payload = read_json(engine)
+        except FileNotFoundError:
+            continue
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
+            complete = False
+            continue
+        root, domain = payload.get("root"), payload.get("domain")
+        if not isinstance(root, str) or not isinstance(domain, str):
+            continue
+        candidates, resolved = _state_databases(root, domain)
+        complete = complete and resolved
+        for database in candidates:
+            key = path_key(database)
+            if key not in seen:
+                seen.add(key)
+                databases.append(database)
+    return databases, complete
+
+
+def _cursor_spellings(spool_file: Path) -> set[str]:
+    """Normalized identities a knowledge cursor may have stored for one file."""
+    values = {os.path.abspath(os.fspath(spool_file)), path_text(spool_file)}
+    try:
+        values.add(str(Path(spool_file).resolve()))
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+    try:
+        values.add(os.path.realpath(spool_file))
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+    try:
+        from mindie_knowledge.filesystem import path_aliases
+
+        values.update(path_aliases(spool_file))
+    except TimeoutError:
+        raise
+    except (ImportError, OSError, ValueError):
+        pass
+    return {path_key(value) for value in values if isinstance(value, str)}
+
+
+def _matching_cursor_rows(connection, targets: set[str]) -> list[tuple]:
+    import sqlite3
+
+    try:
+        rows = connection.execute("SELECT file_identity, finish FROM cursors").fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+    return [
+        (str(row[0]), row[1]) for row in rows
+        if isinstance(row[0], str) and path_key(row[0]) in targets
+    ]
+
+
+def _matching_pending_captures(connection, targets: set[str]) -> bool:
+    import sqlite3
+
+    placeholders = ",".join("?" for _ in _PENDING_CAPTURE_STATUSES)
+    try:
+        rows = connection.execute(
+            f"SELECT transcript FROM captures WHERE status IN ({placeholders})",
+            tuple(_PENDING_CAPTURE_STATUSES),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        raise
+    return any(isinstance(row[0], str) and path_key(row[0]) in targets for row in rows)
+
+
+def _retire_cursor_in_database(database: Path, spool_file: Path, size: int,
+                               deadline: float | None, record: dict) -> str:
+    """`consumed` (rows deleted), `pending` (keep) or `unknown` (keep + partial)."""
+    import sqlite3
+
+    targets = _cursor_spellings(spool_file)
+    connection = None
+    try:
+        connection = _open_sqlite(database, deadline, readonly=False)
+        connection.execute("BEGIN IMMEDIATE")
+        rows = _matching_cursor_rows(connection, targets)
+        for _key, finish in rows:
+            try:
+                consumed = int(finish)
+            except (TypeError, ValueError):
+                connection.rollback()
+                record["partial"] = True
+                note(record, "knowledge transcript cursor has an invalid offset")
+                return "unknown"
+            if consumed < size:
+                connection.rollback()
+                return "pending"
+        if _matching_pending_captures(connection, targets):
+            connection.rollback()
+            return "pending"
+        for key, _finish in rows:
+            connection.execute("DELETE FROM cursors WHERE file_identity=?", (key,))
+        connection.commit()
+        return "consumed"
+    except TimeoutError:
+        raise
+    except sqlite3.Error as exc:
+        note(record, exc)
+        return "unknown"
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _retire_knowledge_cursors(databases, spool_file: Path, size: int,
+                              deadline: float | None, record: dict) -> str:
+    for database in databases:
+        if expired(deadline):
+            record["partial"] = True
+            note(record, "spool prune budget exhausted during cursor retirement")
+            return "unknown"
+        try:
+            exists, regular = database.exists(), database.is_file()
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            note(record, exc)
+            return "unknown"
+        if exists and not regular:
+            record["partial"] = True
+            note(record, "configured knowledge store is not a regular file")
+            return "unknown"
+        if not regular:
+            continue
+        verdict = _retire_cursor_in_database(database, spool_file, size, deadline, record)
+        if verdict != "consumed":
+            return verdict
+    return "consumed"
+
+
 def prune_spool_transcripts(
     spool_dir: str | Path,
     *,
@@ -258,6 +557,7 @@ def prune_spool_transcripts(
     now: float | None = None,
     deadline: float | None = None,
     admission_db: str | Path | None = None,
+    config: str | Path | None = None,
 ) -> dict:
     """Evict complete expired `transcripts/<session>` bundles, never a live one."""
     root = Path(spool_dir)
@@ -270,10 +570,16 @@ def prune_spool_transcripts(
     protected = {sid for sid in exclude if isinstance(sid, str) and sid}
     record = account("completed", removed_sessions=[], lock_files_removed=0)
     rows = _spool_entries(root, limit, record)
-    live = _admission_sessions(root, record, limit, admission_db=admission_db)
+    live = _admission_sessions(root, record, limit, admission_db=admission_db, config=config)
     if live is None:
         record["partial"] = True
         record["status"] = "partial"
+        return record
+    databases, knowledge_complete = knowledge_databases(config, deadline=limit)
+    if not knowledge_complete:
+        record["partial"] = True
+        record["status"] = "partial"
+        note(record, "knowledge state configuration incomplete; spool eviction skipped")
         return record
     needed = max(0, len(rows) - max(0, int(max_sessions)))
     removed_any = False
@@ -293,12 +599,28 @@ def prune_spool_transcripts(
             note(record, "spool prune budget exhausted")
             break
         lock_file = root / f".{sid}.lock"
+        spool_file = root / f"{sid}.jsonl"
         removed = False
         with _held_spool_lock(lock_file, limit) as held:
             if not held:
                 record["deferred_dirs"] += 1
                 continue
-            removed = unlink_file(root / f"{sid}.jsonl", record)
+            try:
+                size = os.stat(spool_file).st_size
+            except TimeoutError:
+                raise
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                note(record, exc)
+                continue
+            verdict = _retire_knowledge_cursors(databases, spool_file, size, limit, record)
+            if verdict != "consumed":
+                if verdict == "unknown":
+                    record["partial"] = True
+                record["kept_dirs"] += 1
+                continue
+            removed = unlink_file(spool_file, record)
             if not removed:
                 continue
             # Retire the cursor with the projection so a resumed session rebuilds
@@ -363,6 +685,7 @@ __all__ = [
     "SPOOL_BUNDLE_MIN_AGE_SECONDS",
     "SPOOL_MAX_AGE_SECONDS",
     "SPOOL_SESSION_LIMIT",
+    "knowledge_databases",
     "lock_inode_matches",
     "prune_spool_transcripts",
     "spool_maintenance_due",

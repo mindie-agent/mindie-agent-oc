@@ -325,6 +325,7 @@ def _write_generation_and_switch_profile(
     sdir = Path(base_adapter["state_dir"]) if isinstance(base_adapter.get("state_dir"), str) else state_dir(cfg_file)
     adm_file = Path(base_adapter["admission_path"]) if isinstance(base_adapter.get("admission_path"), str) else admission_path(cfg_file)
     comm_file, data_root = community_config_path(cfg_file), data_home() / "domains"
+    default_eng = cfg_file.with_name(cfg_file.stem + ".engine.json")
     sdir.mkdir(mode=0o700, parents=True, exist_ok=True)
     data_root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -361,12 +362,14 @@ def _write_generation_and_switch_profile(
         schema_ready=False,
     )
     # Persist last-known-good rollback targets: mtime ranking alone loses them as
-    # soon as two newer unactivated candidates exist.
+    # soon as two newer unactivated candidates exist. A mutable `oc.engine.json`
+    # payload is snapshotted before the legacy mirror overwrites it.
     prior_python, prior_gen = base_adapter.get("python"), base_adapter.get("engine_config")
     if isinstance(prior_python, str) and os.path.isabs(prior_python):
         updated_adapter["previous_python"] = prior_python
-    if isinstance(prior_gen, str) and os.path.isabs(prior_gen):
-        updated_adapter["previous_generation"] = prior_gen
+    protected_prior = storage_gc.preserve_engine_snapshot(cfg_file, prior_gen)
+    if protected_prior is not None:
+        updated_adapter["previous_generation"] = protected_prior
     if artifact is not None:
         updated_adapter["component_runtime"] = artifact["components"]
         if updated_adapter.get("component_commands"):
@@ -382,7 +385,6 @@ def _write_generation_and_switch_profile(
 
     # Best-effort legacy mirror for external callers reading `<stem>.engine.json` directly.
     mirror_warn: str | None = None
-    default_eng = cfg_file.with_name(cfg_file.stem + ".engine.json")
     if default_eng != gen_eng_file:
         try:
             atomic_write_json(default_eng, eng_payload)
