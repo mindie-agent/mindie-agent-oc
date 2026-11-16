@@ -18,7 +18,7 @@ overrides = [
     { name = "mindie-coordinator", git = "https://github.com/mindie-agent/coordinator?rev=d8977114e8cd0e5b7befa59a5ff5e53f40a74521" },
     { name = "mindie-debugger", git = "https://github.com/mindie-agent/debugger?rev=d40a250e4048ac63d4a478a5dbfa993702ceddd0" },
     { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=171623584aa812677df907518dcb55b06493241b" },
-    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=3aa71f979f8af82ea93ba6936c45545183033f89" },
+    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=bd63272c16502f3b46a2fd7ff5b4fdb4cb0fe17d" },
     { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=1c0f28941d6adfb6579cf7b3477a1a28964be97b" },
     { name = "mindie-sim", git = "https://github.com/mindie-agent/sim?rev=f0b19acdab6f5f4e952561c7ff92e4bf9c0b0c3a" },
     { name = "npu-top", git = "https://github.com/mindie-agent/npu-top?rev=848d74da3cba383c07a0eb372a17baf35b6b944b" },
@@ -2102,7 +2102,7 @@ requires-dist = [
     { name = "mindie-coordinator", git = "https://github.com/mindie-agent/coordinator?rev=d8977114e8cd0e5b7befa59a5ff5e53f40a74521" },
     { name = "mindie-debugger", git = "https://github.com/mindie-agent/debugger?rev=d40a250e4048ac63d4a478a5dbfa993702ceddd0" },
     { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=171623584aa812677df907518dcb55b06493241b" },
-    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=3aa71f979f8af82ea93ba6936c45545183033f89" },
+    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=bd63272c16502f3b46a2fd7ff5b4fdb4cb0fe17d" },
     { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=1c0f28941d6adfb6579cf7b3477a1a28964be97b" },
     { name = "mindie-sim", git = "https://github.com/mindie-agent/sim?rev=f0b19acdab6f5f4e952561c7ff92e4bf9c0b0c3a" },
     { name = "npu-top", git = "https://github.com/mindie-agent/npu-top?rev=848d74da3cba383c07a0eb372a17baf35b6b944b" },
@@ -2133,8 +2133,8 @@ source = { git = "https://github.com/mindie-agent/diagnostics?rev=171623584aa812
 
 [[package]]
 name = "mindie-knowledge"
-version = "0.13.20"
-source = { git = "https://github.com/mindie-agent/knowledge?rev=3aa71f979f8af82ea93ba6936c45545183033f89#3aa71f979f8af82ea93ba6936c45545183033f89" }
+version = "0.13.21"
+source = { git = "https://github.com/mindie-agent/knowledge?rev=bd63272c16502f3b46a2fd7ff5b4fdb4cb0fe17d#bd63272c16502f3b46a2fd7ff5b4fdb4cb0fe17d" }
 dependencies = [
     { name = "langmem" },
     { name = "mindie-diagnostics" },

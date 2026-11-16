@@ -11,7 +11,7 @@
     "verified_commit": "911ed567a1011e6ee6578f008c522bde4ac55b4e"
   },
   "components": {
-    "mindie-knowledge": "0.13.20",
+    "mindie-knowledge": "0.13.21",
     "remote-dev": "0.11.10",
     "mindie-diagnostics": "0.5.11",
     "mindie-coordinator": "0.7.9",
