@@ -225,21 +225,46 @@ def prune_component_generations(
     keep_recent_verified: int = COMPONENT_RETENTION_GENERATIONS,
     deadline: float | None = None,
     live_paths: set[str] | None = None,
+    config_homes=None,
+    forbidden_roots=(),
 ) -> dict:
     """Reclaim excess or failed `component-runtimes` generations (never raises)."""
     limit = time.monotonic() + max(0.0, float(budget_seconds))
     if deadline is not None:
         limit = min(limit, float(deadline))
     try:
+        cfg = config_path(config)
         root = state_dir(config) / "component-runtimes"
-        keep, pins_complete = _keep_state(config, extras=keep_paths)
+        homes, homes_complete = guards.config_homes(cfg.parent, *(config_homes or ()))
+        keep, pins_complete = _keep_state(config, extras=keep_paths, homes=homes)
+        forbidden, forbidden_complete = guards.forbidden_roots(homes, deadline=limit)
+        try:
+            cfg_doc = read_json(cfg)
+        except FileNotFoundError:
+            cfg_doc = None
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
+            cfg_doc = None
+            forbidden_complete = False
+        if isinstance(cfg_doc, dict):
+            for key in ("source_root", "package_dir"):
+                item = cfg_doc.get(key)
+                if isinstance(item, str) and guards.is_absolute(item):
+                    forbidden.add(Path(guards.path_text(item)))
+            for item in guards.config_pins([(cfg, cfg_doc)]):
+                if item not in keep:
+                    keep.append(item)
+        for item in forbidden_roots or ():
+            if item:
+                forbidden.add(Path(guards.path_text(item)))
     except TimeoutError:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         return _account("error", warnings=[f"{type(exc).__name__}: {exc}"])
     if not root.is_dir():
         return _account("absent")
-    if not pins_complete:
+    if not (homes_complete and pins_complete and forbidden_complete):
         return _account("partial", partial=True, warnings=["protected pins incomplete; component reclamation skipped"])
     if not guards.link_free(root) or _has_git_ancestor_any(root):
         return _account("protected", warnings=["component root is linked or inside a Git checkout"])
@@ -254,6 +279,7 @@ def prune_component_generations(
             keep_recent_verified=max(0, int(keep_recent_verified)),
             budget_seconds=_budget(limit, COMPONENT_BUDGET_SECONDS),
             live_paths=live_paths,
+            forbidden_roots=forbidden,
             deadline=limit,
         )
     except TimeoutError:
@@ -524,6 +550,7 @@ def post_switch_reclaim(
         component = prune_component_generations(
             config, keep_paths=(interpreter, source_root), live_paths=live_paths,
             budget_seconds=COMPONENT_BUDGET_SECONDS, deadline=limit,
+            config_homes=homes, forbidden_roots=(source_root,) if source_root else (),
         )
         account["component_runtimes"] = component
         _merge(account, component)

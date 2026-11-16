@@ -541,3 +541,69 @@ def test_exception_categories_and_child_subprocess_phrases_are_non_reportable(
     assert getattr(caught.value, "category", None) == "resolver"
     assert caught.value.reason_code == "update_resolver_conflict"
     assert diagnostic_support.classify_update_exception(caught.value) == ("resolver", False, "release_transport_unavailable")
+
+
+def test_missing_explicit_domain_config_aborts_spool_eviction(r3_env: dict[str, Path]) -> None:
+    """R4 P1 #1: a missing/dangling `domain_configs` target marks DB discovery incomplete."""
+    session = "ses_r4_offline_domain"
+    spool = transcript_spool_dir()
+    spool.mkdir(parents=True, exist_ok=True)
+    cfg = config_path()
+    engine = engine_config_path(cfg)
+    knowledge_root = r3_env["root"] / "knowledge-primary"
+    _write_engine(engine, knowledge_root)
+    missing_domain_cfg = r3_env["root"] / "offline-mount" / "sglang.engine.json"
+    _write_adapter(
+        cfg,
+        {
+            "python": str(Path(sys.executable)),
+            "state_dir": str(spool.parent),
+            "admission_path": str(spool.parent / "admission.sqlite3"),
+            "engine_config": str(engine),
+            "domain_configs": {"sglang": str(missing_domain_cfg)},
+        },
+    )
+    projection = spool / f"{session}.jsonl"
+    seq_file = spool / f"{session}.seq"
+    projection.write_text('{"schema":"mindie-oc-spool/1"}\n', encoding="utf-8")
+    seq_file.write_text("1\n", encoding="utf-8")
+    _age(projection, 20 * 24 * 3600)
+    _age(seq_file, 20 * 24 * 3600)
+    primary_db = knowledge_root / "vllm-ascend" / "state-v4" / "state-v4.sqlite3"
+    _make_knowledge_db(primary_db, finish=projection.stat().st_size, key=str(projection))
+
+    dbs, complete = storage_spool.knowledge_databases(cfg)
+    assert complete is False, (dbs, complete)
+    report = storage_spool.prune_spool_transcripts(spool, config=cfg, budget_seconds=5.0)
+    assert report["status"] == "partial" and report["partial"] is True, report
+    assert report["removed_sessions"] == []
+    assert projection.is_file() and seq_file.is_file()
+
+
+def test_custom_config_forbidden_source_root_without_git_protects_component_runtimes(
+    r3_env: dict[str, Path],
+) -> None:
+    """R4 P1 #2: custom `--config` passes its non-Git `source_root` as `forbidden_roots`."""
+    custom_source = r3_env["root"] / "exported-source-no-git"
+    gen = custom_source / "state" / "component-runtimes" / "gen-r4-cold"
+    (gen / "runtime" / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (gen / "runtime" / ".venv" / "bin" / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (gen / "verified.json").write_text('{"status":"verified"}\n', encoding="utf-8")
+    _age(gen, 90_000)
+
+    custom_cfg = r3_env["root"] / "isolated-custom-cfg" / "oc.json"
+    _write_adapter(
+        custom_cfg,
+        {
+            "python": str(Path(sys.executable)),
+            "source_root": str(custom_source),
+            "state_dir": str(custom_source / "state"),
+        },
+    )
+
+    report = storage_gc.prune_component_generations(
+        custom_cfg, keep_recent_verified=0, live_paths=set(),
+    )
+    assert report["status"] == "protected_root", report
+    assert report["reclaimed_dirs"] == 0
+    assert gen.is_dir(), "generation inside configured non-Git source_root was reclaimed"

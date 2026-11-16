@@ -312,7 +312,7 @@ def _admission_sessions(root: Path, record: dict, deadline: float | None, *,
     return live
 
 
-def _engine_config_candidates(cfg: Path) -> tuple[list[Path], bool]:
+def _engine_config_candidates(cfg: Path) -> tuple[list[Path], set[str], bool]:
     """Engine configs that may describe a configured knowledge store."""
     try:
         adapter = read_json(cfg)
@@ -321,21 +321,33 @@ def _engine_config_candidates(cfg: Path) -> tuple[list[Path], bool]:
     except TimeoutError:
         raise
     except (OSError, ValueError):
-        return [], False
+        return [], set(), False
     candidates: list[Path] = [cfg] if adapter else []
+    required: set[str] = {path_key(cfg)} if adapter else set()
     complete = True
     for key in _KNOWLEDGE_ENGINE_KEYS:
         value = adapter.get(key)
+        if value is None:
+            continue
         if isinstance(value, str) and is_absolute(value):
             candidate = Path(path_text(value))
             candidates.append(candidate)
+            required.add(path_key(candidate))
             if key == "engine_config" and not candidate.is_file():
                 complete = False
+        elif isinstance(value, str) and value.strip():
+            complete = False
     mappings = adapter.get("domain_configs")
-    if isinstance(mappings, dict):
+    if mappings is not None and not isinstance(mappings, dict):
+        complete = False
+    elif isinstance(mappings, dict):
         for value in mappings.values():
             if isinstance(value, str) and is_absolute(value):
-                candidates.append(Path(path_text(value)))
+                candidate = Path(path_text(value))
+                candidates.append(candidate)
+                required.add(path_key(candidate))
+            else:
+                complete = False
     for pattern_root, pattern in (
         (cfg.parent, f"{cfg.stem}.engine.json"),
         (cfg.parent, f"{cfg.stem}.engine.*.json"),
@@ -358,8 +370,8 @@ def _engine_config_candidates(cfg: Path) -> tuple[list[Path], bool]:
             seen.add(key)
             unique.append(candidate)
     if len(unique) > _MAX_KNOWLEDGE_DATABASES:
-        return unique[:_MAX_KNOWLEDGE_DATABASES], False
-    return unique, complete
+        return unique[:_MAX_KNOWLEDGE_DATABASES], required, False
+    return unique, required, complete
 
 
 def _state_databases(root: str, domain: str) -> tuple[list[Path], bool]:
@@ -397,15 +409,19 @@ def knowledge_databases(config=None, *, deadline: float | None = None) -> tuple[
         raise
     except (OSError, ValueError):
         return [], False
-    engines, complete = _engine_config_candidates(cfg)
+    engines, required, complete = _engine_config_candidates(cfg)
+    cfg_key = path_key(cfg)
     databases: list[Path] = []
     seen: set[str] = set()
     for engine in engines:
         if expired(deadline):
             return databases, False
+        engine_key = path_key(engine)
         try:
             payload = read_json(engine)
         except FileNotFoundError:
+            if engine_key in required:
+                complete = False
             continue
         except TimeoutError:
             raise
@@ -414,6 +430,8 @@ def knowledge_databases(config=None, *, deadline: float | None = None) -> tuple[
             continue
         root, domain = payload.get("root"), payload.get("domain")
         if not isinstance(root, str) or not isinstance(domain, str):
+            if engine_key in required and engine_key != cfg_key:
+                complete = False
             continue
         candidates, resolved = _state_databases(root, domain)
         complete = complete and resolved
