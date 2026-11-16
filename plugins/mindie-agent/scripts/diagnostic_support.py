@@ -319,6 +319,40 @@ def failure(operation: str, stage: str, category: str, *, exception=None,
     return out
 
 
+_NON_REPORTABLE_CATEGORIES = frozenset({"resolver", "busy", "deferred", "prerequisite"})
+_LOCAL_EXC_CATEGORIES = {
+    "LockTimeout": ("busy", "update_resource_busy"),
+    "LockBusy": ("busy", "update_resource_busy"),
+    "ResourceBusyError": ("busy", "update_resource_busy"),
+    "DeferredError": ("deferred", "update_deferred"),
+    "StartInProgress": ("deferred", "update_deferred"),
+    "ResolverError": ("resolver", "release_transport_unavailable"),
+    "DNSResolutionError": ("resolver", "release_transport_unavailable"),
+}
+
+
+def _os_update_failure(exc: BaseException) -> tuple[str, bool, str | None] | None:
+    """Local filesystem/lock failures (`#360` class) are never upstream reports."""
+    import errno
+
+    if isinstance(exc, PermissionError) or getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        return "prerequisite", False, "update_permission_denied"
+    if getattr(exc, "errno", None) in {errno.ENOSPC, errno.EDQUOT, errno.ENOMEM}:
+        return "prerequisite", False, "update_disk_exhausted"
+    if isinstance(exc, BlockingIOError) or getattr(exc, "errno", None) in {errno.EAGAIN, errno.EBUSY, errno.ETXTBSY}:
+        return "busy", False, "update_resource_busy"
+    if isinstance(exc, OSError):
+        return "prerequisite", False, "update_environment_unavailable"
+    return None
+
+
+def _classified(category: str, reportable: bool, code: str | None) -> tuple[str, bool, str | None]:
+    """Final gate: local resolver/busy/deferred/prerequisite outcomes never report."""
+    if category in _NON_REPORTABLE_CATEGORIES:
+        return category, False, code
+    return category, bool(reportable), code
+
+
 def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None]:
     """Map transient transport/TLS/HTTP/DNS update failures without masking local bugs."""
     import http.client
@@ -342,6 +376,9 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
             continue
         seen.add(id(cur))
         cls_name = type(cur).__name__
+        if cls_name in _LOCAL_EXC_CATEGORIES:
+            category, code = _LOCAL_EXC_CATEGORIES[cls_name]
+            return _classified(category, False, code)
         if cls_name == "ReleaseResponseTooLarge" or isinstance(cur, local_http_bugs):
             return "update", True, None
         if isinstance(cur, (TimeoutError, subprocess.TimeoutExpired)):
@@ -371,6 +408,9 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
             return "temporary_network", False, "release_transport_unavailable"
         if isinstance(cur, (ssl.SSLError, ConnectionError, socket.gaierror, socket.herror, http.client.HTTPException)):
             return "temporary_network", False, "release_transport_unavailable"
+        local = _os_update_failure(cur)
+        if local is not None:
+            return _classified(*local)
         if getattr(cur, "__cause__", None) is not None:
             pending.append(cur.__cause__)
         if getattr(cur, "__context__", None) is not None and not getattr(cur, "__suppress_context__", False):

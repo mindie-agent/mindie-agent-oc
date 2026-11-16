@@ -14,10 +14,9 @@ per-session JSONL spool files under `<state_dir>/transcripts/<session_id>.jsonl`
   redaction before writing local spool JSONL.
 - Truncates any torn non-newline tail and reconciles the highest committed `seq`
   before appending, preventing crash-induced duplicate entries.
-- Spool projections are bounded: after a sync, cold `transcripts/*.jsonl` files
-  (older than `SPOOL_MAX_AGE_SECONDS` or beyond `SPOOL_SESSION_LIMIT` sessions)
-  and their idle `.<session>.lock` siblings are retired only while the lock is
-  free, and the matching `_THREAD_LOCKS` entries are dropped.
+- Spool bundles are bounded: cold `transcripts/*.jsonl` files (older than
+  `SPOOL_MAX_AGE_SECONDS` or beyond `SPOOL_SESSION_LIMIT` sessions) are retired as
+  a unit with their `.seq`/lock only while the lock is free and never while admitted.
 
 [Timeouts & Locks]
 - Serializes writers per session via in-process thread lock + OS file lock
@@ -194,8 +193,37 @@ def _thread_lock_for(lock_file: Path) -> threading.Lock:
         return lock
 
 
+def _lock_stream(handle, lock_file: Path) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        if lock_file.stat().st_size == 0:
+            handle.write(b"0")
+            handle.flush()
+            handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_stream(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def _session_spool_lock(lock_file: Path, *, deadline: float):
+    """Hold the live `.<session>.lock` inode, retrying after a concurrent unlink."""
     tlock = _thread_lock_for(lock_file)
     wait = max(0.0, deadline - time.monotonic())
     if not tlock.acquire(timeout=wait):
@@ -203,44 +231,39 @@ def _session_spool_lock(lock_file: Path, *, deadline: float):
     handle = None
     os_locked = False
     try:
-        handle = lock_file.open("a+b")
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    handle.seek(0)
-                    if lock_file.stat().st_size == 0:
-                        handle.write(b"0")
-                        handle.flush()
-                        handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os_locked = True
+        for attempt in range(3):
+            handle = lock_file.open("a+b")
+            while True:
+                try:
+                    _lock_stream(handle, lock_file)
+                    os_locked = True
+                    break
+                except TimeoutError:
+                    raise
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for session spool OS lock")
+                    time.sleep(0.02)
+            if storage_gc.lock_inode_matches(handle, lock_file):
                 break
+            # A concurrent spool eviction unlinked the inode we locked; retry on
+            # the live path so two writers can never hold old/new lock inodes.
+            try:
+                _unlock_stream(handle)
             except TimeoutError:
                 raise
             except OSError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("timed out waiting for session spool OS lock")
-                time.sleep(0.02)
+                pass
+            handle.close()
+            handle, os_locked = None, False
+            if time.monotonic() >= deadline or attempt + 1 >= 3:
+                raise TimeoutError("timed out re-verifying session spool OS lock inode")
         yield
     finally:
         if handle is not None:
             if os_locked:
                 try:
-                    if os.name == "nt":
-                        import msvcrt
-
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        import fcntl
-
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    _unlock_stream(handle)
                 except TimeoutError:
                     raise
                 except OSError:
@@ -299,6 +322,12 @@ def _recover_spool_tail_and_seq(spool_file: Path) -> int:
 
 
 def _read_cursor_seq(cursor_file: Path, *, spool_exists: bool, boundary: float | None) -> int:
+    """Highest committed sequence, or -1 when the projection identity is gone.
+
+    `boundary` is retained for callers, but a missing `<session>.jsonl` always
+    restarts at sequence 0: a spool rebuilt after eviction has a new inode and
+    prefix, so honoring a stale cursor would silently drop the retired prefix.
+    """
     if not cursor_file.is_file():
         return -1
     try:
@@ -314,12 +343,9 @@ def _read_cursor_seq(cursor_file: Path, *, spool_exists: bool, boundary: float |
             parsed = json.loads(raw)
             if not isinstance(parsed, dict) or type(parsed.get("seq")) is not int or int(parsed["seq"]) < -1:
                 raise ValueError(f"corrupt transcript cursor: {cursor_file}")
-            saved_boundary = parsed.get("not_before")
-            if not spool_exists and isinstance(saved_boundary, (int, float)):
-                if boundary is None or boundary + 1e-3 < float(saved_boundary):
-                    return -1
-            return int(parsed["seq"])
-        seq_val = int(raw)
+            seq_val = int(parsed["seq"])
+        else:
+            seq_val = int(raw)
     except ValueError as exc:
         raise ValueError(f"corrupt transcript cursor: {cursor_file}") from exc
     if seq_val < -1:

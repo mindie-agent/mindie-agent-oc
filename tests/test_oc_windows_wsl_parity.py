@@ -91,6 +91,67 @@ def test_classify_update_exception_maps_transient_transport_without_masking_loca
         assert diagnostic_support.classify_update_exception(local_bug) == ("update", True, None)
 
 
+def test_storage_guards_normalize_windows_extended_length_prefixes() -> None:
+    """P1 #1: extended-length Windows spellings compare equal to their plain form."""
+    from storage_support import normalize_windows_path, within_root
+
+    assert normalize_windows_path("\\\\?\\C:\\data\\gen") == "C:\\data\\gen"
+    assert normalize_windows_path("\\\\?\\UNC\\server\\share\\gen") == "\\\\server\\share\\gen"
+    assert normalize_windows_path("\\??\\C:\\data") == "C:\\data"
+    assert within_root("\\\\?\\C:\\data\\gen\\runtime", "C:\\data") is True
+    assert within_root("C:\\data\\gen2", "C:\\data\\gen") is False
+
+
+def test_classify_update_exception_never_reports_local_environment_failures() -> None:
+    """Issue #360 class: DNS, lock contention, ENOSPC and EACCES are never upstream reports."""
+    import errno
+
+    class LockTimeout(RuntimeError):
+        pass
+
+    local_failures = (
+        socket.gaierror(-2, "name not known"),
+        PermissionError(errno.EACCES, "denied", "oc.json"),
+        PermissionError(errno.EPERM, "operation not permitted"),
+        OSError(errno.ENOSPC, "no space left on device"),
+        OSError(errno.EROFS, "read-only file system"),
+        BlockingIOError(errno.EAGAIN, "resource temporarily unavailable"),
+        LockTimeout("component update lock is held"),
+    )
+    for exc in local_failures:
+        category, reportable, code = diagnostic_support.classify_update_exception(exc)
+        assert reportable is False, (exc, category, code)
+        assert category in {"resolver", "temporary_network", "busy", "deferred", "prerequisite"}, (category, code)
+    assert diagnostic_support.classify_update_exception(PermissionError(errno.EACCES, "denied"))[2] == "update_permission_denied"
+    assert diagnostic_support.classify_update_exception(OSError(errno.ENOSPC, "full"))[2] == "update_disk_exhausted"
+    assert diagnostic_support.classify_update_exception(LockTimeout("held"))[:2] == ("busy", False)
+
+
+def test_component_update_check_records_local_permission_failure_as_non_reportable(
+    isolated_oc_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local `EACCES`/`ENOSPC` build failure is a prerequisite, never a reportable bug."""
+    import errno
+
+    recorded: list[tuple] = []
+    orig_failure = diagnostic_support.failure
+
+    def spy_failure(op: str, stage: str, category: str, **kwargs):
+        recorded.append((op, stage, category, kwargs.get("reportable"), kwargs.get("reason_code")))
+        return orig_failure(op, stage, category, **kwargs)
+
+    monkeypatch.setattr(diagnostic_support, "failure", spy_failure)
+    for exc, category, reason in (
+        (PermissionError(errno.EACCES, "denied", "component-runtimes"), "prerequisite", "update_permission_denied"),
+        (OSError(errno.ENOSPC, "no space left"), "prerequisite", "update_disk_exhausted"),
+    ):
+        recorded.clear()
+        monkeypatch.setattr(component_update, "prepare", lambda **_kw: (_ for _ in ()).throw(exc))
+        with pytest.raises(type(exc)):
+            component_update.check(config=paths.config_path(), source=REPO_ROOT, timeout=30.0)
+        assert recorded[-1] == ("component.update", "prepare", category, False, reason), recorded
+
+
 def test_component_update_check_records_non_reportable_transient_tls_error(
     isolated_oc_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

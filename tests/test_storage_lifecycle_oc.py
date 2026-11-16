@@ -50,6 +50,7 @@ import storage_gc
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "plugins" / "mindie-agent" / "scripts"
+_PYTHON_REL = "Scripts/python.exe" if os.name == "nt" else "bin/python"
 CORE_MODULES = (
     REPO_ROOT / "index.mjs",
     REPO_ROOT / "plugins" / "mindie-agent" / "opencode_host.mjs",
@@ -386,7 +387,7 @@ def test_real_subprocess_lease_protects_generation_and_survives_tree_termination
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdio="ignore", timeout=10.0,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10.0,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
             )
         try:
@@ -538,6 +539,251 @@ def test_reclamation_entry_points_never_raise_on_absent_state(storage_env: dict[
     assert storage_gc.warning_text({"status": "partial", "warnings": ["TimeoutError: busy"]}) == (
         "storage cleanup partial: TimeoutError: busy"
     )
+
+
+def _make_admission(state: Path, leases: dict[str, int]) -> None:
+    """A minimal `mindie-admission/1` store with the given `enabled` flags."""
+    import sqlite3
+
+    state.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(state / "admission.sqlite3") as db:
+        db.execute(
+            "CREATE TABLE leases(session TEXT PRIMARY KEY, token TEXT NOT NULL, enabled INTEGER NOT NULL,"
+            " failures INTEGER NOT NULL, project_root TEXT, root_session TEXT, activated_at REAL,"
+            " entry_enabled INTEGER NOT NULL DEFAULT 0)"
+        )
+        db.executemany("INSERT INTO leases (session, token, enabled, failures) VALUES (?, 't', ?, 0)", leases.items())
+
+
+def _make_opencode_db(path: Path, session: str, rows: int) -> None:
+    """A minimal OpenCode v2 transcript database with `rows` public user messages."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, fork_session_id TEXT,"
+            " time_created INTEGER, time_updated INTEGER, data TEXT);"
+            "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, seq INTEGER, type TEXT,"
+            " time_created INTEGER, time_updated INTEGER, data TEXT);"
+            "CREATE TABLE session_part (message_id TEXT, session_id TEXT, ordinal INTEGER, type TEXT,"
+            " time_created INTEGER, time_updated INTEGER, data TEXT);"
+        )
+        created = 1730000000000
+        db.execute("INSERT INTO session_v2 VALUES (?, ?, NULL, NULL, ?, ?, '{}')", (session, str(path.parent), created, created))
+        for seq in range(rows):
+            stamp = created + seq
+            db.execute(
+                "INSERT INTO session_message VALUES (?, ?, ?, 'user', ?, ?, ?)",
+                (f"m_{seq}", session, seq, stamp, stamp, json.dumps({"time": {"created": stamp}, "text": f"turn {seq}"})),
+            )
+
+
+def test_cross_config_root_borrower_and_incomplete_pins_guard_legacy_sweep(
+    storage_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 #1: a default-home borrower survives, and unreadable pins skip the sweep."""
+    import mindie_knowledge.storage as shared_storage
+
+    cfg = storage_env["root"] / "custom-config" / "oc.json"
+    runtimes = state_dir(config_path()) / "component-runtimes"
+    active = _touch_generation(runtimes, "gen-active", age_seconds=90_000)
+    borrowed = _touch_generation(runtimes, "gen-borrowed", age_seconds=85_000)
+    for index in range(3):
+        _touch_generation(runtimes, f"gen-stale-{index}", age_seconds=70_000 - index)
+    active_py = str(active / "runtime/.venv" / _PYTHON_REL)
+    _write_adapter(cfg, {"schema": "mindie-adapter-config/1", "harness": "opencode", "state_dir": str(runtimes.parent), "python": active_py})
+    default_home = storage_env["home"] / ".config" / "mindie-agent"
+    default_home.mkdir(parents=True, exist_ok=True)
+    linked = storage_env["root"] / "borrowed-codex.json"
+    linked.write_text(json.dumps({"python": str(borrowed / "runtime/.venv" / _PYTHON_REL)}), encoding="utf-8")
+    (default_home / "codex.json").symlink_to(linked)
+
+    calls: list[dict] = []
+    original = shared_storage.sweep_legacy_installations
+
+    def _spy(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(shared_storage, "sweep_legacy_installations", _spy)
+    report = storage_gc.post_switch_reclaim(config=cfg, interpreter=active_py, budget_seconds=8.0)
+    assert borrowed.is_dir() and active.is_dir(), report
+    assert calls and len(calls[0]["config_home"]) >= 3, "a config home was dropped from the sweep scope"
+
+    # An unreadable borrower config must skip the legacy sweep instead of sweeping unguarded.
+    calls.clear()
+    (default_home / "cc.json").write_text("{corrupt", encoding="utf-8")
+    guarded = storage_gc.post_switch_reclaim(config=cfg, interpreter=active_py, budget_seconds=8.0)
+    assert guarded["partial"] is True and calls == [], guarded
+    assert borrowed.is_dir(), "an incomplete pin set still swept the borrowed generation"
+
+
+def test_previous_python_survives_two_newer_unactivated_candidates(storage_env: dict[str, Path]) -> None:
+    """P1 #2: the persisted rollback generation outranks mtime-only retention."""
+    cfg = config_path()
+    setup.ensure_default_profile(config=cfg, python_exe=str(storage_env["python"]), prepare_store=False)
+    runtimes = state_dir(cfg) / "component-runtimes"
+    prior = _touch_generation(runtimes, "gen-prior", age_seconds=90_000)
+    previous = _touch_generation(runtimes, "gen-previous", age_seconds=80_000)
+    candidate_a, candidate_b = (
+        _touch_generation(runtimes, name, age_seconds=age) for name, age in (("gen-candidate-a", 5_000), ("gen-candidate-b", 4_000))
+    )
+    adapter = read_json(cfg)
+    adapter["python"] = str(prior / "runtime/.venv" / _PYTHON_REL)
+    adapter["previous_python"] = str(previous / "runtime/.venv" / _PYTHON_REL)
+    _write_adapter(cfg, adapter)
+
+    report = storage_gc.prune_component_generations(cfg, keep_recent_verified=1)
+    assert report["status"] == "completed", report
+    assert prior.is_dir() and previous.is_dir(), "the explicit rollback pointer was reclaimed"
+    assert candidate_b.is_dir(), "the newest unactivated candidate must survive retention"
+    assert not candidate_a.exists(), "an excess unactivated candidate must be reclaimed"
+
+
+def test_engine_snapshot_scan_propagates_timeout_and_aborts_on_oserror(
+    storage_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 #3: an incomplete reference set never deletes a snapshot."""
+    cfg = config_path()
+    _write_adapter(cfg, {"schema": "mindie-adapter-config/1", "harness": "opencode", "python": str(Path(sys.executable))})
+    generations = cfg.parent / "generations"
+    snapshots = [_write_engine_snapshot(generations, f"oc.engine.hist{index}.json", age_seconds=90_000 - index) for index in range(4)]
+    (cfg.parent / "borrower.json").write_text("{}", encoding="utf-8")
+    original = storage_gc.read_json
+
+    def _unreadable(path, *args, **kwargs):
+        if Path(path).name == "borrower.json":
+            raise PermissionError("borrower config unreadable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage_gc, "read_json", _unreadable)
+    aborted = storage_gc.prune_engine_snapshots(cfg, keep_recent=1)
+    assert aborted["status"] == "partial" and aborted["removed"] == 0, aborted
+    monkeypatch.setattr(storage_gc, "read_json", lambda *_a, **_k: (_ for _ in ()).throw(TimeoutError("config budget")))
+    with pytest.raises(TimeoutError):
+        storage_gc.prune_engine_snapshots(cfg, keep_recent=1)
+    assert all(item.is_file() for item in snapshots)
+
+
+def test_engine_snapshot_guards_reject_linked_git_and_user_source_roots(storage_env: dict[str, Path]) -> None:
+    """P1 #4: linked ancestors, external Git trees and user roots are never unlinked."""
+    cfg = config_path()
+    adapter = {"schema": "mindie-adapter-config/1", "harness": "opencode", "python": str(Path(sys.executable))}
+    _write_adapter(cfg, adapter)
+    generations = cfg.parent / "generations"
+    external = storage_env["root"] / "linked-generations"
+    external.mkdir(parents=True)
+    linked_snapshot = external / "oc.engine.link00.json"
+    linked_snapshot.write_text("{}", encoding="utf-8")
+    generations.symlink_to(external, target_is_directory=True)
+    assert storage_gc.prune_engine_snapshots(cfg, keep_recent=0)["removed"] == 0
+    generations.unlink()
+    assert linked_snapshot.is_file(), "a snapshot behind a linked ancestor was unlinked"
+
+    (cfg.parent / ".git").mkdir()
+    git_snapshot = _write_engine_snapshot(generations, "oc.engine.git000.json", age_seconds=90_000)
+    assert storage_gc.prune_engine_snapshots(cfg, keep_recent=0)["removed"] == 0
+    (cfg.parent / ".git").rmdir()
+    assert git_snapshot.is_file(), "a snapshot inside a Git checkout was unlinked"
+
+    _write_adapter(cfg, dict(adapter, source_root=str(generations)))
+    forbidden_snapshot = _write_engine_snapshot(generations, "oc.engine.user00.json", age_seconds=90_000)
+    assert storage_gc.prune_engine_snapshots(cfg, keep_recent=0)["removed"] == 0
+    assert forbidden_snapshot.is_file(), "a snapshot inside a user `source_root` was unlinked"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock inode semantics")
+def test_spool_lock_verifies_live_inode_and_unlinks_before_unlock(
+    storage_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 #5: a stale lock inode never blocks, and the live lock is unlinked first."""
+    import fcntl
+    import storage_spool
+
+    spool = transcript_spool_dir()
+    spool.mkdir(parents=True, exist_ok=True)
+    session = "ses_lock_race_01"
+    lock_file = spool / f".{session}.lock"
+    stale = lock_file.open("a+b")
+    fcntl.flock(stale.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.unlink(lock_file)
+    lock_file.write_bytes(b"0")
+    assert storage_gc.lock_inode_matches(stale, lock_file) is False
+    with storage_gc._held_spool_lock(lock_file) as held:
+        assert held is True, "the live lock inode was not acquired"
+        probe = lock_file.open("a+b")
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    stale.close()
+
+    (spool / f"{session}.jsonl").write_text("{}\n", encoding="utf-8")
+    stamp = time.time() - 20 * 24 * 3600
+    os.utime(spool / f"{session}.jsonl", (stamp, stamp))
+    observed: list[bool] = []
+    original_unlock = storage_spool._unlock_stream
+    monkeypatch.setattr(
+        storage_spool, "_unlock_stream",
+        lambda handle: (observed.append(lock_file.exists()), original_unlock(handle))[1],
+    )
+    report = storage_gc.prune_spool_transcripts(spool, max_sessions=1024, budget_seconds=5.0)
+    assert report["removed_sessions"] == [session], report
+    assert observed == [False], "the lock file was unlinked after unlocking (inode race)"
+    assert not lock_file.exists()
+
+
+def test_spool_eviction_never_breaks_admitted_or_resumable_sessions(storage_env: dict[str, Path]) -> None:
+    """P1 #6: only complete expired terminal bundles are retired, never a live cursor."""
+    spool = transcript_spool_dir()
+    spool.mkdir(parents=True, exist_ok=True)
+    stamp = time.time() - 20 * 24 * 3600
+    for session in ("ses_live_01", "ses_dead_01", "ses_plain_01"):
+        (spool / f"{session}.jsonl").write_text("{}\n", encoding="utf-8")
+        (spool / f"{session}.seq").write_text('{"seq":5,"not_before":null}\n', encoding="utf-8")
+        os.utime(spool / f"{session}.jsonl", (stamp, stamp))
+    _make_admission(spool.parent, {"ses_live_01": 1, "ses_dead_01": 0})
+
+    report = storage_gc.prune_spool_transcripts(spool, max_sessions=1, budget_seconds=5.0)
+    assert "ses_live_01" not in report["removed_sessions"]
+    assert (spool / "ses_live_01.jsonl").is_file() and (spool / "ses_live_01.seq").is_file()
+    for session in ("ses_dead_01", "ses_plain_01"):
+        assert session in report["removed_sessions"], report
+        assert not (spool / f"{session}.jsonl").exists()
+        assert not (spool / f"{session}.seq").exists(), "a retired projection kept its stale cursor"
+
+    db_file = storage_env["opencode_db"]
+    _make_opencode_db(db_file, "ses_plain_01", 3)
+    resumed = opencode_transcript.sync_session_spool("ses_plain_01", db_path=db_file, spool_dir=spool, max_seconds=5.0)
+    rows = [json.loads(line) for line in resumed.read_text(encoding="utf-8").splitlines()]
+    assert [row["seq"] for row in rows] == [0, 1, 2], "a resumed session skipped its retired prefix"
+    (spool.parent / "admission.sqlite3").write_text("not-a-database", encoding="utf-8")
+    unknown = storage_gc.prune_spool_transcripts(spool, max_sessions=0, budget_seconds=5.0)
+    assert unknown["status"] == "partial" and unknown["removed_sessions"] == []
+
+
+def test_post_switch_cleanup_exception_keeps_updated_status(
+    storage_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 #7: a committed switch is never downgraded by post-commit cleanup."""
+    cfg = config_path()
+    setup.ensure_default_profile(config=cfg, python_exe=str(storage_env["python"]), prepare_store=False)
+    monkeypatch.setattr(component_update, "prepare", lambda **_kw: None)
+    monkeypatch.setattr(component_update, "sync_store_schema", lambda *_a, **_kw: (True, None))
+    monkeypatch.setattr(component_update, "compatible_runtime", lambda interpreter, **_kw: component_update._norm_python_path(interpreter))
+    monkeypatch.setattr(component_update, "read_inventory", lambda *_a, **_kw: {"mindie-knowledge": {"version": "0.13.22"}})
+
+    for exc, version in ((PermissionError("EACCES component-runtimes"), "0.1.12"), (TimeoutError("cleanup deadline"), "0.1.13")):
+        before = read_json(cfg)
+        candidate = _stage_candidate(storage_env["root"] / f"candidate-{version}", version=version)
+        monkeypatch.setattr(storage_gc, "post_switch_reclaim", lambda **_kw: (_ for _ in ()).throw(exc))
+        result = component_update.check(config=cfg, source=candidate)
+        assert result["status"] == "updated" and result["needs_host_reload"] is True, result
+        assert type(exc).__name__ in result["cleanup_warning"], result
+        assert "receipt_unconfirmed" not in result
+        switched = read_json(cfg)
+        assert switched["product_validation"]["native_version"] == version
+        assert switched["previous_python"] == before["python"]
+        assert switched["previous_generation"] == before["engine_config"]
 
 
 def test_core_sources_stay_under_the_line_cap() -> None:

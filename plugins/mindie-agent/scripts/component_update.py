@@ -302,6 +302,18 @@ def _active_python_is_reusable(adapter: dict, *, timeout: float) -> bool:
     return inventory_ready(candidate, timeout=min(15.0, max(1.0, float(timeout))))
 
 
+def _advisory_cleanup(cfg_file: Path, *, interpreter: str, source_root: str) -> str | None:
+    """Bounded post-commit reclamation: every failure becomes `cleanup_warning`."""
+    try:
+        account = storage_gc.post_switch_reclaim(
+            config=cfg_file, interpreter=interpreter, source_root=source_root,
+            force_legacy=bool(os.environ.get("MINDIE_OC_FORCE_CLEANUP") == "1"),
+        )
+        return storage_gc.warning_text(account)
+    except Exception as exc:  # noqa: BLE001 - advisory cleanup after a committed switch
+        return f"storage cleanup skipped: {type(exc).__name__}: {exc}"[:400]
+
+
 def _write_generation_and_switch_profile(
     *, cfg_file: Path, base_adapter: dict, base_engine: dict,
     target_source: Path, target_python: str, validation: dict, artifact: dict | None,
@@ -348,6 +360,13 @@ def _write_generation_and_switch_profile(
         state_dir=str(sdir), admission_path=str(adm_file), domain=domain, product_validation=validation,
         schema_ready=False,
     )
+    # Persist last-known-good rollback targets: mtime ranking alone loses them as
+    # soon as two newer unactivated candidates exist.
+    prior_python, prior_gen = base_adapter.get("python"), base_adapter.get("engine_config")
+    if isinstance(prior_python, str) and os.path.isabs(prior_python):
+        updated_adapter["previous_python"] = prior_python
+    if isinstance(prior_gen, str) and os.path.isabs(prior_gen):
+        updated_adapter["previous_generation"] = prior_gen
     if artifact is not None:
         updated_adapter["component_runtime"] = artifact["components"]
         if updated_adapter.get("component_commands"):
@@ -369,14 +388,9 @@ def _write_generation_and_switch_profile(
             atomic_write_json(default_eng, eng_payload)
         except (TimeoutError, OSError) as exc:
             mirror_warn = f"{type(exc).__name__}: {exc}"
-    # Step 3: Silent post-switch reclamation. A contended or slow cleanup only
-    # annotates the receipt; it never rolls back the committed profile switch.
-    cleanup_warn = storage_gc.warning_text(
-        storage_gc.post_switch_reclaim(
-            config=cfg_file, interpreter=target_python, source_root=str(target_source),
-            force_legacy=bool(os.environ.get("MINDIE_OC_FORCE_CLEANUP") == "1"),
-        )
-    )
+    # Step 3: Silent post-switch reclamation. A contended, slow or raising cleanup
+    # only annotates the receipt; it never rolls back the committed profile switch.
+    cleanup_warn = _advisory_cleanup(cfg_file, interpreter=target_python, source_root=str(target_source))
     return gen_eng_file, mirror_warn, cleanup_warn
 
 
@@ -637,12 +651,7 @@ def check(
         needs_reload = status == "updated"
         if status == "up_to_date" and non_blocking:
             # Background maintenance: reclaim historical baggage even when no switch happened.
-            cleanup_warn = storage_gc.warning_text(
-                storage_gc.post_switch_reclaim(
-                    config=cfg_file, interpreter=target_python, source_root=str(target_source),
-                    force_legacy=bool(os.environ.get("MINDIE_OC_FORCE_CLEANUP") == "1"),
-                )
-            )
+            cleanup_warn = _advisory_cleanup(cfg_file, interpreter=target_python, source_root=str(target_source))
         result: dict = dict(schema="mindie-component-update/1", harness="opencode", status=status, needs_host_reload=needs_reload, python=target_python, installed=installed)
         if cleanup_warn is not None:
             result["cleanup_warning"] = cleanup_warn
