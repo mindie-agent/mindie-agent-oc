@@ -13,10 +13,10 @@
   "components": {
     "mindie-knowledge": "0.13.22",
     "remote-dev": "0.11.12",
-    "mindie-diagnostics": "0.5.14",
+    "mindie-diagnostics": "0.5.15",
     "mindie-coordinator": "0.7.11",
     "mindie-debugger": "0.1.3",
-    "mindie-profiler": "0.5.14",
+    "mindie-profiler": "0.5.15",
     "mindie-sim": "0.9.15",
     "npu-top": "0.3.4"
   }

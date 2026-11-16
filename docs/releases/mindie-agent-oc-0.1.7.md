@@ -38,6 +38,6 @@
 
 ## 组件版本锁定
 
-`mindie-knowledge` 0.13.22、`remote-dev` 0.11.12、`mindie-diagnostics` 0.5.14、`mindie-coordinator` 0.7.11、`mindie-debugger` 0.1.3、`mindie-profiler` 0.5.14、`mindie-sim` 0.9.15、`npu-top` 0.3.4；`pyproject.toml` 的 `[tool.uv.sources]` 与 `override-dependencies` 锁定对应正式版 commit SHA，`uv.lock` 同步更新。
+`mindie-knowledge` 0.13.22、`remote-dev` 0.11.12、`mindie-diagnostics` 0.5.15、`mindie-coordinator` 0.7.11、`mindie-debugger` 0.1.3、`mindie-profiler` 0.5.15、`mindie-sim` 0.9.15、`npu-top` 0.3.4；`pyproject.toml` 的 `[tool.uv.sources]` 与 `override-dependencies` 锁定对应正式版 commit SHA，`uv.lock` 同步更新。
 
 验证范围：`pytest tests` 全量（含 `tests/test_storage_lifecycle_oc.py` 中针对跨 config home 保护、回滚指针保留、`TimeoutError` 传播、引擎快照链接/Git 守卫、POSIX 锁 inode 顺序、可恢复会话游标与切换后异常隔离的 R1 回归）、Node 语法检查与 LF 换行门禁。以上在本机 macOS 完成；不推断其他平台 NPU 或完整模型任务的验证结论。

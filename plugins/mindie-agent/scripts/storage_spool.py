@@ -326,6 +326,8 @@ def _engine_config_candidates(cfg: Path) -> tuple[list[Path], set[str], bool]:
     required: set[str] = {path_key(cfg)} if adapter else set()
     complete = True
     for key in _KNOWLEDGE_ENGINE_KEYS:
+        if key not in adapter:
+            continue
         value = adapter.get(key)
         if value is None:
             continue
@@ -335,7 +337,7 @@ def _engine_config_candidates(cfg: Path) -> tuple[list[Path], set[str], bool]:
             required.add(path_key(candidate))
             if key == "engine_config" and not candidate.is_file():
                 complete = False
-        elif isinstance(value, str) and value.strip():
+        else:
             complete = False
     mappings = adapter.get("domain_configs")
     if mappings is not None and not isinstance(mappings, dict):

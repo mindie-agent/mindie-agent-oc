@@ -38,6 +38,6 @@ Related diagnosis: [mindie-agent#354](https://github.com/mindie-agent/mindie-age
 
 ## Component pins
 
-`mindie-knowledge` 0.13.22, `remote-dev` 0.11.12, `mindie-diagnostics` 0.5.14, `mindie-coordinator` 0.7.11, `mindie-debugger` 0.1.3, `mindie-profiler` 0.5.14, `mindie-sim` 0.9.15, `npu-top` 0.3.4. `pyproject.toml` `[tool.uv.sources]` and `override-dependencies` pin the matching formal-release commit SHAs, and `uv.lock` is regenerated.
+`mindie-knowledge` 0.13.22, `remote-dev` 0.11.12, `mindie-diagnostics` 0.5.15, `mindie-coordinator` 0.7.11, `mindie-debugger` 0.1.3, `mindie-profiler` 0.5.15, `mindie-sim` 0.9.15, `npu-top` 0.3.4. `pyproject.toml` `[tool.uv.sources]` and `override-dependencies` pin the matching formal-release commit SHAs, and `uv.lock` is regenerated.
 
 Verification scope: the full `pytest tests` suite (including the R1 storage-lifecycle regressions for cross-config-root pins, rollback-pointer retention, `TimeoutError` propagation, engine-snapshot link/Git guards, POSIX lock-inode ordering, resumable spool cursors and post-switch exception isolation in `tests/test_storage_lifecycle_oc.py`), Node syntax checks, and the LF line-ending gate. All of it ran on macOS; no NPU or complete model-task result on another platform is inferred.

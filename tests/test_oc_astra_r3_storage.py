@@ -579,6 +579,24 @@ def test_missing_explicit_domain_config_aborts_spool_eviction(r3_env: dict[str, 
     assert report["removed_sessions"] == []
     assert projection.is_file() and seq_file.is_file()
 
+    # Non-string explicit engine keys (list/int/dict/empty) must also fail closed.
+    for malformed in (["/offline/old.engine.json"], 42, {"path": "/offline/old.engine.json"}, ""):
+        _write_adapter(
+            cfg,
+            {
+                "python": str(Path(sys.executable)),
+                "state_dir": str(spool.parent),
+                "admission_path": str(spool.parent / "admission.sqlite3"),
+                "engine_config": str(engine),
+                "previous_generation": malformed,
+            },
+        )
+        _dbs, ok = storage_spool.knowledge_databases(cfg)
+        assert ok is False, malformed
+        malformed_report = storage_spool.prune_spool_transcripts(spool, config=cfg, budget_seconds=5.0)
+        assert malformed_report["status"] == "partial" and malformed_report["removed_sessions"] == [], malformed
+        assert projection.is_file() and seq_file.is_file()
+
 
 def test_custom_config_forbidden_source_root_without_git_protects_component_runtimes(
     r3_env: dict[str, Path],
