@@ -15,10 +15,13 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import {
-    admissionPath, atomicWriteJson, configPath, dataHome, isNewerSemver,
+    atomicWriteJson, configPath, dataHome, isNewerSemver,
     opencodeDbPath, pidAlive, pluginRoot, readJsonSafe, resolveBootstrapPython,
-    stateDir, summaryEndpointPath,
+    summaryEndpointPath,
 } from "./paths.mjs";
+import {
+    admissionMtimeSignature, parseModelSpec, renderSkillSystemBlock, safeGetSession,
+} from "./session_support.mjs";
 
 const GESTURE_PREFIX_RE = /^\uFEFF?\s*(?:\/mindie-agent(?::mindie-agent)?|\$mindie-agent(?::mindie-agent)?)(?=\s|$)/;
 const MCP_WIRE_RE = /^(?:mcp[_:])?(?:mindie[-_]agent[-_:])?(mindie[-_]remote[-_]dev|mindie[-_]tools)[_:]([A-Za-z0-9_.-]+)$/;
@@ -129,33 +132,6 @@ function buildMindieEnv() {
     return env;
 }
 
-function admissionMtimeSignature(sessionID = null) {
-    const base = admissionPath();
-    let sig = null;
-    try {
-        const mainStat = fs.statSync(base);
-        let walMtime = 0;
-        try {
-            walMtime = fs.statSync(`${base}-wal`).mtimeMs;
-        } catch {
-            walMtime = 0;
-        }
-        sig = `${mainStat.mtimeMs}:${walMtime}`;
-    } catch (err) {
-        if (err && err.code !== "ENOENT") {
-            process.stderr.write(`MindIE OpenCode admission stat failed (${base}): ${err.message || err}\n`);
-            sig = "unreadable";
-        }
-    }
-    if (typeof sessionID === "string" && sessionID.length > 0 && !sessionID.includes("/") && !sessionID.includes("\\")) {
-        try {
-            const pStat = fs.statSync(path.join(stateDir(), "pending-activations", `${sessionID}.json`));
-            return `${sig || "0"}:p${pStat.mtimeMs}`;
-        } catch {}
-    }
-    return sig;
-}
-
 function killHookTree(child) {
     if (!Number.isInteger(child?.pid) || child.pid <= 0) return;
     if (process.platform !== "win32") {
@@ -259,62 +235,11 @@ function spawnDetachedCapture(payload) {
     child.unref();
 }
 
-function parseModelSpec(rawModel) {
-    if (typeof rawModel !== "string") return undefined;
-    const trimmed = rawModel.trim();
-    if (!trimmed || trimmed === "default") return undefined;
-    const [providerAndId, variant] = trimmed.split("#", 2);
-    const slashIdx = providerAndId.indexOf("/");
-    if (slashIdx <= 0 || slashIdx >= providerAndId.length - 1) return undefined;
-    const spec = {
-        providerID: providerAndId.slice(0, slashIdx),
-        id: providerAndId.slice(slashIdx + 1),
-    };
-    if (variant) {
-        spec.variant = variant;
-    }
-    return spec;
-}
-
 function extractGestureTaskPrompt(rawText) {
     const rem = String(rawText || "").replace(GESTURE_PREFIX_RE, "").trim();
     if (!rem) return "";
     const first = rem.split(/\s+/, 2)[0].toLowerCase();
     return rem === first && (first === "activate" || first === "deactivate" || first === "status") ? "" : rem;
-}
-
-async function safeGetSession(ctx, sessionID) {
-    if (!sessionID || typeof ctx?.session?.get !== "function") {
-        return null;
-    }
-    try {
-        return await ctx.session.get({ sessionID });
-    } catch (err) {
-        process.stderr.write(`MindIE OpenCode session.get warning (${sessionID}): ${err?.message || err}\n`);
-        return null;
-    }
-}
-
-function renderSkillSystemBlock(sessionID, state) {
-    const py = resolveBootstrapPython();
-    let skillBody = "";
-    if (typeof state.skill_path === "string" && fs.existsSync(state.skill_path)) {
-        skillBody = fs.readFileSync(state.skill_path, "utf8");
-    }
-    return [
-        `<mindie-agent-skill session="${sessionID}">`,
-        "MindIE Agent knowledge flywheel is ACTIVE for this OpenCode main session.",
-        "Host-verified execution bindings:",
-        `- OPENCODE_SESSION_ID=${sessionID}`,
-        `- Python runtime: ${py}`,
-        `- Private Knowledge CLI: ${state.knowledge_cli}`,
-        `- RSI Loop helper: ${state.rsi_loop}`,
-        `- Experiment Ledger helper: ${state.experiment_ledger}`,
-        `Shell commands created in this session automatically receive OPENCODE_SESSION_ID=${sessionID}.`,
-        "",
-        skillBody.trim(),
-        "</mindie-agent-skill>",
-    ].join("\n");
 }
 
 export default {

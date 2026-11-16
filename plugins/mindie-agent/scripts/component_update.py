@@ -13,12 +13,18 @@ promoting verified native plugin generations atomically via `os.replace()`.
   verification, `prepare()`, and `oc.engine.<gen>.json` complete before flipping `oc.json`.
 - Single-Instance Lock & State Honesty: serializes via `oc-component-update.lock`,
   reclaims dead-PID `in_progress` status, and reports `read_inventory` failures as `"failed"`.
+- Single Candidate Build: a healthy active interpreter is reused for discovery, so a
+  `native_candidate` upgrade builds one `component-runtimes` runtime, not a baseline plus
+  the candidate; the baseline bootstrap only runs when `prepare()` reports nothing to build.
+- Post-Switch Cleanup Is Advisory: bounded `storage_gc` reclamation may attach
+  `cleanup_warning` after a committed switch but never rolls back `oc.json`.
 
 [Timeouts & Locks]
 - Shared `540.0s` deadline (`15s` metadata, `120s` catalog, `420s` `uv` build, `5s` reserve).
 
 [Side-Effect Policy]
-- Writes candidate generations under `state_dir()/component-runtimes` and flips `oc.json` last.
+- Writes candidate generations under `state_dir()/component-runtimes`, flips `oc.json`
+  last, then silently reclaims historical baggage through `storage_gc`.
 """
 
 from __future__ import annotations
@@ -31,7 +37,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -42,13 +47,19 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import storage_gc
 from bounded import run as bounded_run
+from host_process import find_gitleaks_executable as _find_gitleaks_executable
+from host_process import pid_running_windows as _pid_running_windows
+from host_process import stop_untracked_updater as _stop_untracked_updater
 from oc_native_compat import ensure_oc_native_support
 from paths import (
     admission_path, apply_enterprise_transport_env, atomic_write_json, community_config_path,
     config_path, consent_path, data_home, engine_config_path, installed_source_root,
-    norm_python_path as _norm_python_path, read_json, repo_root, same_interpreter, state_dir, which_host_binary,
+    norm_python_path as _norm_python_path, read_json, repo_root, same_interpreter, state_dir,
 )
+from runtime_bootstrap import compatible_runtime as _compatible_runtime
+from runtime_bootstrap import inventory_ready
 
 ensure_oc_native_support()
 
@@ -115,23 +126,6 @@ def _update_lock(lock_file: Path, *, blocking_timeout: float = 0.0):
         handle.close()
 
 
-def _pid_running_windows(pid: int) -> bool:
-    try:
-        import ctypes
-
-        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        h = k32.OpenProcess(0x1000, False, int(pid))
-        if not h:
-            return False
-        try:
-            code = ctypes.c_ulong(0)
-            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code)) and int(code.value) == 259)
-        finally:
-            k32.CloseHandle(h)
-    except Exception:
-        return False
-
-
 def _pid_running(pid: object) -> bool:
     if type(pid) is not int or pid <= 0:
         return False
@@ -146,17 +140,6 @@ def _pid_running(pid: object) -> bool:
         return True
     except OSError:
         return False
-
-
-def _stop_untracked_updater(proc: subprocess.Popen) -> None:
-    try:
-        proc.terminate()
-        proc.wait(timeout=1.0)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
 
 
 def read_inventory(python: str, *, timeout: float = 15.0) -> dict:
@@ -240,40 +223,9 @@ def trigger_background_update_if_due(*, config: str | Path | None = None) -> boo
 
 def compatible_runtime(python: str, *, source=None, config=None, timeout: float = 540.0) -> str:
     """Prepare a compatible generation without changing the active profile."""
-    if timeout <= 0:
-        raise TimeoutError("runtime compatibility probe exceeded its budget")
-    deadline = time.monotonic() + float(timeout)
-    norm_py = _norm_python_path(python)
-    req_mods = ("mindie_knowledge", "remote_dev", "mindie_diagnostics", "mindie_profiler", "mindie_sim", "mindie_coordinator", "mindie_debugger", "npu_top")
-    if same_interpreter(python, sys.executable) and all(importlib.util.find_spec(m) is not None for m in req_mods) and importlib.util.find_spec("remote_dev.mcp.outcome") is not None:
-        return norm_py
-    imports = f"import {', '.join(req_mods)}; from remote_dev.mcp.outcome import operation_outcome"
-
-    def probe(interpreter):
-        rem = min(15.0, deadline - time.monotonic())
-        grace = min(1.5, max(0.15, rem * 0.25))
-        budget = rem - grace
-        if budget <= 0.05:
-            raise TimeoutError("runtime compatibility probe exceeded its budget")
-        return bounded_run([str(interpreter), "-I", "-c", imports], "", timeout=budget, cleanup_grace=grace).returncode == 0
-
-    if probe(python):
-        return norm_py
-    remaining = deadline - time.monotonic()
-    if remaining <= 20.0:
-        raise TimeoutError("runtime preparation has no remaining build budget")
-    command = [
-        str(python), "-I", str(Path(__file__).resolve()), "--prepare-only", "--python", str(python),
-        "--source", str(source or repo_root(config)), "--config", str(config_path(config)), "--timeout", str(remaining - 20.0),
-    ]
-    result = bounded_run(command, "", timeout=remaining - 15.0, max_output=256 * 1024, env=apply_enterprise_transport_env(dict(os.environ)))
-    if result.returncode != 0:
-        raise RuntimeError(f"runtime candidate preparation failed: {(result.stderr or result.stdout)[-1000:]}")
-    artifact = json.loads(result.stdout)
-    candidate = artifact.get("python") if isinstance(artifact, dict) else None
-    if not candidate or not probe(candidate):
-        raise RuntimeError("runtime candidate does not provide the plugin APIs")
-    return _norm_python_path(candidate)
+    return _compatible_runtime(
+        python, source=source, config=config, timeout=timeout, script=Path(__file__).resolve(),
+    )
 
 
 def prepare(
@@ -342,23 +294,19 @@ def _candidate_plugin_is_newer(candidate_source: Path, adapter: dict) -> bool:
     return active_ver is None or cand_ver > active_ver
 
 
-def _find_gitleaks_executable() -> str | None:
-    found = which_host_binary("gitleaks", which_fn=shutil.which)
-    if found:
-        return found
-    cache_dir = Path.home() / ".cache" / "mindie-agent" / "gitleaks"
-    if cache_dir.is_dir():
-        for candidate in sorted(cache_dir.rglob("gitleaks*"), reverse=True):
-            if candidate.is_file() and candidate.name in {"gitleaks", "gitleaks.exe"}:
-                return str(candidate.resolve())
-    return None
+def _active_python_is_reusable(adapter: dict, *, timeout: float) -> bool:
+    """True when the active interpreter can run discovery without a baseline build."""
+    candidate = adapter.get("python")
+    if not isinstance(candidate, str) or not os.path.isabs(candidate):
+        return False
+    return inventory_ready(candidate, timeout=min(15.0, max(1.0, float(timeout))))
 
 
 def _write_generation_and_switch_profile(
     *, cfg_file: Path, base_adapter: dict, base_engine: dict,
     target_source: Path, target_python: str, validation: dict, artifact: dict | None,
     lock_timeout: float = 5.0,
-) -> Path:
+) -> tuple[Path, str | None, str | None]:
     """Write generation-isolated `oc.engine.<gen>.json` FIRST, then atomically flip `oc.json`."""
     from mindie_knowledge.component_bindings import rebind_commands
 
@@ -421,7 +369,15 @@ def _write_generation_and_switch_profile(
             atomic_write_json(default_eng, eng_payload)
         except (TimeoutError, OSError) as exc:
             mirror_warn = f"{type(exc).__name__}: {exc}"
-    return gen_eng_file, mirror_warn
+    # Step 3: Silent post-switch reclamation. A contended or slow cleanup only
+    # annotates the receipt; it never rolls back the committed profile switch.
+    cleanup_warn = storage_gc.warning_text(
+        storage_gc.post_switch_reclaim(
+            config=cfg_file, interpreter=target_python, source_root=str(target_source),
+            force_legacy=bool(os.environ.get("MINDIE_OC_FORCE_CLEANUP") == "1"),
+        )
+    )
+    return gen_eng_file, mirror_warn, cleanup_warn
 
 
 def store_schema_needs_prepare(cfg_file: str | Path | None = None, eng_file: str | Path | None = None) -> bool:
@@ -593,14 +549,22 @@ def check(
         native_candidate = (not profile_existed) or _candidate_plugin_is_newer(candidate_checkout, existing_adapter)
 
         try:
+            reuse_existing = False
             if native_candidate:
                 # Stage immutable candidate snapshot & validate contracts WITHOUT touching active `oc.json`.
                 target_source = stage_source_baseline(source_dir=candidate_checkout)
                 validation = validate_contracts(target_source)
-                base_python = ensure_runtime_python(
-                    source_root=target_source,
-                    python_exe=existing_adapter.get("python") if isinstance(existing_adapter.get("python"), str) else None,
-                    config=cfg_file, timeout=remaining(10.0),
+                # Reuse a healthy active interpreter directly: it can already run discovery, so a
+                # throwaway baseline generation must not be built before the merged candidate build.
+                reuse_existing = _active_python_is_reusable(existing_adapter, timeout=remaining(10.0))
+                base_python = (
+                    _norm_python_path(existing_adapter["python"])
+                    if reuse_existing
+                    else ensure_runtime_python(
+                        source_root=target_source,
+                        python_exe=existing_adapter.get("python") if isinstance(existing_adapter.get("python"), str) else None,
+                        config=cfg_file, timeout=remaining(10.0),
+                    )
                 )
             else:
                 configured_sr = existing_adapter.get("source_root")
@@ -613,10 +577,17 @@ def check(
                 base_python = str(existing_adapter.get("python") or sys.executable)
 
             artifact = prepare(source=target_source, python=base_python, config=cfg_file, force=force, timeout=remaining(5.0))
+            if reuse_existing and artifact is None:
+                # `prepare()` reported nothing to build. Only an interpreter already aligned with the
+                # candidate baseline may be published; otherwise bootstrap exactly one baseline runtime.
+                base_python = ensure_runtime_python(source_root=target_source, python_exe=base_python, config=cfg_file, timeout=remaining(10.0))
+                if _norm_python_path(base_python) != _norm_python_path(existing_adapter["python"]):
+                    artifact = prepare(source=target_source, python=base_python, config=cfg_file, force=force, timeout=remaining(5.0))
             target_python = _norm_python_path(artifact["python"] if artifact is not None else base_python)
             inventory_error: str | None = None
             inventory_diag: dict | None = None
             receipt_warn: str | None = None
+            cleanup_warn: str | None = None
             if artifact is not None:
                 installed: dict | None = artifact["installed"]
             else:
@@ -633,7 +604,7 @@ def check(
             if inventory_error is not None:
                 active_eng_file, status = existing_eng_file, "failed"
             elif artifact is not None or native_candidate:
-                active_eng_file, receipt_warn = _write_generation_and_switch_profile(
+                active_eng_file, receipt_warn, cleanup_warn = _write_generation_and_switch_profile(
                     cfg_file=cfg_file, base_adapter=existing_adapter, base_engine=existing_engine,
                     target_source=target_source, target_python=target_python, validation=validation, artifact=artifact,
                     lock_timeout=min(5.0, remaining(0.0)),
@@ -664,7 +635,17 @@ def check(
             raise
 
         needs_reload = status == "updated"
+        if status == "up_to_date" and non_blocking:
+            # Background maintenance: reclaim historical baggage even when no switch happened.
+            cleanup_warn = storage_gc.warning_text(
+                storage_gc.post_switch_reclaim(
+                    config=cfg_file, interpreter=target_python, source_root=str(target_source),
+                    force_legacy=bool(os.environ.get("MINDIE_OC_FORCE_CLEANUP") == "1"),
+                )
+            )
         result: dict = dict(schema="mindie-component-update/1", harness="opencode", status=status, needs_host_reload=needs_reload, python=target_python, installed=installed)
+        if cleanup_warn is not None:
+            result["cleanup_warning"] = cleanup_warn
         if inventory_error is not None:
             result["inventory_error"], result["diagnostic"] = inventory_error, inventory_diag
         elif receipt_warn is not None:

@@ -186,10 +186,11 @@ def test_paired_generation_continuity_across_plugin_overwrite_and_failed_cutover
     assert json.loads(hook_proc.stdout)["activated"] is False
     assert read_json(cfg)["product_validation"]["native_version"] == "0.1.0"
 
-    # Simulate a broken 0.1.1 runtime candidate preparation: oc.json must stay on 0.1.0 and status records "failed".
+    # Simulate a broken 0.1.1 runtime candidate preparation. A healthy active interpreter is
+    # reused for discovery now, so the candidate build (`prepare`) is the failure surface.
     monkeypatch.setattr(
         component_update,
-        "compatible_runtime",
+        "prepare",
         lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("simulated uv build failure")),
     )
     with pytest.raises(RuntimeError, match="simulated uv build failure"):
@@ -197,7 +198,7 @@ def test_paired_generation_continuity_across_plugin_overwrite_and_failed_cutover
     assert read_json(cfg)["product_validation"]["native_version"] == "0.1.0"
     assert read_json(data_home() / "oc-component-update-status.json")["status"] == "failed"
 
-    # Restore compatible_runtime and promote 0.1.1 cleanly.
+    # Restore a no-op prepare and promote 0.1.1 cleanly.
     monkeypatch.setattr(component_update, "compatible_runtime", lambda interpreter, **_kw: component_update._norm_python_path(interpreter))
     monkeypatch.setattr(component_update, "prepare", lambda **_kw: None)
     promoted = component_update.check(config=cfg, source=live_plugin_dir)
