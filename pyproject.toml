@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-agent-oc"
-version = "0.1.6"
+version = "0.1.7"
 description = "OpenCode native harness plugin adapter for MindIE Agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,7 +30,7 @@ test = [
 py-modules = []
 
 [tool.uv.sources]
-mindie-knowledge = { git = "https://github.com/mindie-agent/knowledge", rev = "315fc4bc51ee9a7afef32a3666599d608ff59f9d" }
+mindie-knowledge = { git = "https://github.com/mindie-agent/knowledge", rev = "3aa71f979f8af82ea93ba6936c45545183033f89" }
 remote-dev = { git = "https://github.com/mindie-agent/remote-dev", rev = "3556df571450dab481a25e0157167f1c3727dc6c" }
 mindie-diagnostics = { git = "https://github.com/mindie-agent/diagnostics", rev = "171623584aa812677df907518dcb55b06493241b" }
 mindie-coordinator = { git = "https://github.com/mindie-agent/coordinator", rev = "d8977114e8cd0e5b7befa59a5ff5e53f40a74521" }
@@ -41,7 +41,7 @@ npu-top = { git = "https://github.com/mindie-agent/npu-top", rev = "848d74da3cba
 
 [tool.uv]
 override-dependencies = [
-    "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@315fc4bc51ee9a7afef32a3666599d608ff59f9d",
+    "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@3aa71f979f8af82ea93ba6936c45545183033f89",
     "remote-dev @ git+https://github.com/mindie-agent/remote-dev@3556df571450dab481a25e0157167f1c3727dc6c",
     "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@171623584aa812677df907518dcb55b06493241b",
     "mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@d8977114e8cd0e5b7befa59a5ff5e53f40a74521",
