@@ -394,8 +394,11 @@ def test_real_subprocess_lease_protects_generation_and_survives_tree_termination
             proc.kill()
             proc.communicate(timeout=10.0)
 
-    # The lease holder refreshed the generation's mtime, so age it past the staging grace
-    # before the reclaim that must now succeed.
+    # Reaping a killed Windows lease sidecar updates the directory mtime, so
+    # sweep stale lease markers first and then age the generation past grace.
+    from mindie_knowledge.storage import is_lease_held
+
+    assert is_lease_held(leased) is False
     stamp = time.time() - 86_400
     for target in (leased, leased / "components.json"):
         os.utime(target, (stamp, stamp))

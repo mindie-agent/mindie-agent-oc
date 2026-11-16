@@ -142,10 +142,12 @@ def _consume_spool(store, spool_file: Path, session: str, capture_id: str):
 
 
 def _make_knowledge_db(path: Path, *, finish: int, key: str, pending_capture: bool = False, trigger: bool = False) -> None:
+    from contextlib import closing
+
     path.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("", "-wal", "-shm"):
         Path(str(path) + suffix).unlink(missing_ok=True)
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute(
             "CREATE TABLE cursors(file_identity TEXT PRIMARY KEY, identity TEXT NOT NULL,"
             " finish INTEGER NOT NULL, digest TEXT NOT NULL, ok_finish INTEGER NOT NULL, updated REAL NOT NULL)"
@@ -268,11 +270,13 @@ def test_unconsumed_unknown_or_undeletable_cursor_keeps_the_projection(r3_env: d
     _age(projection, 20 * 24 * 3600)
     size = projection.stat().st_size
 
+    from contextlib import closing
+
     # Raw (unresolved) spelling and a short offset must protect the projection.
     _make_knowledge_db(database, finish=size - 1, key=str(projection))
     report = storage_spool.prune_spool_transcripts(spool, config=cfg, budget_seconds=5.0)
     assert report["removed_sessions"] == [] and projection.is_file(), report
-    with sqlite3.connect(database) as db:
+    with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0] == 1
 
     # A pending capture for the same projection also protects it.
@@ -302,7 +306,7 @@ def test_unconsumed_unknown_or_undeletable_cursor_keeps_the_projection(r3_env: d
     _make_knowledge_db(database, finish=size, key=str(projection))
     report = storage_spool.prune_spool_transcripts(spool, config=cfg, budget_seconds=5.0)
     assert session in report["removed_sessions"] and not projection.exists(), report
-    with sqlite3.connect(database) as db:
+    with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT COUNT(*) FROM cursors").fetchone()[0] == 0
 
 

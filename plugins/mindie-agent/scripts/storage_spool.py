@@ -646,23 +646,15 @@ def prune_spool_transcripts(
             # Retire the cursor with the projection so a resumed session rebuilds
             # from sequence 0 instead of skipping the retired prefix.
             unlink_file(root / f"{sid}.seq", record)
-            removed_any = _unlink_locked(lock_file, record) or removed_any
+            if os.name != "nt":
+                _unlink_locked(lock_file, record)
         if removed:
+            if os.name == "nt":
+                # Windows refuses to delete an open lock: unlink once the handle closed.
+                _unlink_locked(lock_file, record)
             if needed > 0:
                 needed -= 1
             record["removed_sessions"].append(sid)
-    if os.name == "nt" and removed_any:
-        # Windows refuses to delete an open lock: retried after the handle closed.
-        for sid in record["removed_sessions"]:
-            lock_file = root / f".{sid}.lock"
-            try:
-                if lock_file.is_file():
-                    os.unlink(lock_file)
-                    record["lock_files_removed"] += 1
-            except TimeoutError:
-                raise
-            except OSError:
-                pass
     if record["partial"]:
         record["status"] = "partial"
     return record
