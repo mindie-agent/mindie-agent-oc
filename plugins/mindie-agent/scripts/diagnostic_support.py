@@ -346,11 +346,12 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
             return "update", True, None
         if isinstance(cur, (TimeoutError, subprocess.TimeoutExpired)):
             return "timeout", False, None
-        if isinstance(cur, urllib.error.HTTPError) or cls_name == "ReleaseFetchError":
+        fetch_error = any(base.__name__ == "ReleaseFetchError" for base in type(cur).__mro__)
+        if isinstance(cur, urllib.error.HTTPError) or fetch_error:
             status = getattr(cur, "code", None) if isinstance(cur, urllib.error.HTTPError) else getattr(cur, "status", None)
-            code = getattr(cur, "code", None) if cls_name == "ReleaseFetchError" else None
+            code = getattr(cur, "code", None) if fetch_error else None
             code_s = code if isinstance(code, str) else None
-            if cls_name == "ReleaseFetchError" and code_s == "release_transport_unavailable" and getattr(cur, "__cause__", None) is not None:
+            if fetch_error and code_s == "release_transport_unavailable" and getattr(cur, "__cause__", None) is not None:
                 inner_cat, inner_rep, inner_code = classify_update_exception(cur.__cause__)
                 if inner_rep or inner_cat in {"timeout", "certificate", "rate_limited"}:
                     return inner_cat, inner_rep, inner_code
@@ -358,6 +359,9 @@ def classify_update_exception(exc: BaseException) -> tuple[str, bool, str | None
                 return "certificate", False, "release_certificate_error"
             if status == 429 or (status == 403 and code_s == "release_rate_limited"):
                 return "rate_limited", False, code_s or "release_rate_limited"
+            if (fetch_error and code_s not in {"release_http_error", "release_transport_unavailable"}
+                    and getattr(cur, "category", None) != "temporary_network"):
+                return "update", True, code_s
             return "temporary_network", False, code_s or "release_http_error"
         if isinstance(cur, ssl.SSLCertVerificationError):
             return "certificate", False, "release_certificate_error"

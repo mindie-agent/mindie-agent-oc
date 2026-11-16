@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -70,7 +71,7 @@ def test_classify_update_exception_maps_transient_transport_without_masking_loca
     ) == ("rate_limited", False, "release_rate_limited")
     assert diagnostic_support.classify_update_exception(
         ReleaseFetchError("invalid_release_json")
-    ) == ("temporary_network", False, "invalid_release_json")
+    ) == ("update", True, "invalid_release_json")
 
     wrapped_local_json = ValueError("MindIE metadata is malformed JSON: product-contract.json")
     wrapped_local_json.__cause__ = json.JSONDecodeError("bad json", "{", 1)
@@ -122,20 +123,34 @@ def test_component_update_check_records_non_reportable_transient_tls_error(
         "release_transport_unavailable",
     )
 
-    # Verify truncated upstream Catalog.read(..., force=...) JSONDecodeError is wrapped into invalid_release_json
-    # (temporary_network, reportable=False) through real Catalog.latest(force=...) keyword forwarding.
+    # Exercise actual HTTP bytes through Catalog.read/latest, retaining force.
+    # A caller-created JSONDecodeError is not evidence of a bad remote response.
     import mindie_knowledge.component_releases as comp_rel
     import mindie_knowledge.component_runtime as comp_rt
     import mindie_knowledge.component_bindings as comp_bind
 
     seen_force: list[bool] = []
 
-    def truncated_http_read(_self, _url: str, *, force: bool = False):
-        seen_force.append(force)
-        raise json.JSONDecodeError("Expecting value", "{truncated", 1)
+    original_read = comp_rel.Catalog.read
 
+    def observed_read(self, path, *, force=False):
+        seen_force.append(force)
+        return original_read(self, path, force=force)
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {}
+
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            return Response(b'{truncated')
+
+    import urllib.request
+    from mindie_knowledge import release_http
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_: Opener())
+    monkeypatch.setattr(release_http, "token", lambda: None)
     comp_name = next(iter(comp_rel.COMPONENTS))
-    monkeypatch.setattr(comp_rel.Catalog, "read", truncated_http_read)
+    monkeypatch.setattr(comp_rel.Catalog, "read", observed_read)
     monkeypatch.setattr(comp_bind, "required_components", lambda *_a, **_kw: {comp_name: "0.1.0"})
     monkeypatch.setattr(comp_rt, "source_baseline", lambda *_a, **_kw: {"runtime": {comp_name: "abc"}})
     monkeypatch.setattr(
@@ -154,6 +169,16 @@ def test_component_update_check_records_non_reportable_transient_tls_error(
         )
     else:
         raise AssertionError("Expected ReleaseFetchError('invalid_release_json') from truncated Catalog.read()")
+
+    local = json.JSONDecodeError("local parser failure", "", 0)
+    def local_failure(*_args, **_kwargs):
+        raise local
+    monkeypatch.setattr(comp_rel.Catalog, "read", local_failure)
+    with pytest.raises(json.JSONDecodeError) as caught:
+        orig_prepare(source=REPO_ROOT, python=sys.executable, config=paths.config_path(), force=True, timeout=30.0)
+    assert caught.value is local
+    assert diagnostic_support.classify_update_exception(local) == ("update", True, None)
+
 
 
 def test_utf8_bom_tolerance_across_python_and_js(tmp_path: Path) -> None:

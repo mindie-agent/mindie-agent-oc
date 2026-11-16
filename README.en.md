@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.6-0F766E.svg" alt="Release v0.1.6"></a>
+  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.7-0F766E.svg" alt="Release v0.1.7"></a>
   &nbsp;
   <a href="./README.md">简体中文</a>
 </p>
@@ -18,7 +18,7 @@
 
 ## 1. Architecture & Exposure Boundary
 
-`mindie-agent-oc` (npm package `@mindie-agent/oc`, current release [`v0.1.6`](https://github.com/mindie-agent/mindie-agent-oc/releases/tag/v0.1.6)) targets OpenCode's v2 Promise Plugin API (`@opencode-ai/plugin`) directly and enforces the same strict boundary as `mindie-agent-agy` and `mindie-agent-codex`:
+`mindie-agent-oc` (npm package `@mindie-agent/oc`, current release [`v0.1.6`](https://github.com/mindie-agent/mindie-agent-oc/releases/tag/v0.1.7)) targets OpenCode's v2 Promise Plugin API (`@opencode-ai/plugin`) directly and enforces the same strict boundary as `mindie-agent-agy` and `mindie-agent-codex`:
 
 1. **GitHub / Local Installation & Automatic Updates**: Supports `opencode plugin add github:mindie-agent/mindie-agent-oc` (OpenCode 2.2.7 rejects direct tarball URLs; release tarballs remain distribution artifacts), and local directory URIs (`"plugin": ["file:///abs/path/to/mindie-agent-oc"]`), native `opencode plugin update`, and monotonic `300s` background updates (`max(installed, baseline, latest)`) for shared runtime components.
 2. **Always-On Deterministic MCP Tools (34 Tools, Zero `knowledge_*` in Default `tools/list`)**:
