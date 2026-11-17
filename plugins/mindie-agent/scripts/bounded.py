@@ -521,7 +521,8 @@ def run(
     child_env["PYTHONIOENCODING"] = "utf-8"
 
     if (
-        strict_output_limit
+        os.name == "nt"
+        and strict_output_limit
         and subprocess.Popen is _STDLIB_POPEN
         and os is _STDLIB_OS
         and shutil.rmtree is _STDLIB_RMTREE
@@ -555,7 +556,7 @@ def run(
             try:
                 outcome = run_owned(
                     spec,
-                    deadline=Deadline.from_timeout(float(timeout), cleanup_grace=max(0.1, float(cleanup_grace))),
+                    deadline=Deadline.from_budgets((float(timeout),), cleanup_grace=max(0.1, float(cleanup_grace))),
                     cancel=cancel,
                 )
             except OutputLimitError as exc:

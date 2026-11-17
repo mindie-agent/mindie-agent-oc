@@ -15,7 +15,7 @@ jobs:
     secrets:
       MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
-      release-notes-path: docs/releases/mindie-agent-oc-0.1.7.md
+      release-notes-path: docs/releases/mindie-agent-oc-0.1.8.md
       node: true
       version-files: |
         package.json
@@ -24,6 +24,7 @@ jobs:
       setup-command: |
         uv sync --frozen --no-editable --no-install-project --all-extras
       test-command: |
+        git fetch --no-tags --depth=1 origin refs/tags/v0.1.7:refs/tags/v0.1.7
         .venv/bin/python .github/scripts/check_lf_eol.py
         .venv/bin/python -m pytest -q -m "not live_npu and not live_opencode"
         node --check index.mjs
