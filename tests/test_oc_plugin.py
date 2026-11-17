@@ -76,6 +76,7 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
     source_files = [
         REPO_ROOT / "index.mjs",
         REPO_ROOT / "plugins" / "mindie-agent" / "paths.mjs",
+        REPO_ROOT / "plugins" / "mindie-agent" / "session_support.mjs",
         REPO_ROOT / "plugins" / "mindie-agent" / "opencode_host.mjs",
         *sorted((REPO_ROOT / "plugins" / "mindie-agent" / "scripts").glob("*.py")),
     ]
@@ -90,6 +91,34 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
 
     host_mjs = (REPO_ROOT / "plugins" / "mindie-agent" / "opencode_host.mjs").read_text(encoding="utf-8")
     assert "windowsHide: true" in host_mjs
+
+    install_docs = REPO_ROOT / "docs" / "install"
+    skill_dir = REPO_ROOT / "plugins" / "mindie-agent" / "skills" / "mindie-agent"
+    refs_dir = skill_dir / "references"
+    for doc_name in ("workspace-setup.md", "user-notice.md", "github-authentication.md"):
+        assert (install_docs / doc_name).is_file()
+        assert not (refs_dir / doc_name).exists()
+    skill_text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    assert "\ndisable-model-invocation: true\n" in skill_text.split("---", 2)[1]
+    for runtime_doc in (skill_dir / "SKILL.md", *sorted(refs_dir.glob("*.md"))):
+        body = runtime_doc.read_text(encoding="utf-8")
+        for forbidden_install_term in (
+            "workspace-setup.md",
+            "github-authentication.md",
+            "user-notice.md",
+            "needs_onboarding_prompt",
+            "vllm-ascend-workspace",
+            "gh auth login",
+            "/user/starred/",
+            "setup.py",
+        ):
+            assert forbidden_install_term not in body, f"{forbidden_install_term!r} leaked into {runtime_doc}"
+    for readme_path in (REPO_ROOT / "README.md", REPO_ROOT / "README.en.md"):
+        readme_text = readme_path.read_text(encoding="utf-8")
+        assert "docs/install/user-notice.md" in readme_text
+        assert "docs/install/workspace-setup.md" in readme_text
+        assert "docs/install/github-authentication.md" in readme_text
+        assert "skills/mindie-agent/references/" not in readme_text
 
     # Verify live OpenCode v2 CLI loads `file://<repo>` cleanly via `debug config --standalone` & `mcp list --standalone`.
     oc_bin = opencode_cli_bin()
@@ -226,6 +255,8 @@ await sessionHooks.get("context")({{ sessionID: "ses_mainA001", system: activeSy
 assert.equal(activeSys.length, 1);
 assert.equal(activeSys[0].type, "text");
 assert.match(activeSys[0].text, /OPENCODE_SESSION_ID=ses_mainA001/);
+assert.ok(activeSys[0].text.includes("# MindIE Agent (OpenCode Unified Entry)"));
+assert.ok(!activeSys[0].text.includes("disable-model-invocation"));
 
 const otherSys = [];
 await sessionHooks.get("context")({{ sessionID: "ses_otherB002", system: otherSys }});

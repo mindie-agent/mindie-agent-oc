@@ -1,11 +1,12 @@
 ---
 name: mindie-agent
 description: Manually enable MindIE knowledge, domain skills, feedback, distillation and background capture for the current OpenCode session through /mindie-agent or $mindie-agent. Configured deterministic MCP tools remain available without this entry.
+disable-model-invocation: true
 ---
 
 # MindIE Agent (OpenCode Unified Entry)
 
-**Keep the user's task moving.** MindIE knowledge, setup, onboarding, diagnostics and local ledgers support the task. If one is unavailable, report that specific failure and continue independent work or use equivalent authorized host-native tools. Defer optional setup and sharing questions when they would interrupt the task. Retain existing job IDs and confirmed results. Reconcile an uncertain remote write before repeating that operation; do not bypass identity, permissions or actual device/port ownership. Coordinator-managed work keeps its leases; an existing verified host reservation may support equivalent native work. If ownership cannot be established, pause only that device action.
+**Keep the user's task moving.** MindIE knowledge, diagnostics, and local ledgers support the task. If one is unavailable, report that specific failure and continue independent work or use equivalent authorized host-native tools. Retain existing job IDs and confirmed results. Reconcile an uncertain remote write before repeating that operation; do not bypass identity, permissions or actual device/port ownership. Coordinator-managed work keeps its leases; an existing verified host reservation may support equivalent native work. If ownership cannot be established, pause only that device action.
 
 Use this skill **only** after the user explicitly invokes `/mindie-agent` or `$mindie-agent` in the current top-level OpenCode session. Do not activate it from topic matching.
 
@@ -35,10 +36,3 @@ Use this skill **only** after the user explicitly invokes `/mindie-agent` or `$m
 
 - **Detailed tool schemas (`knowledge_*`, `remote_*`) and Ascend NPU timing / profiler / lease discipline**: read [references/domain-skills.md](references/domain-skills.md).
 - **Session lifecycle, `/mindie-agent deactivate`, and `session.idle` capture rules**: read [references/activation-lifecycle.md](references/activation-lifecycle.md).
-- **Installation, first-run onboarding (`question` prompt), workspace setup, and GitHub sign-in**:
-  - Read [references/user-notice.md](references/user-notice.md), [references/workspace-setup.md](references/workspace-setup.md), and [references/github-authentication.md](references/github-authentication.md).
-  - Right after installation or when `<python> -I "<plugin_root>/scripts/setup.py" sharing --status` reports `needs_onboarding_prompt: true` in an interactive session, use OpenCode's native **`question`** tool in the user's language (skipping interactive onboarding automatically in headless `--auto` runs) to ask:
-    1. Local Development Workspace `vllm-ascend-workspace` (`Initialize vllm-ascend-workspace in current directory` vs `Keep current directory as workspace` vs `Use an existing workspace directory`)
-    2. Community Knowledge Sharing & Automated Fault Reporting (`Enable Community Sharing & Fault Reporting` vs `Keep Local-Only Mode`)
-    3. `Would you like to give mindie-agent a Star on GitHub ⭐?` (`Sure, star it ⭐` vs `Maybe later`)
-  - After the user answers, resolve `WORKSPACE_ROOT` first, then run `<python> -I "<plugin_root>/scripts/setup.py" sharing --enable --project-root "$WORKSPACE_ROOT"` (or `--disable`), and if Star was chosen, run `gh api --hostname github.com --silent -X PUT /user/starred/mindie-agent/mindie-agent`.
