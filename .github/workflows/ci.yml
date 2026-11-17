@@ -34,7 +34,6 @@ jobs:
       - name: Install locked runtime and test dependencies
         run: |
           uv sync --frozen --no-editable --no-install-project --extra test
-          uv pip install --no-deps "mindie-harness @ git+https://github.com/mindie-agent/harness.git@main"
       - name: Enforce Unix LF line endings
         run: uv run --no-sync python .github/scripts/check_lf_eol.py
       - name: Contract, update, and continuity tests

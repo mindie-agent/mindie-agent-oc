@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.7-0F766E.svg" alt="Release v0.1.7"></a>
+  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.8-0F766E.svg" alt="Release v0.1.8"></a>
   &nbsp;
   <a href="./README.en.md">English</a>
 </p>
@@ -18,7 +18,7 @@
 
 ## 1. 架构特性与暴露边界
 
-`mindie-agent-oc`（npm 包标识 `@mindie-agent/oc`，当前正式版本为 `v0.1.7`）基于 OpenCode v2 Promise Plugin API（`@opencode-ai/plugin`）原生构建，与其他手动入口 Harness（`mindie-agent-agy` / `mindie-agent-codex`）保持严格的边界一致性：
+`mindie-agent-oc`（npm 包标识 `@mindie-agent/oc`，当前正式版本为 `v0.1.8`）基于 OpenCode v2 Promise Plugin API（`@opencode-ai/plugin`）原生构建，与其他手动入口 Harness（`mindie-agent-agy` / `mindie-agent-codex`）保持严格的边界一致性：
 
 1. **GitHub / 本地安装与无感升级**：同时支持 GitHub 仓库通道（`opencode plugin add github:mindie-agent/mindie-agent-oc`）（OpenCode 2.2.7 不接受直接 tarball URL，Release tarball 仅作为分发产物）以及本地开发目录引用（`"plugin": ["file:///abs/path/to/mindie-agent-oc"]`）；支持 `opencode plugin update` 原生升级，并在后台按 `300s` 周期单调发现并原子切换共享组件独立更新（`max(installed, baseline, latest)`）。
 2. **默认全量开放确定性 MCP 工具（共 34 项，零 `knowledge_*` 污染）**：

@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-agent-oc"
-version = "0.1.7"
+version = "0.1.8"
 description = "OpenCode native harness plugin adapter for MindIE Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "mindie-harness>=0.1.0",
     "mindie-knowledge>=0.13.0",
-    "remote-dev>=0.11.0",
+    "remote-dev>=0.11.9",
     "mindie-diagnostics>=0.5.0",
     "mindie-coordinator>=0.7.0",
     "mindie-debugger>=0.1.0",
@@ -30,25 +31,27 @@ test = [
 py-modules = []
 
 [tool.uv.sources]
-mindie-knowledge = { git = "https://github.com/mindie-agent/knowledge", rev = "c991b64a1ead277b5ce91b7835337b01aed03998" }
-remote-dev = { git = "https://github.com/mindie-agent/remote-dev", rev = "c4d38f99c1ef5aace1c088af07647941adc2d394" }
-mindie-diagnostics = { git = "https://github.com/mindie-agent/diagnostics", rev = "96c40049e2fc8e53676f557cb8144421efcfe8ed" }
-mindie-coordinator = { git = "https://github.com/mindie-agent/coordinator", rev = "33e2c6966d21d62969a2148145e74885dc826e3c" }
-mindie-debugger = { git = "https://github.com/mindie-agent/debugger", rev = "33052a2fc10c7475e4b819577870ca822efcebd0" }
-mindie-profiler = { git = "https://github.com/mindie-agent/profiler", rev = "609d555d84857309ac5cb8214da7309f1b783ef0" }
-mindie-sim = { git = "https://github.com/mindie-agent/sim", rev = "9dbab02f10843c7b829d6fda7e7b9ad89e4f92e5" }
-npu-top = { git = "https://github.com/mindie-agent/npu-top", rev = "4341003c6637e2b8b9512c7b076f80f45019e252" }
+mindie-harness = { git = "https://github.com/mindie-agent/harness", rev = "f05569947dbf0131061d8698bb779d024df0c43b" }
+mindie-knowledge = { git = "https://github.com/mindie-agent/knowledge", rev = "8fe8455669e88ef6963314332422653841518900" }
+remote-dev = { git = "https://github.com/mindie-agent/remote-dev", rev = "64c5a8d0ca9fe344e7af05f89fc0de6249f2368a" }
+mindie-diagnostics = { git = "https://github.com/mindie-agent/diagnostics", rev = "54ac7c03c78f9e02f379051d1613a4427559e10d" }
+mindie-coordinator = { git = "https://github.com/mindie-agent/coordinator", rev = "a3c7336faa0bc14ebdb8f2fd75606c82e96422e9" }
+mindie-debugger = { git = "https://github.com/mindie-agent/debugger", rev = "e15c2ed38d8f928db67c5bb1a94269f62207227c" }
+mindie-profiler = { git = "https://github.com/mindie-agent/profiler", rev = "b702893129724b852c5abcb8971724b8b0a6e870" }
+mindie-sim = { git = "https://github.com/mindie-agent/sim", rev = "83fb8288aa998e0a6ad345ca7a16269f0181545b" }
+npu-top = { git = "https://github.com/mindie-agent/npu-top", rev = "72654fe6047df6ccc67746c242b3ce18bcabc945" }
 
 [tool.uv]
 override-dependencies = [
-    "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@c991b64a1ead277b5ce91b7835337b01aed03998",
-    "remote-dev @ git+https://github.com/mindie-agent/remote-dev@c4d38f99c1ef5aace1c088af07647941adc2d394",
-    "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@96c40049e2fc8e53676f557cb8144421efcfe8ed",
-    "mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@33e2c6966d21d62969a2148145e74885dc826e3c",
-    "mindie-debugger @ git+https://github.com/mindie-agent/debugger@33052a2fc10c7475e4b819577870ca822efcebd0",
-    "mindie-profiler @ git+https://github.com/mindie-agent/profiler@609d555d84857309ac5cb8214da7309f1b783ef0",
-    "mindie-sim @ git+https://github.com/mindie-agent/sim@9dbab02f10843c7b829d6fda7e7b9ad89e4f92e5",
-    "npu-top @ git+https://github.com/mindie-agent/npu-top@4341003c6637e2b8b9512c7b076f80f45019e252",
+    "mindie-harness @ git+https://github.com/mindie-agent/harness@f05569947dbf0131061d8698bb779d024df0c43b",
+    "mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@8fe8455669e88ef6963314332422653841518900",
+    "remote-dev @ git+https://github.com/mindie-agent/remote-dev@64c5a8d0ca9fe344e7af05f89fc0de6249f2368a",
+    "mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@54ac7c03c78f9e02f379051d1613a4427559e10d",
+    "mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@a3c7336faa0bc14ebdb8f2fd75606c82e96422e9",
+    "mindie-debugger @ git+https://github.com/mindie-agent/debugger@e15c2ed38d8f928db67c5bb1a94269f62207227c",
+    "mindie-profiler @ git+https://github.com/mindie-agent/profiler@b702893129724b852c5abcb8971724b8b0a6e870",
+    "mindie-sim @ git+https://github.com/mindie-agent/sim@83fb8288aa998e0a6ad345ca7a16269f0181545b",
+    "npu-top @ git+https://github.com/mindie-agent/npu-top@72654fe6047df6ccc67746c242b3ce18bcabc945",
 ]
 
 [tool.pytest.ini_options]
