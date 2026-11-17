@@ -67,7 +67,7 @@ from storage_support import normalize_windows_path as _normalize_windows_path
 from storage_support import note as _note
 from paths import atomic_write_json, config_path, data_home, read_json, state_dir
 
-COMPONENT_BUDGET_SECONDS = 2.5
+COMPONENT_BUDGET_SECONDS = 6.0 if os.name == "nt" else 2.5
 LEGACY_BUDGET_SECONDS = 3.0
 ENGINE_BUDGET_SECONDS = 0.5
 MAINTENANCE_BUDGET_SECONDS = COMPONENT_BUDGET_SECONDS + LEGACY_BUDGET_SECONDS + ENGINE_BUDGET_SECONDS
