@@ -42,14 +42,54 @@ jobs:
         run: |
           node --check index.mjs
           node --check plugins/mindie-agent/paths.mjs
+          node --check plugins/mindie-agent/session_support.mjs
           node --check plugins/mindie-agent/opencode_host.mjs
           uv run --no-sync python plugins/mindie-agent/scripts/release_metadata.py --source . --tests tests --revision "${{ github.sha }}" > "${{ runner.temp }}/mindie-plugin-release.json"
 
+  smoke:
+    name: Out-of-Tree npm Pack & Cold Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Pack tarball and verify out-of-tree JS/Python contracts
+        run: |
+          SMOKE_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$SMOKE_ROOT"' EXIT
+          mkdir -p "$SMOKE_ROOT/home" "$SMOKE_ROOT/cfg" "$SMOKE_ROOT/data" "$SMOKE_ROOT/diag" "$SMOKE_ROOT/unpacked"
+          TGZ="$(npm pack --pack-destination "$SMOKE_ROOT" | tail -n 1)"
+          tar -xzf "$SMOKE_ROOT/$TGZ" -C "$SMOKE_ROOT/unpacked"
+          cd "$SMOKE_ROOT/home"
+          HOME="$SMOKE_ROOT/home" \
+          MINDIE_CONFIG_HOME="$SMOKE_ROOT/cfg" \
+          MINDIE_DATA_HOME="$SMOKE_ROOT/data" \
+          MINDIE_DIAGNOSTICS_ROOT="$SMOKE_ROOT/diag" \
+          node --input-type=module -e "import p from '$SMOKE_ROOT/unpacked/package/index.mjs'; if (typeof p?.setup !== 'function') process.exit(1);"
+          HOME="$SMOKE_ROOT/home" \
+          MINDIE_CONFIG_HOME="$SMOKE_ROOT/cfg" \
+          MINDIE_DATA_HOME="$SMOKE_ROOT/data" \
+          MINDIE_DIAGNOSTICS_ROOT="$SMOKE_ROOT/diag" \
+          python3 -I - "$SMOKE_ROOT/unpacked/package/plugins/mindie-agent" <<'PY'
+          import sys
+          from pathlib import Path
+          plugin_dir = Path(sys.argv[1])
+          sys.path.insert(0, str(plugin_dir / "scripts"))
+          import host_adapter
+          lock = host_adapter.verify_seed_bundle(plugin_dir)
+          assert lock["schema"] == "mindie-harness-seed/1"
+          PY
+
   release-ready:
     name: release-ready
-    needs: [contract]
+    needs: [contract, smoke]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}

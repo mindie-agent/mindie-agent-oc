@@ -80,7 +80,7 @@ export function pidAlive(pid) {
 
 export function readJsonSafe(targetPath) {
     try {
-        const stat = fs.lstatSync(targetPath);
+        const stat = fs.statSync(targetPath);
         if (!stat.isFile() || stat.size > MAX_CONFIG_BYTES) {
             process.stderr.write(`MindIE OpenCode config ignored (non-regular or oversize): ${targetPath}\n`);
             return null;
