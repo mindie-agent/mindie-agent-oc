@@ -49,8 +49,12 @@ def isolated_oc_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
     workspace = tmp_path / "workspace"
     opencode_db = xdg_data / "opencode" / "opencode.db"
 
+    appdata = tmp_path / "appdata" / "Roaming"
+    localappdata = tmp_path / "appdata" / "Local"
     for directory in (
         home,
+        appdata,
+        localappdata,
         mindie_cfg,
         mindie_data,
         mindie_diag,
@@ -66,6 +70,8 @@ def isolated_oc_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
     env_map = {
         "HOME": str(home),
         "USERPROFILE": str(home),
+        "APPDATA": str(appdata),
+        "LOCALAPPDATA": str(localappdata),
         "MINDIE_CONFIG_HOME": str(mindie_cfg),
         "MINDIE_DATA_HOME": str(mindie_data),
         "MINDIE_DIAGNOSTICS_ROOT": str(mindie_diag),

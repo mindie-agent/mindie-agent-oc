@@ -33,6 +33,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 
@@ -44,11 +45,8 @@ from admission import status_facts
 from bounded import run as bounded_run
 from component_update import trigger_background_update_if_due
 from identity import claim_bind, finish_bind, reject_forged_identity_args, require_session
-from mcp_stdio import iter_stdio_messages as _iter_stdio_messages
-from mcp_stdio import write_rpc_frame as _write_rpc_frame
 from oc_native_compat import ensure_oc_native_support
 from paths import bind_db_path, config_path, diagnostics_config_path, plugin_root, read_json, remote_receipts_path, state_dir
-from storage_gc import acquire_service_lease, release_service_lease
 
 ensure_oc_native_support()
 
@@ -229,19 +227,8 @@ class RemoteReceipts:
             db.close()
 
 
-def _with_bind_property(tool: dict) -> dict:
-    """Declare optional `_mindie_bind_id` so OpenCode's post-hook schema decoder preserves exact call correlation."""
-    item = dict(tool)
-    raw_schema = item.get("inputSchema")
-    if isinstance(raw_schema, dict):
-        props = dict(raw_schema.get("properties") or {})
-        props.setdefault("_mindie_bind_id", dict(type="string"))
-        item["inputSchema"] = dict(raw_schema, properties=props)
-    return item
-
-
 def tools_catalog() -> list[dict]:
-    """Return the deterministic `mindie-tools` MCP catalog (zero knowledge tools)."""
+    """Return the deterministic `mindie-tools` MCP catalog (zero knowledge tools, zero bind injection)."""
     limits = {
         "cwd": dict(type="string", description="Optional absolute working directory."),
         "timeout_ms": dict(type="integer", minimum=1, maximum=600000, default=120000, description="Execution deadline in milliseconds; bounded within OpenCode's 660s MCP ceiling."),
@@ -286,14 +273,14 @@ def tools_catalog() -> list[dict]:
             annotations=dict(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         )
     )
-    return [_with_bind_property(item) for item in items]
+    return items
 
 
 def remote_catalog() -> list[dict]:
     """Return the `mindie-remote-dev` canonical MCP catalog."""
     from remote_dev.mcp.tools import list_tools
 
-    return [_with_bind_property(item) for item in list_tools("canonical")]
+    return list(list_tools("canonical"))
 
 
 def _resolve_component_command(component: str, *, config=None) -> list[str]:
@@ -316,6 +303,9 @@ def _resolve_component_command(component: str, *, config=None) -> list[str]:
     return [python_exe, "-I", "-X", "utf8", "-m", module_map[component]]
 
 
+_CONNECTION_SESSION_ID = os.environ.get("MINDIE_MCP_CONNECTION_ID") or f"oc-mcp-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
 def _resolve_session(
     surface: str,
     tool_name: str,
@@ -324,12 +314,23 @@ def _resolve_session(
     bind_id: str | None = None,
     config=None,
 ) -> tuple[str, str | None, str | None]:
-    """Resolve session identity from an `execute.before` bind or `OPENCODE_SESSION_ID`."""
+    """Resolve optional session identity from `execute.before`, `OPENCODE_SESSION_ID`, or connection scope."""
     reject_forged_identity_args(arguments)
     if bind_db_path(config).is_file():
-        bound = claim_bind(surface, tool_name, arguments, bind_id=bind_id, config=config)
-        return bound["session"], bound["bind_id"], bound.get("workspace_root")
-    return require_session(os.environ.get("OPENCODE_SESSION_ID")), None, None
+        try:
+            bound = claim_bind(surface, tool_name, arguments, bind_id=bind_id, config=config)
+            return bound["session"], bound["bind_id"], bound.get("workspace_root")
+        except TimeoutError:
+            raise
+        except ValueError:
+            pass
+    raw_env = os.environ.get("OPENCODE_SESSION_ID")
+    if isinstance(raw_env, str) and raw_env.strip():
+        try:
+            return require_session(raw_env), None, None
+        except ValueError:
+            pass
+    return _CONNECTION_SESSION_ID, None, None
 
 
 def _admission_failure(exc: Exception) -> dict:
@@ -378,9 +379,11 @@ def call_tools_surface(
     *,
     config=None,
     receipts: RemoteReceipts | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict:
     raw_args = dict(arguments or {})
     explicit_bind = raw_args.pop("_mindie_bind_id", None)
+    raw_args.pop("request_nonce", None)
     try:
         session, bind_id, bound_cwd = _resolve_session(
             "tools",
@@ -460,7 +463,7 @@ def call_tools_surface(
             cmd = _resolve_component_command(component, config=config) + list(argv)
             proc = bounded_run(
                 cmd, "", timeout=timeout_ms / 1000.0, max_output=COMPONENT_CAPTURE_LIMIT_BYTES,
-                env=child_env, cwd=run_cwd, strict_output_limit=False,
+                env=child_env, cwd=run_cwd, cancel=cancel, strict_output_limit=False,
             )
             reply_limit = budget * 4
             stdout_bytes = proc.stdout.encode("utf-8", errors="replace")
@@ -535,10 +538,12 @@ def call_remote_surface(
     *,
     config=None,
     receipts: RemoteReceipts | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict:
     os.environ.setdefault("MINDIE_DIAGNOSTICS_CONFIG", str(diagnostics_config_path(config)))
     raw_args = dict(arguments or {})
     explicit_bind = raw_args.pop("_mindie_bind_id", None)
+    raw_args.pop("request_nonce", None)
     try:
         session, bind_id, _bound_cwd = _resolve_session(
             "remote",
@@ -557,7 +562,8 @@ def call_remote_surface(
     receipt_store = receipts or RemoteReceipts(remote_receipts_path(config))
     call_id = str(uuid.uuid4())
     try:
-        remote_root = state_dir(config) / "remote" / session
+        explicit_remote = os.environ.get("REMOTE_DEV_STATE_DIR")
+        remote_root = Path(explicit_remote) if explicit_remote else (state_dir(config) / "remote")
         remote_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         receipt_store.begin(call_id, session, name, exec_args)
     except Exception as exc:
@@ -568,11 +574,15 @@ def call_remote_surface(
     succeeded = False
     outcome = "failed"
     try:
+        from contextlib import nullcontext
+        from remote_dev.core.cancellation import request_context
         from remote_dev.mcp.outcome import operation_outcome
         from remote_dev.mcp.server import tool_text
         from remote_dev.mcp.tools import call_tool
 
-        raw = call_tool(name, exec_args, profile="canonical")
+        ctx_mgr = request_context(cancel) if cancel is not None else nullcontext()
+        with ctx_mgr:
+            raw = call_tool(name, exec_args, profile="canonical")
         outcome = operation_outcome(name, raw)
         is_error = outcome != "succeeded"
         succeeded = not is_error
@@ -635,7 +645,14 @@ def _safe_trigger_background_update(config=None) -> None:
         print(f"MindIE OpenCode background update check warning: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
-def handle_rpc(request: dict, surface: str, *, config=None, receipts: RemoteReceipts | None = None) -> dict | None:
+def handle_rpc(
+    request: dict,
+    surface: str,
+    *,
+    config=None,
+    receipts: RemoteReceipts | None = None,
+    cancel: threading.Event | None = None,
+) -> dict | None:
     if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or not isinstance(request.get("method"), str):
         req_id = request.get("id") if isinstance(request, dict) else None
         return dict(jsonrpc="2.0", id=req_id, error=dict(code=-32600, message="Invalid Request"))
@@ -662,7 +679,7 @@ def handle_rpc(request: dict, surface: str, *, config=None, receipts: RemoteRece
             jsonrpc="2.0", id=req_id,
             result=dict(
                 protocolVersion=params.get("protocolVersion") or "2024-11-05",
-                capabilities=dict(tools=dict(listChanged=False)),
+                capabilities=dict(tools=dict(listChanged=True)),
                 serverInfo=dict(name=f"mindie-oc-{surface}", version=srv_ver),
             ),
         )
@@ -676,9 +693,9 @@ def handle_rpc(request: dict, surface: str, *, config=None, receipts: RemoteRece
         if not isinstance(name, str) or not name:
             return dict(jsonrpc="2.0", id=req_id, error=dict(code=-32602, message="MCP tools/call requires a tool name"))
         outcome = (
-            call_remote_surface(name, arguments, config=config, receipts=receipts)
+            call_remote_surface(name, arguments, config=config, receipts=receipts, cancel=cancel)
             if surface == "remote"
-            else call_tools_surface(name, arguments, config=config, receipts=receipts)
+            else call_tools_surface(name, arguments, config=config, receipts=receipts, cancel=cancel)
         )
         return dict(jsonrpc="2.0", id=req_id, result=outcome)
     return dict(jsonrpc="2.0", id=req_id, error=dict(code=-32601, message=f"Method not found: {method}"))
@@ -690,38 +707,26 @@ MAX_STDIO_FRAME_BYTES = 16 * 1024 * 1024
 def serve(surface: str, *, config=None, stdin=None, stdout=None) -> int:
     if surface not in {"remote", "tools"}:
         raise ValueError(f"unsupported MCP surface: {surface}")
-    in_stream = sys.stdin.buffer if stdin is None else stdin
-    out_stream = sys.stdout.buffer if stdout is None else stdout
+    from host_adapter import hold_combined_service_lease, serve_concurrent_stdio
+
     receipts = RemoteReceipts(remote_receipts_path(config))
-    # A resident MCP process keeps the shared runtime lease of the disposable
-    # generation owning its interpreter, so a concurrent sweep never retires it.
-    lease = acquire_service_lease()
-    try:
-        for framed, req in _iter_stdio_messages(in_stream, max_frame_bytes=MAX_STDIO_FRAME_BYTES):
-            if isinstance(req, dict) and "__parse_error__" in req:
-                _write_rpc_frame(
-                    out_stream,
-                    dict(jsonrpc="2.0", id=None, error=dict(code=-32700, message=str(req["__parse_error__"]))),
-                    framed=framed,
-                )
-                continue
-            resp = handle_rpc(req, surface, config=config, receipts=receipts)
-            if resp is not None:
-                _write_rpc_frame(out_stream, resp, framed=framed)
-    except BrokenPipeError:
-        try:
-            sys.stdout.close()
-        except Exception:
-            pass
-        return 0
-    finally:
-        release_service_lease(lease)
-    return 0
+    with hold_combined_service_lease():
+        return serve_concurrent_stdio(
+            surface=surface,
+            rpc_handler=lambda req, cancel_ev: handle_rpc(
+                req, surface, config=config, receipts=receipts, cancel=cancel_ev
+            ),
+            watched_files=(config_path(config),),
+            stdin=stdin,
+            stdout=stdout,
+            max_frame_bytes=MAX_STDIO_FRAME_BYTES,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    surface = argv[0] if argv else "tools"
+    positional = [arg for arg in argv if arg != "--once"]
+    surface = positional[0] if positional else "tools"
     return serve(surface)
 
 

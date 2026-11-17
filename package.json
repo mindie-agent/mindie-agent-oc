@@ -19,7 +19,9 @@
     "harness-compatibility.json",
     "README.md",
     "README.en.md",
-    "LICENSE"
+    "LICENSE",
+    "!**/__pycache__/**",
+    "!**/*.pyc"
   ],
   "keywords": [
     "mindie",

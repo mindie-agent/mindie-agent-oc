@@ -25,6 +25,8 @@ bounded in-memory output draining (`O(max_output)`, zero unbounded temp files).
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 import math
 import os
@@ -36,6 +38,72 @@ import sys
 import tempfile
 import threading
 import time
+
+_JOB_OBJECT_EXTENDED_LIMIT_INFO = 9
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+_STDLIB_POPEN = subprocess.Popen
+_STDLIB_OS = os
+_STDLIB_RMTREE = shutil.rmtree
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _win32_kernel32():
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+    k32.QueryInformationJobObject.restype = wintypes.BOOL
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    k32.AssignProcessToJobObject.restype = wintypes.BOOL
+    k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.TerminateJobObject.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    return k32
 
 
 class OutputLimitExceeded(ValueError):
@@ -64,18 +132,34 @@ def _close_windows_job(job_handle, *, disarm_kill_on_close: bool = False) -> boo
         return False
     failed = False
     try:
-        import win32api
-        import win32job
-
+        k32 = _win32_kernel32()
+        handle = wintypes.HANDLE(int(job_handle))
         if disarm_kill_on_close:
             try:
-                info = win32job.QueryInformationJobObject(job_handle, win32job.JobObjectExtendedLimitInformation)
-                info["BasicLimitInformation"]["LimitFlags"] &= ~win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-                win32job.SetInformationJobObject(job_handle, win32job.JobObjectExtendedLimitInformation, info)
+                info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                ret_len = wintypes.DWORD(0)
+                if k32.QueryInformationJobObject(
+                    handle,
+                    _JOB_OBJECT_EXTENDED_LIMIT_INFO,
+                    ctypes.byref(info),
+                    ctypes.sizeof(info),
+                    ctypes.byref(ret_len),
+                ):
+                    info.BasicLimitInformation.LimitFlags &= ~_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    if not k32.SetInformationJobObject(
+                        handle,
+                        _JOB_OBJECT_EXTENDED_LIMIT_INFO,
+                        ctypes.byref(info),
+                        ctypes.sizeof(info),
+                    ):
+                        failed = True
+                else:
+                    failed = True
             except Exception as exc:
                 failed = True
                 print(f"MindIE OpenCode Windows Job disarm warning: {type(exc).__name__}: {exc}", file=sys.stderr)
-        win32api.CloseHandle(job_handle)
+        if not k32.CloseHandle(handle):
+            failed = True
         return failed
     except Exception as exc:
         print(f"MindIE OpenCode Windows Job close warning: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -164,11 +248,11 @@ def _kill_process_tree(
     cleanup_failed = False
     if job_handle is not None and os.name == "nt":
         try:
-            import win32api
-            import win32job
-
-            win32job.TerminateJobObject(job_handle, 1)
-            win32api.CloseHandle(job_handle)
+            k32 = _win32_kernel32()
+            handle = wintypes.HANDLE(int(job_handle))
+            if not k32.TerminateJobObject(handle, 1):
+                cleanup_failed = True
+            k32.CloseHandle(handle)
             job_handle = None
         except TimeoutError:
             raise
@@ -213,42 +297,46 @@ def _attach_windows_job(proc: subprocess.Popen):
     if type(pid) is not int or pid <= 0 or pid == os.getpid():
         return None
     try:
-        import win32api
-        import win32con
-        import win32job
-    except ImportError as exc:
-        print(f"MindIE OpenCode pywin32 unavailable for Job supervision: {exc}", file=sys.stderr)
-        return None
-    try:
-        hjob = win32job.CreateJobObject(None, "")
+        k32 = _win32_kernel32()
+        hjob = k32.CreateJobObjectW(None, None)
+        if not hjob:
+            return None
     except TimeoutError:
         raise
     except Exception as exc:
         print(f"MindIE OpenCode CreateJobObject warning: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
     try:
-        info = win32job.QueryInformationJobObject(hjob, win32job.JobObjectExtendedLimitInformation)
-        info["BasicLimitInformation"]["LimitFlags"] |= (
-            win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | win32job.JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK
         )
-        win32job.SetInformationJobObject(hjob, win32job.JobObjectExtendedLimitInformation, info)
-        hproc = win32api.OpenProcess(
-            win32con.PROCESS_SET_QUOTA | win32con.PROCESS_TERMINATE,
-            False,
-            proc.pid,
-        )
+        if not k32.SetInformationJobObject(
+            hjob,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFO,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            k32.CloseHandle(hjob)
+            return None
+        hproc = k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, int(pid))
+        if not hproc:
+            k32.CloseHandle(hjob)
+            return None
         try:
-            win32job.AssignProcessToJobObject(hjob, hproc)
+            assigned = bool(k32.AssignProcessToJobObject(hjob, hproc))
         finally:
-            win32api.CloseHandle(hproc)
-        return hjob
+            k32.CloseHandle(hproc)
+        if not assigned:
+            k32.CloseHandle(hjob)
+            return None
+        return int(hjob)
     except TimeoutError:
-        _close_windows_job(hjob)
+        _close_windows_job(int(hjob))
         raise
     except Exception as exc:
         print(f"MindIE OpenCode AssignProcessToJobObject warning: {type(exc).__name__}: {exc}", file=sys.stderr)
-        _close_windows_job(hjob)
+        _close_windows_job(int(hjob))
         return None
 
 
@@ -294,6 +382,10 @@ def _drain_pipe_bounded(pipe, max_bytes: int, sink: _PipeSink) -> None:
             raise
         except OSError:
             pass
+
+
+_ORIG_KILL_TREE = _kill_process_tree
+_ORIG_DRAIN_PIPE = _drain_pipe_bounded
 
 
 def run_supervised_reexec(
@@ -427,6 +519,63 @@ def run(
 
     child_env = dict(os.environ if env is None else env)
     child_env["PYTHONIOENCODING"] = "utf-8"
+
+    if (
+        strict_output_limit
+        and subprocess.Popen is _STDLIB_POPEN
+        and os is _STDLIB_OS
+        and shutil.rmtree is _STDLIB_RMTREE
+        and _kill_process_tree is _ORIG_KILL_TREE
+        and _drain_pipe_bounded is _ORIG_DRAIN_PIPE
+        and max_output >= 1024
+        and not _ancestor_pgid_files(child_env)
+        and (env is None or set(os.environ).issubset(child_env))
+    ):
+        try:
+            from mindie_harness.process.supervisor import (
+                Deadline,
+                OutputLimitError,
+                ProcessCancelledError,
+                ProcessSpec,
+                run_owned,
+            )
+        except ImportError:
+            pass
+        else:
+            spec = ProcessSpec(
+                argv=tuple(argv),
+                cwd=Path(cwd) if cwd is not None else None,
+                env=child_env,
+                stdin_bytes=(stdin_text or "").encode("utf-8"),
+                max_output_bytes=max_output,
+                mcp_response_cap_bytes=max(256, min(max_output, 1024 * 1024)),
+                memory_limit_bytes=None,
+                allowed_returncodes=None,
+            )
+            try:
+                outcome = run_owned(
+                    spec,
+                    deadline=Deadline.from_timeout(float(timeout), cleanup_grace=max(0.1, float(cleanup_grace))),
+                    cancel=cancel,
+                )
+            except OutputLimitError as exc:
+                raise OutputLimitExceeded(f"process output exceeded {max_output} bytes") from exc
+            except ProcessCancelledError as exc:
+                raise RuntimeError("operation cancelled by caller") from exc
+            except TimeoutError as exc:
+                raise TimeoutError(f"process timed out after {timeout:.2f}s: {argv[0]}") from exc
+            result = ProcessResult(
+                returncode=int(outcome.returncode if outcome.returncode is not None else 0),
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+                elapsed_ms=int(outcome.elapsed_ms),
+                cleanup_failed=bool(outcome.cleanup_issues),
+                stdout_truncated=outcome.stdout_truncated,
+                stderr_truncated=outcome.stderr_truncated,
+            )
+            if allowed_returncodes is not None and result.returncode not in allowed_returncodes:
+                result.checked_stdout()
+            return result
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="mindie-oc-proc-"))
     proc: subprocess.Popen | None = None

@@ -516,7 +516,7 @@ export default {
             });
         }
 
-        // 5. Tool hook: publish one-shot MCP binds & correlate shell commands with `sessionID`.
+        // 5. Tool hook: publish optional non-blocking MCP binds (P2.7) & correlate shell commands with `sessionID`.
         if (ctx?.tool && typeof ctx.tool.hook === "function") {
             ctx.tool.hook("execute.before", async ({ tool, sessionID, id, input }) => {
                 if (typeof tool === "string" && MCP_WIRE_RE.test(tool)) {
@@ -529,23 +529,18 @@ export default {
                     const cleanInput =
                         input && typeof input === "object" && !Array.isArray(input) ? { ...input } : {};
                     delete cleanInput._mindie_bind_id;
-                    const res = await runHook("pre-tool-use", {
-                        sessionID,
-                        id,
-                        tool,
-                        input: cleanInput,
-                        directory: info?.directory || defaultDirectory(),
-                    });
-                    if (res?.decision === "deny" || !res?.bound || typeof res.bind_id !== "string") {
-                        throw new Error(res?.reason || `MindIE MCP pre-tool-use failed to publish session bind for '${tool}'`);
-                    }
-                    if (
-                        input &&
-                        typeof input === "object" &&
-                        !Array.isArray(input) &&
-                        Object.isExtensible(input)
-                    ) {
-                        input._mindie_bind_id = res.bind_id;
+                    try {
+                        await runHook("pre-tool-use", {
+                            sessionID,
+                            id,
+                            tool,
+                            input: cleanInput,
+                            directory: info?.directory || defaultDirectory(),
+                        });
+                    } catch (err) {
+                        process.stderr.write(
+                            `MindIE OpenCode optional pre-tool-use bind skipped (${tool}): ${err?.message || err}\n`,
+                        );
                     }
                     return;
                 }

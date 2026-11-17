@@ -408,14 +408,13 @@ shellHooks.get("create.before")(shellA);
 assert.equal(shellA.env.OPENCODE_SESSION_ID, "ses_alpha01");
 assert.equal(shellA.command, "zsh -lc 'python knowledge_cli.py describe'");
 
-// 2. Concurrent MCP tool `execute.before` injects distinct `_mindie_bind_id` on same-arg inputs.
+// 2. Concurrent MCP tool `execute.before` is non-blocking and keeps deterministic inputs clean (`P2.7`).
 const mcpInA = {{ argv: ["status"] }};
 const mcpInB = {{ argv: ["status"] }};
 await toolHooks.get("execute.before")({{ tool: "mindie-tools_mindie_status", sessionID: "ses_alpha01", id: "m1", input: mcpInA }});
 await toolHooks.get("execute.before")({{ tool: "mindie-tools_mindie_status", sessionID: "ses_bravo02", id: "m2", input: mcpInB }});
-assert.equal(typeof mcpInA._mindie_bind_id, "string");
-assert.equal(typeof mcpInB._mindie_bind_id, "string");
-assert.notEqual(mcpInA._mindie_bind_id, mcpInB._mindie_bind_id);
+assert.equal("_mindie_bind_id" in mcpInA, false);
+assert.equal("_mindie_bind_id" in mcpInB, false);
 
 await streamDone;
 await cleanup();
@@ -780,12 +779,12 @@ def test_recheck_cold_stdlib_schema_bind_older_source_streaming_and_1mb_head(
     assert admission.flush_pending_cold_activations() == 1
     assert admission.knowledge_lease("ses_stdlib_cold")["project_root"] == str(Path(ws).resolve())
 
-    # 2. All 34 MCP schemas declare optional `_mindie_bind_id` (including closed `mindie_status`) so OpenCode never strips/rejects it.
+    # 2. All 34 deterministic MCP schemas stay clean without `_mindie_bind_id` (`P2.7` / `AD-01` fixed).
     all_tools = mcp_server.tools_catalog() + mcp_server.remote_catalog()
     assert len(all_tools) == 34
     for tool in all_tools:
-        props = tool["inputSchema"]["properties"]
-        assert props.get("_mindie_bind_id") == {"type": "string"}
+        props = tool["inputSchema"].get("properties") or {}
+        assert "_mindie_bind_id" not in props
         assert "_mindie_bind_id" not in (tool["inputSchema"].get("required") or [])
 
     # 3. `component_update.check(source=<older_0.1.0>)` never downgrades active `0.1.1` payload when a component updates.
