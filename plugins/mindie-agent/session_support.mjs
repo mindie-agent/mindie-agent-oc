@@ -3,7 +3,7 @@
  * [Invariants]
  * - `admissionMtimeSignature` only reads `admission.sqlite3` metadata and the per-session pending-activation file; it never opens or mutates the database.
  * - `safeGetSession` never throws: a missing or failing `ctx.session.get` degrades to `null` with one stderr warning.
- * - `renderSkillSystemBlock` embeds only the host-verified interpreter and MindIE-owned CLI paths; it never injects model-supplied text.
+ * - `renderSkillSystemBlock` strips YAML frontmatter from `SKILL.md` and embeds only the host-verified interpreter and MindIE-owned CLI paths; it never injects model-supplied text.
  * - `parseModelSpec` accepts only `provider/id[#variant]` and returns `undefined` for anything else (zero side effects).
  * [Timeouts & Locks] Pure `statSync`/`readFileSync` reads plus one awaited host call; no timer, lock, or subprocess.
  * [Side-Effect Policy] Read-only against the host: writes nothing, spawns nothing, and only emits a stderr diagnostic line on failure.
@@ -69,11 +69,16 @@ export async function safeGetSession(ctx, sessionID) {
     }
 }
 
+export function stripSkillFrontmatter(markdown) {
+    if (typeof markdown !== "string") return "";
+    return markdown.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "");
+}
+
 export function renderSkillSystemBlock(sessionID, state) {
     const py = resolveBootstrapPython();
     let skillBody = "";
     if (typeof state.skill_path === "string" && fs.existsSync(state.skill_path)) {
-        skillBody = fs.readFileSync(state.skill_path, "utf8");
+        skillBody = stripSkillFrontmatter(fs.readFileSync(state.skill_path, "utf8"));
     }
     return [
         `<mindie-agent-skill session="${sessionID}">`,

@@ -1,7 +1,7 @@
 # Development workspace setup (OpenCode)
 
 Run this flow during interactive installation and first-use setup, immediately after
-presenting the MindIE Agent user notice. Reuse saved creation, initialization and
+presenting the [MindIE Agent user notice](user-notice.md). Reuse saved creation, initialization and
 sharing decisions; ordinary tasks, headless `--auto` runs, and updates do not repeat
 onboarding.
 
