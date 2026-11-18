@@ -51,11 +51,12 @@
       ],
       "code_paths": [
         "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/.mcp.json",
         "plugins/mindie-agent/scripts/mcp_server.py:serve"
       ],
       "test_ids": [
-        "tests/test_oc_mcp_and_knowledge.py::test_public_mcp_exposes_default_on_knowledge_and_remote_surfaces",
-        "tests/test_oc_mcp_and_knowledge.py::test_receipt_honesty_preserves_succeeded_remote_result_on_local_sqlite_error"
+        "tests/test_oc_mcp_and_knowledge.py::test_remote_and_tools_surfaces_expose_default_tools",
+        "tests/test_oc_mcp_and_knowledge.py::test_knowledge_fallback_receipt_honesty"
       ],
       "evidence_refs": [
         "AGENTS.md"
@@ -71,8 +72,7 @@
         }
       ],
       "code_paths": [
-        "plugins/mindie-agent/opencode_host.mjs",
-        "plugins/mindie-agent/session_support.mjs"
+        "plugins/mindie-agent/opencode_host.mjs"
       ],
       "test_ids": [
         "tests/test_oc_plugin.py::test_host_session_isolation_and_context_injection"
@@ -91,11 +91,10 @@
         }
       ],
       "code_paths": [
-        "plugins/mindie-agent/opencode_host.mjs",
-        "plugins/mindie-agent/scripts/bridge.py:handle_pre_tool_use"
+        "plugins/mindie-agent/opencode_host.mjs"
       ],
       "test_ids": [
-        "tests/test_oc_lifecycle.py::test_pre_tool_use_binds_mcp_call_and_rejects_replay"
+        "tests/test_oc_plugin.py::test_host_session_isolation_and_context_injection"
       ],
       "evidence_refs": [
         "AGENTS.md"
@@ -131,11 +130,11 @@
       ],
       "code_paths": [
         "plugins/mindie-agent/opencode_host.mjs",
-        "plugins/mindie-agent/scripts/capture_stop.py:main"
+        "plugins/mindie-agent/scripts/mindie_launch.py:main"
       ],
       "test_ids": [
-        "tests/test_oc_lifecycle.py::test_stop_checks_consent_before_sqlite_and_auto_leases_when_enabled",
-        "tests/test_oc_audit_regressions.py::test_concurrent_same_args_mcp_binds_and_shell_commands_never_cross_bind"
+        "tests/test_oc_lifecycle.py::test_stop_consent_gate_and_capture_boundary",
+        "tests/test_oc_lifecycle.py::test_admission_revocation_and_idle_deduplication"
       ],
       "evidence_refs": [
         "AGENTS.md"
@@ -151,12 +150,12 @@
         }
       ],
       "code_paths": [
-        "plugins/mindie-agent/scripts/opencode_spool.py:sync_session_spool",
+        "plugins/mindie-agent/scripts/opencode_transcript.py:sync_session_spool",
         "plugins/mindie-agent/scripts/opencode_transcript.py:read_material"
       ],
       "test_ids": [
-        "tests/test_oc_transcript_and_organizer.py::test_sqlite_v2_spool_and_public_transcript_filtering",
-        "tests/test_oc_audit_regressions.py::test_real_transcript_capture_ingest_and_oversize_messages"
+        "tests/test_oc_transcript.py::test_sqlite_v2_spool_and_public_transcript_filtering",
+        "tests/test_oc_transcript.py::test_spool_torn_tail_cold_cap_and_release_benchmark"
       ],
       "evidence_refs": [
         "AGENTS.md"
@@ -173,10 +172,10 @@
       ],
       "code_paths": [
         "plugins/mindie-agent/opencode_host.mjs",
-        "plugins/mindie-agent/scripts/organizer.py:execute_request"
+        "plugins/mindie-agent/scripts/mindie_launch.py:main"
       ],
       "test_ids": [
-        "tests/test_oc_transcript_and_organizer.py::test_organizer_loopback_and_outcome_unknown_no_retry"
+        "tests/test_oc_plugin.py::test_host_session_isolation_and_context_injection"
       ],
       "evidence_refs": [
         "AGENTS.md"

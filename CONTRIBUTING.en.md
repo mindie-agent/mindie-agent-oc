@@ -32,6 +32,6 @@ Before opening or updating a PR, complete the `host-plugin` checklist (`HOST-NAT
 ```bash
 python3 .github/scripts/check_lf_eol.py
 python3 .github/scripts/check_pr_checklist.py --profile host-plugin --body-file <pr_body.md>
-node --check index.mjs && node --check plugins/mindie-agent/paths.mjs && node --check plugins/mindie-agent/opencode_host.mjs
+node --check index.mjs && node --check plugins/mindie-agent/opencode_host.mjs
 pytest -q -m "not live_npu and not live_opencode"
 ```
