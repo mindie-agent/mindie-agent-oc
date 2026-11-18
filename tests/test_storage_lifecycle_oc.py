@@ -436,7 +436,7 @@ def test_native_candidate_builds_exactly_one_component_runtime(
     cfg = config_path()
     setup.ensure_default_profile(config=cfg, python_exe=py, prepare_store=False)
     active_python = read_json(cfg)["python"]
-    candidate = _stage_candidate(storage_env["root"] / "candidate-0.1.9", version="0.1.9")
+    candidate = _stage_candidate(storage_env["root"] / "candidate-0.1.98", version="0.1.98")
 
     builds: list[tuple[str, str]] = []
 
@@ -479,7 +479,7 @@ def test_native_candidate_builds_exactly_one_component_runtime(
     healed = str(storage_env["root"] / "baseline-venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
     monkeypatch.setattr(component_update, "prepare", _none_then_artifact)
     monkeypatch.setattr(setup, "ensure_runtime_python", lambda **_kw: healed)
-    candidate_v2 = _stage_candidate(storage_env["root"] / "candidate-0.1.10", version="0.1.10")
+    candidate_v2 = _stage_candidate(storage_env["root"] / "candidate-0.1.99", version="0.1.99")
 
     promoted = component_update.check(config=cfg, source=candidate_v2)
 

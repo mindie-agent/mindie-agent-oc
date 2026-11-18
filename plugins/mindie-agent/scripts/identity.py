@@ -1,10 +1,9 @@
-"""OpenCode (`oc`) native session/gesture validator and one-shot MCP bind store.
+"""OpenCode (`oc`) native session validator and one-shot MCP bind store.
 
 [Role]
-Validates OpenCode v2 session identifiers (`ses_...` and UUIDs), parses
-`/mindie-agent` and `$mindie-agent` manual activation gestures, maps OpenCode
+Validates OpenCode v2 session identifiers (`ses_...` and UUIDs), maps OpenCode
 wire MCP tool names (`mindie-remote-dev_*`, `mindie-tools_*`) to MindIE surfaces,
-and manages one-shot SQLite WAL binds connecting `tool.hook("execute.before")`
+and manages optional one-shot SQLite WAL binds connecting `tool.hook("execute.before")`
 to `mcp_server.py`.
 
 [Invariants]

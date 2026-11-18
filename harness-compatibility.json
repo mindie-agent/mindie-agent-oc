@@ -12,8 +12,6 @@
   "used_interfaces": [
     "plugin.v2-setup",
     "mcp.transform-local",
-    "command.transform",
-    "session.hook.prompt",
     "session.hook.context",
     "tool.hook.execute-before",
     "shell.hook.create-before",
@@ -56,48 +54,8 @@
         "plugins/mindie-agent/scripts/mcp_server.py:serve"
       ],
       "test_ids": [
-        "tests/test_oc_mcp_and_knowledge.py::test_public_mcp_excludes_knowledge_even_when_session_is_active",
+        "tests/test_oc_mcp_and_knowledge.py::test_public_mcp_exposes_default_on_knowledge_and_remote_surfaces",
         "tests/test_oc_mcp_and_knowledge.py::test_receipt_honesty_preserves_succeeded_remote_result_on_local_sqlite_error"
-      ],
-      "evidence_refs": [
-        "AGENTS.md"
-      ]
-    },
-    "command.transform": {
-      "supported": [
-        {
-          "minimum": "2.2.0",
-          "maximum": "2.99.99",
-          "maximum_inclusive": true,
-          "include_prerelease": true
-        }
-      ],
-      "code_paths": [
-        "plugins/mindie-agent/opencode_host.mjs",
-        "plugins/mindie-agent/scripts/bridge.py:handle_gesture"
-      ],
-      "test_ids": [
-        "tests/test_oc_lifecycle.py::test_explicit_mindie_agent_gesture_activates_and_deactivates_lease"
-      ],
-      "evidence_refs": [
-        "AGENTS.md"
-      ]
-    },
-    "session.hook.prompt": {
-      "supported": [
-        {
-          "minimum": "2.2.0",
-          "maximum": "2.99.99",
-          "maximum_inclusive": true,
-          "include_prerelease": true
-        }
-      ],
-      "code_paths": [
-        "plugins/mindie-agent/opencode_host.mjs",
-        "plugins/mindie-agent/scripts/bridge.py:handle_gesture"
-      ],
-      "test_ids": [
-        "tests/test_oc_lifecycle.py::test_passive_ordinary_prompt_and_subagent_non_inheritance"
       ],
       "evidence_refs": [
         "AGENTS.md"
@@ -113,7 +71,8 @@
         }
       ],
       "code_paths": [
-        "plugins/mindie-agent/opencode_host.mjs"
+        "plugins/mindie-agent/opencode_host.mjs",
+        "plugins/mindie-agent/session_support.mjs"
       ],
       "test_ids": [
         "tests/test_oc_plugin.py::test_host_session_isolation_and_context_injection"
@@ -175,7 +134,7 @@
         "plugins/mindie-agent/scripts/capture_stop.py:main"
       ],
       "test_ids": [
-        "tests/test_oc_lifecycle.py::test_stop_requires_manual_lease_and_spools_public_transcript",
+        "tests/test_oc_lifecycle.py::test_stop_checks_consent_before_sqlite_and_auto_leases_when_enabled",
         "tests/test_oc_audit_regressions.py::test_concurrent_same_args_mcp_binds_and_shell_commands_never_cross_bind"
       ],
       "evidence_refs": [

@@ -183,7 +183,7 @@ def test_paired_generation_continuity_across_plugin_overwrite_and_failed_cutover
         timeout=10.0,
     )
     assert hook_proc.returncode == 0
-    assert json.loads(hook_proc.stdout)["activated"] is False
+    assert json.loads(hook_proc.stdout)["activated"] is True
     assert read_json(cfg)["product_validation"]["native_version"] == "0.1.0"
 
     # Simulate a broken 0.1.1 runtime candidate preparation. A healthy active interpreter is
@@ -407,7 +407,7 @@ def test_remote_continuity_input_repair_auth_redaction_uncertain_receipt_and_cor
 def test_release_metadata_validates_interface_registry_and_ast_tests() -> None:
     checked = release_metadata.check_registry(REPO_ROOT, REPO_ROOT / "tests")
     assert checked["harness"] == "opencode"
-    assert len(checked["used_interfaces"]) == 10
+    assert len(checked["used_interfaces"]) == 8
     payload = release_metadata.metadata(REPO_ROOT, "a" * 40)
     expected_version = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))["version"]
     assert payload["schema"] == "mindie-plugin-release/1"

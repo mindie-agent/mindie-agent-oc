@@ -1,7 +1,7 @@
 # GitHub sign-in during setup
 
 Use this flow for installation, first-use configuration or an authentication
-failure. Keep the user in the existing `/mindie-agent` conversation; ordinary
+failure. Keep the user in the existing conversation; ordinary
 tasks do not need another login check or choice.
 
 1. Install `gh` if missing. Run

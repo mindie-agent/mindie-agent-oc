@@ -119,7 +119,7 @@ def test_cutover_defers_under_profile_schema_lock_contention(
     for rel, key in (("package.json", "version"), ("plugins/mindie-agent/plugin.json", "version"), ("product-contract.json", "native_version")):
         p = v2_dir / rel
         d = json.loads(p.read_text(encoding="utf-8"))
-        d[key] = "0.1.9"
+        d[key] = "0.1.99"
         p.write_text(json.dumps(d) + "\n", encoding="utf-8")
 
     expected_ver = read_json(REPO_ROOT / "product-contract.json")["native_version"]

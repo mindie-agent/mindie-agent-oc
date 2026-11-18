@@ -724,13 +724,12 @@ await dispose();
 fs.renameSync(cfgBak, cfgFile);
 process.env.MINDIE_OC_PYTHON = {json.dumps(py)};
 dispose = await hostMod.setup(ctx);
+process.env.MINDIE_OC_PYTHON = "/nonexistent-mindie-python-enoent";
 const sysArr = [];
 await hooks.session.context({{ sessionID: "ses_inactive_ordinary", system: sysArr }});
-assert.equal(sysArr.length, 0);
-const promptObj = {{ text: "/mindie-agent optimize decode kernel" }};
-await hooks.session.prompt({{ sessionID: "ses_inactive_ordinary", prompt: promptObj }});
-assert.match(promptObj.text, /optimize decode kernel/);
-assert.match(promptObj.text, /MindIE Unavailable/);
+assert.equal(sysArr.length, 1);
+assert.equal(hooks.session.prompt, undefined);
+await hooks.tool["execute.before"]({{ tool: "mindie-tools_mindie_status", sessionID: "x", id: "b1", input: {{}} }});
 await dispose();
 console.log("CONTINUITY_OK");
 """
@@ -740,7 +739,7 @@ console.log("CONTINUITY_OK");
     )
     shutil.rmtree(status_dir_blocker, ignore_errors=True)
     assert probe.returncode == 0, probe.stderr
-    assert "CONTINUITY_OK" in probe.stdout and "unavailable" in probe.stderr.lower()
+    assert "CONTINUITY_OK" in probe.stdout and "optional pre-tool-use bind skipped" in probe.stderr.lower()
     adm_db.unlink(missing_ok=True)
 
     # 3. Post-completion cleanup TimeoutError preserves delayed pipe output; timeout cleanup runs once.

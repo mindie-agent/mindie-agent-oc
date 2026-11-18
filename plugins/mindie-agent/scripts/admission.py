@@ -1,13 +1,15 @@
 """Session lease admission and factual control-plane status for OpenCode (`oc`).
 
 [Role]
-Wraps `mindie_knowledge.loop.activation.Admission` for manual-entry session
-lease management (`activate`, `deactivate`, `knowledge_lease`, `status_facts`).
+Wraps `mindie_knowledge.loop.activation.Admission` for on-demand session lease
+provisioning (`ensure_default_lease`, `activate`, `deactivate`, `knowledge_lease`,
+`is_deactivated`, `status_facts`).
 
 [Invariants]
-- `knowledge_lease(session)` is strictly read-only: it never creates the SQLite
-  file or activates a session, and returns a lease only when `enabled == 1` and
-  `entry_enabled == 1`.
+- `knowledge_lease(session)` and `is_deactivated(session)` are strictly read-only:
+  they never create the SQLite file or mutate session state.
+- `ensure_default_lease(session, ...)` provisions a default lease (`not_before=0.0`)
+  on demand when `knowledge_*` or authorized `session.idle` capture executes.
 - `status_facts(session)` returns factual control-plane status with
   `harness="opencode"` and without onboarding prompts or implicit service
   activation.
@@ -16,8 +18,8 @@ lease management (`activate`, `deactivate`, `knowledge_lease`, `status_facts`).
 - Uses `Admission`'s WAL + `5.0s` SQLite busy timeout.
 
 [Side-Effect Policy]
-- `activate` and `deactivate` mutate `admission_path`; `knowledge_lease` and
-  `status_facts` are side-effect free.
+- `ensure_default_lease`, `activate`, and `deactivate` mutate `admission_path`;
+  `knowledge_lease`, `is_deactivated`, and `status_facts` are side-effect free.
 """
 
 from __future__ import annotations
@@ -176,7 +178,7 @@ def flush_pending_cold_activations(
                     raw_at = item.get("activated_at")
                     not_before = (
                         float(raw_at)
-                        if isinstance(raw_at, (int, float)) and math.isfinite(float(raw_at)) and float(raw_at) > 0
+                        if isinstance(raw_at, (int, float)) and math.isfinite(float(raw_at)) and float(raw_at) >= 0
                         else None
                     )
                     adm._write_committed = False
@@ -247,6 +249,107 @@ def knowledge_lease(session: str, *, config: str | Path | None = None) -> dict |
         if lease is not None:
             return lease
     return _read_pending_lease(session, config)
+
+
+def is_deactivated(session: str, *, config: str | Path | None = None) -> bool:
+    session = require_session(session)
+    pfile = _pending_file(session, config)
+    if pfile.is_file():
+        try:
+            pdata = read_json(pfile)
+            if isinstance(pdata, dict) and pdata.get("session") == session and int(pdata.get("enabled", 1)) == 0:
+                return True
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
+            pass
+    path = admission_path(config)
+    if not path.is_file() or not _has_mindie_knowledge():
+        return False
+    return gate(config).inspect(session).get("status") == "inactive"
+
+
+def ensure_default_lease(
+    session: str,
+    project_root: str | Path | None = None,
+    *,
+    not_before: float = 0.0,
+    config: str | Path | None = None,
+    timeout: float = 6.0,
+) -> dict:
+    if timeout <= 0:
+        raise TimeoutError("session lease timeout must be positive")
+    deadline = time.monotonic() + float(timeout)
+    session = require_session(session)
+    if is_deactivated(session, config=config):
+        raise ValueError("knowledge session has been explicitly deactivated")
+    existing = knowledge_lease(session, config=config)
+    raw_root = (
+        str(Path(project_root).resolve())
+        if project_root is not None
+        else (str(existing["project_root"]) if existing and existing.get("project_root") else str(Path.cwd().resolve()))
+    )
+    if not os.path.isabs(raw_root):
+        raise ValueError("project_root must be an absolute path")
+    is_committed_sqlite = bool(existing and existing.get("capture_schema") is True)
+    if existing is not None and isinstance(existing.get("project_root"), str):
+        if Path(existing["project_root"]).resolve() == Path(raw_root).resolve():
+            if is_committed_sqlite or not _has_mindie_knowledge():
+                return existing
+    effective_not_before = (
+        float(existing["activated_at"])
+        if (
+            existing is not None
+            and not is_committed_sqlite
+            and isinstance(existing.get("activated_at"), (int, float))
+            and math.isfinite(float(existing["activated_at"]))
+            and float(existing["activated_at"]) >= 0
+        )
+        else float(not_before)
+    )
+    rem_init = deadline - time.monotonic()
+    if rem_init <= 0:
+        raise TimeoutError("session lease provisioning exceeded its budget")
+    if not _has_mindie_knowledge():
+        lock_budget = min(2.0, rem_init)
+        with _pending_lock(config, timeout=lock_budget):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("session lease provisioning exceeded its budget")
+            tok = secrets.token_hex(16)
+            pfile = _pending_file(session, config)
+            pfile.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lease_doc = dict(
+                session=session,
+                token=tok,
+                enabled=1,
+                entry_enabled=1,
+                failures=0,
+                project_root=raw_root,
+                root_session=session,
+                activated_at=float(not_before),
+            )
+            atomic_write_json(pfile, lease_doc)
+            try:
+                os.chmod(pfile, 0o600)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+            return lease_doc
+    lock_budget = min(2.0, rem_init - 5.05) if rem_init > 5.2 else min(2.0, rem_init)
+    if lock_budget <= 0:
+        raise TimeoutError("timed out before acquiring pending admission lock")
+    with _pending_lock(config, timeout=lock_budget):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("session lease provisioning exceeded its budget")
+        adm = gate(config)
+        adm._deadline = deadline
+        adm.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lease = adm.activate(session, project_root=raw_root, root_session=session, not_before=effective_not_before)
+        if not getattr(adm, "_write_committed", False) and time.monotonic() >= deadline:
+            raise TimeoutError("session lease provisioning exceeded its budget")
+        _pending_file(session, config).unlink(missing_ok=True)
+        return lease
 
 
 def activate(
@@ -402,12 +505,19 @@ def deactivate(session: str, *, config: str | Path | None = None, timeout: float
                     timeout=rem,
                 )
         path = admission_path(config)
-        if not path.is_file():
-            return dict(status="inactive", session=session)
+        adm = gate(config)
+        adm._deadline = deadline
+        adm.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        inspect_fn = getattr(adm, "inspect", None)
+        activate_fn = getattr(adm, "activate", None)
+        if activate_fn is not None and (
+            not path.is_file() or (inspect_fn is not None and inspect_fn(session, deadline=deadline).get("status") == "missing")
+        ):
+            activate_fn(session, project_root=str(Path.cwd().resolve()), root_session=session, not_before=0.0)
         rem = deadline - time.monotonic()
         if rem <= 0:
             raise TimeoutError("session deactivation exceeded its budget")
-        gate(config).deactivate(session, timeout=rem)
+        adm.deactivate(session, timeout=rem)
         return dict(status="inactive", session=session)
 
 
@@ -418,8 +528,10 @@ def status_facts(session: str | None = None, *, config: str | Path | None = None
     cfg_file = config_path(config)
     configured = cfg_file.is_file()
     lease = None
+    deactivated = False
     if session is not None:
         try:
+            deactivated = is_deactivated(session, config=config)
             lease = knowledge_lease(session, config=config)
         except ValueError:
             lease = None
@@ -449,7 +561,7 @@ def status_facts(session: str | None = None, *, config: str | Path | None = None
         configured=configured,
         config_path=str(cfg_file),
         engine_config_path=str(engine_config_path(config)),
-        activated=bool(lease is not None and lease.get("enabled") == 1),
+        activated=not deactivated,
         session_id=lease["session"] if lease else session,
         project_root=lease.get("project_root") if lease else None,
         activated_at=lease.get("activated_at") if lease else None,

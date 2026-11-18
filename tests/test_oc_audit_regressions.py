@@ -779,9 +779,9 @@ def test_recheck_cold_stdlib_schema_bind_older_source_streaming_and_1mb_head(
     assert admission.flush_pending_cold_activations() == 1
     assert admission.knowledge_lease("ses_stdlib_cold")["project_root"] == str(Path(ws).resolve())
 
-    # 2. All 34 deterministic MCP schemas stay clean without `_mindie_bind_id` (`P2.7` / `AD-01` fixed).
+    # 2. All 39 MCP schemas (20 remote + 19 tools) stay clean without `_mindie_bind_id` (`P2.7` / `AD-01` fixed).
     all_tools = mcp_server.tools_catalog() + mcp_server.remote_catalog()
-    assert len(all_tools) == 34
+    assert len(all_tools) == 39
     for tool in all_tools:
         props = tool["inputSchema"].get("properties") or {}
         assert "_mindie_bind_id" not in props

@@ -1,15 +1,17 @@
-"""MCP surface boundary, Receipt Honesty, and private `knowledge_cli.py` tests (`test_oc_mcp_and_knowledge.py`).
+"""MCP surface boundary, Receipt Honesty, and default-enabled `knowledge_*` tests (`test_oc_mcp_and_knowledge.py`).
 
 [Role]
-Verifies that `mcp_server.py` exposes the exact deterministic `remote` and
-`tools` surfaces with zero `knowledge_*` tools, preserves primary results when
-local SQLite receipt/bind accounting fails (Receipt Honesty), executes real
-`mindie_status` and `debugger` tools, and gates `knowledge_cli.py` by active
-`OPENCODE_SESSION_ID` lease.
+Verifies that `mcp_server.py` exposes all 20 `remote_*` tools on `mindie-remote-dev`
+and all 19 tools (14 deterministic + 5 default-on `knowledge_*` tools) on
+`mindie-tools` on startup, routes `knowledge_query` & `knowledge_explain` to
+`read_pool`, preserves primary results when local SQLite accounting fails
+(Receipt Honesty), and allows `knowledge_cli.py` without prior session activation.
 
 [Invariants]
-- `knowledge_*` never appears in `tools/list` on either MCP surface, even when
-  a session is activated.
+- All 5 `knowledge_*` tools appear in `tools/list` on `mindie-tools` by default and
+  work with zero `_mindie_bind_id`, zero `OPENCODE_SESSION_ID`, and zero prior
+  manual activation (`_CONNECTION_SESSION_ID` / `"oc-cli-default"` fallback +
+  on-demand `not_before=0.0` lease).
 - Succeeded primary operations never flip to `isError=True` on local SQLite
   accounting errors.
 
@@ -30,8 +32,12 @@ import sqlite3
 import subprocess
 import pytest
 
-from bridge import handle_gesture, handle_pre_tool_use
+import admission
+from bridge import handle_pre_tool_use
+import host_adapter
+import knowledge_cli
 import mcp_server
+from paths import admission_path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -63,10 +69,7 @@ def _run_jsonrpc(surface: str, messages: list[dict], *, content_length: bool = F
     return [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
 
 
-def test_public_mcp_excludes_knowledge_even_when_session_is_active(isolated_oc_env: dict[str, Path]) -> None:
-    ws = str(isolated_oc_env["workspace"])
-    handle_gesture({"sessionID": "ses_active_mcp", "directory": ws, "prompt": "/mindie-agent"})
-
+def test_public_mcp_exposes_default_on_knowledge_and_remote_surfaces(isolated_oc_env: dict[str, Path]) -> None:
     remote_res = _run_jsonrpc(
         "remote",
         [
@@ -87,11 +90,35 @@ def test_public_mcp_excludes_knowledge_even_when_session_is_active(isolated_oc_e
         ],
         content_length=True,
     )
-    tool_names = [t["name"] for t in tools_res[1]["result"]["tools"]]
-    assert len(tool_names) == 14
-    for expected in ("mindie_status", "debugger", "profiler", "sim", "coordinator", "npu_top", "diagnostics_status"):
-        assert expected in tool_names
-    assert all(not name.startswith("knowledge_") for name in tool_names)
+    tools_list = tools_res[1]["result"]["tools"]
+    tool_by_name = {t["name"]: t for t in tools_list}
+    assert len(tools_list) == 19
+    for expected in (
+        "mindie_status",
+        "debugger",
+        "profiler",
+        "sim",
+        "coordinator",
+        "npu_top",
+        "diagnostics_status",
+        "knowledge_query",
+        "knowledge_explain",
+        "knowledge_feedback",
+        "knowledge_distill",
+        "knowledge_sync",
+    ):
+        assert expected in tool_by_name
+        assert "_mindie_bind_id" not in tool_by_name[expected]["inputSchema"].get("properties", {})
+
+    assert tool_by_name["knowledge_query"]["annotations"]["readOnlyHint"] is True
+    assert tool_by_name["knowledge_explain"]["annotations"]["readOnlyHint"] is True
+    assert tool_by_name["knowledge_feedback"]["annotations"]["readOnlyHint"] is False
+    assert tool_by_name["knowledge_distill"]["annotations"]["readOnlyHint"] is False
+    assert tool_by_name["knowledge_sync"]["annotations"]["openWorldHint"] is True
+    assert host_adapter.is_fast_lane_tool("tools", "knowledge_query", {}) is True
+    assert host_adapter.is_fast_lane_tool("tools", "knowledge_explain", {}) is True
+    assert host_adapter.is_fast_lane_tool("tools", "knowledge_distill", {}) is False
+    assert not admission_path().exists()
 
 
 def test_receipt_honesty_preserves_succeeded_remote_result_on_local_sqlite_error(
@@ -140,30 +167,20 @@ def test_receipt_honesty_preserves_succeeded_remote_result_on_local_sqlite_error
     assert "bind_warning" in res["structuredContent"]
 
 
-def test_knowledge_cli_requires_active_lease_and_executes_when_active(isolated_oc_env: dict[str, Path]) -> None:
+def test_default_on_knowledge_mcp_and_cli_without_prior_activation(
+    isolated_oc_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     py = str(isolated_oc_env["python"])
     cli = str(REPO_ROOT / "plugins" / "mindie-agent" / "scripts" / "knowledge_cli.py")
     ws = str(isolated_oc_env["workspace"])
 
-    # 1. Missing OPENCODE_SESSION_ID -> nonzero exit + isError=True.
+    # 1. `knowledge_cli.py describe` works with zero OPENCODE_SESSION_ID & creates zero SQLite files.
     env_no_sid = dict(os.environ)
     env_no_sid.pop("OPENCODE_SESSION_ID", None)
     p1 = subprocess.run([py, "-I", cli, "describe"], env=env_no_sid, capture_output=True, text=True, timeout=10.0)
-    assert p1.returncode == 1
-    assert json.loads(p1.stdout)["isError"] is True
-
-    # 2. Unactivated OPENCODE_SESSION_ID -> nonzero exit + knowledge_inactive.
-    env_unact = dict(os.environ, OPENCODE_SESSION_ID="ses_unactivated_99")
-    p2 = subprocess.run([py, "-I", cli, "describe"], env=env_unact, capture_output=True, text=True, timeout=10.0)
-    assert p2.returncode == 1
-    assert json.loads(p2.stdout)["structuredContent"]["code"] == "knowledge_inactive"
-
-    # 3. Activated OPENCODE_SESSION_ID -> exit 0 + private 5-tool catalog returned.
-    handle_gesture({"sessionID": "ses_know_ok", "directory": ws, "prompt": "/mindie-agent"})
-    env_act = dict(os.environ, OPENCODE_SESSION_ID="ses_know_ok")
-    p3 = subprocess.run([py, "-I", cli, "describe"], env=env_act, capture_output=True, text=True, timeout=10.0)
-    assert p3.returncode == 0
-    payload = json.loads(p3.stdout)
+    assert p1.returncode == 0, p1.stderr
+    payload = json.loads(p1.stdout)
     assert payload["isError"] is False
     names = [t["name"] for t in payload["tools"]]
     assert names == [
@@ -173,6 +190,104 @@ def test_knowledge_cli_requires_active_lease_and_executes_when_active(isolated_o
         "knowledge_distill",
         "knowledge_sync",
     ]
+    assert not admission_path().exists()
+
+    # 2. Direct MCP `knowledge_query` with zero OPENCODE_SESSION_ID & zero prior hook auto-provisions
+    # default lease (`not_before=0.0`) on `_CONNECTION_SESSION_ID` and preserves Receipt Honesty!
+    monkeypatch.delenv("OPENCODE_SESSION_ID", raising=False)
+    import mindie_knowledge.loop.cli as loop_cli
+    import mindie_knowledge.loop.transport as loop_transport
+
+    monkeypatch.setattr(loop_cli, "ensure_service", lambda _cfg: "fake-conn")
+    seen_rpc: list[tuple[str, dict]] = []
+
+    def _fake_rpc(_conn, method: str, rpc_payload: dict, timeout: float = 30.0):
+        seen_rpc.append((method, dict(rpc_payload)))
+        return {"cards": [{"ref": "mindie://vllm-ascend/units/u1@1"}], "foundation_cards": []}
+
+    monkeypatch.setattr(loop_transport, "rpc", _fake_rpc)
+    monkeypatch.setattr(
+        mcp_server.RemoteReceipts,
+        "finish",
+        lambda *_a, **_kw: (_ for _ in ()).throw(sqlite3.OperationalError("simulated receipt finish disk full")),
+    )
+
+    mcp_res = mcp_server.call_tools_surface("knowledge_query", {"query": "ACLGraph", "mode": "standard"})
+    assert mcp_res["isError"] is False
+    assert mcp_res["structuredContent"]["cards"][0]["ref"] == "mindie://vllm-ascend/units/u1@1"
+    assert mcp_res["structuredContent"]["receipt_unconfirmed"] is True
+    assert "receipt_warning" in mcp_res["structuredContent"]
+    assert seen_rpc[0][0] == "query"
+    assert seen_rpc[0][1]["mode"] == "reuse"
+    assert seen_rpc[0][1]["_session_id"] == mcp_server._CONNECTION_SESSION_ID
+
+    auto_lease = admission.knowledge_lease(mcp_server._CONNECTION_SESSION_ID)
+    assert auto_lease is not None
+    assert float(auto_lease["activated_at"]) == 0.0
+
+    # 3. `knowledge_sync` list RPC return value is wrapped in a dict (`{"feeds": ...}`) for MCP structuredContent!
+    def _fake_sync_rpc(_conn, method: str, rpc_payload: dict, timeout: float = 30.0):
+        seen_rpc.append((method, dict(rpc_payload)))
+        return [{"domain": "vllm-ascend", "status": "synced"}]
+
+    monkeypatch.setattr(loop_transport, "rpc", _fake_sync_rpc)
+    sync_res = mcp_server.call_tools_surface("knowledge_sync", {})
+    assert sync_res["isError"] is False
+    assert sync_res["structuredContent"]["feeds"] == [{"domain": "vllm-ascend", "status": "synced"}]
+    monkeypatch.setattr(loop_transport, "rpc", _fake_rpc)
+
+    # 4. Direct `knowledge_cli.invoke` without session arg falls back to `"oc-cli-default"`, never seeds
+    # `project_roots` on auto-profile init, and preserves existing lease's verified `project_root` when `project_root=None`!
+    cli_res = knowledge_cli.invoke("knowledge_query", {"query": "HCCL"}, project_root=ws)
+    assert cli_res["isError"] is False
+    from paths import community_config_path, read_json
+
+    comm_auto = read_json(community_config_path())
+    assert comm_auto["enabled"] is False
+    assert comm_auto["project_roots"] == []
+    cli_lease = admission.knowledge_lease("oc-cli-default")
+    assert cli_lease is not None and float(cli_lease["activated_at"]) == 0.0
+    assert Path(cli_lease["project_root"]).resolve() == Path(ws).resolve()
+    other_cwd = isolated_oc_env["root"] / "other-cwd"
+    other_cwd.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(other_cwd)
+    assert knowledge_cli.invoke("knowledge_query", {"query": "HCCL"}, project_root=None)["isError"] is False
+    assert Path(admission.knowledge_lease("oc-cli-default")["project_root"]).resolve() == Path(ws).resolve()
+
+    # 5. `knowledge_sync` TimeoutError records `"unknown"` in RemoteReceipts!
+    monkeypatch.setattr(
+        loop_transport,
+        "rpc",
+        lambda *_a, **_kw: (_ for _ in ()).throw(TimeoutError("sync timed out")),
+    )
+    monkeypatch.undo() if False else None
+    t_receipts = mcp_server.RemoteReceipts(isolated_oc_env["root"] / "sync-timeout.sqlite3")
+    monkeypatch.setattr(mcp_server.RemoteReceipts, "finish", mcp_server.RemoteReceipts.finish)
+    # Restore real finish on a subclass to bypass earlier monkeypatch on RemoteReceipts.finish!
+    class _RealReceipts(mcp_server.RemoteReceipts):
+        def finish(self, call_id: str, status: str) -> None:
+            db = self._connect()
+            try:
+                with db:
+                    db.execute("UPDATE receipts SET status=? WHERE call_id=?", (status, call_id))
+            finally:
+                db.close()
+
+    real_rec = _RealReceipts(t_receipts.path)
+    t_out = mcp_server.call_tools_surface("knowledge_sync", {}, receipts=real_rec)
+    assert t_out["isError"] is True
+    with sqlite3.connect(real_rec.path) as db:
+        assert [r[0] for r in db.execute("SELECT status FROM receipts")] == ["unknown"]
+    monkeypatch.setattr(loop_transport, "rpc", _fake_rpc)
+
+    # 6. Explicit programmatic deactivation blocks subsequent calls on that session (`knowledge_inactive`).
+    admission.deactivate("ses_explicit_off")
+    off_res = mcp_server.call_tools_surface(
+        "knowledge_query", {"query": "blocked"}, config=None
+    )
+    assert off_res["isError"] is False  # `_CONNECTION_SESSION_ID` stays independent and active!
+    with pytest.raises(knowledge_cli.KnowledgeInactive):
+        knowledge_cli.invoke("knowledge_query", {"query": "blocked"}, session="ses_explicit_off")
 
 
 def test_deterministic_debugger_and_status_mcp_tools(isolated_oc_env: dict[str, Path]) -> None:
@@ -207,7 +322,7 @@ def test_deterministic_debugger_and_status_mcp_tools(isolated_oc_env: dict[str, 
     status_res = responses[0]["result"]
     assert status_res["isError"] is False
     assert status_res["structuredContent"]["harness"] == "opencode"
-    assert status_res["structuredContent"]["activated"] is False
+    assert status_res["structuredContent"]["activated"] is True
 
     dbg_res = responses[1]["result"]
     assert dbg_res["isError"] is False

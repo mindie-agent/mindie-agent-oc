@@ -367,7 +367,7 @@ def test_first_upgrade_snapshots_the_mutable_rollback_engine(r3_env: dict[str, P
     before = read_json(cfg)
     default_engine = engine_config_path(cfg)
     old_summary = read_json(default_engine)["summary_command"]
-    candidate = _stage_candidate(r3_env["root"] / "candidate-r3-0.1.9", version="0.1.9")
+    candidate = _stage_candidate(r3_env["root"] / "candidate-r3-0.1.99", version="0.1.99")
     fake_python = str(r3_env["root"] / "runtime-alt" / "bin" / "python")
 
     monkeypatch.setattr(component_update, "_active_python_is_reusable", lambda *_a, **_kw: True)
