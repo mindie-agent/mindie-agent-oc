@@ -464,12 +464,11 @@ def ensure_default_profile(
         adapter_payload.pop("schema_warning", None) if warn is None else adapter_payload.__setitem__("schema_warning", warn)
 
     if not comm_file.is_file():
-        roots = [str(Path(workspace_root).resolve())] if workspace_root else []
         _write_initial_community_config(
             interpreter, comm_file,
             dict(
                 enabled=False, repository="mindie-agent/knowledge-vllm-ascend",
-                project_roots=roots, branch="main", idle_seconds=300, consent_config=str(cfile.resolve()),
+                project_roots=[], branch="main", idle_seconds=300, consent_config=str(cfile.resolve()),
             ),
             timeout=min(30.0, _rem_budget(deadline, 0.1)),
         )
@@ -665,6 +664,7 @@ def configure_community(
         fork=resolved_fork, account=resolved_account, visibility=visibility,
         remote_project_root=remote_project_root if remote_project_root is not None else current.raw.get("remote_project_root"),
     )
+    schema_warn_msg: str | None = None
     if enabled:
         updated = settings_mod.write(comm_file, **write_kwargs)
         consent_store.record_choice(cfile, "contribute")
@@ -673,19 +673,24 @@ def configure_community(
             try:
                 eng_doc = read_json(eng_file)
                 if isinstance(eng_doc.get("root"), str) and isinstance(eng_doc.get("domain"), str):
-                    from mindie_knowledge.loop.handoff import _store_path, prepare_schema
+                    from component_update import sync_store_schema
 
-                    if not _store_path(eng_doc).is_file():
-                        prepare_schema(str(eng_file))
-            except TimeoutError:
-                raise
-            except Exception as exc:
-                print(f"MindIE OpenCode store schema prepare warning: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    cfg_py = str(read_json(cfg_file).get("python") or sys.executable) if cfg_file.is_file() else sys.executable
+                    ready, warn = sync_store_schema(
+                        cfg_file, eng_file, interpreter=cfg_py, deadline=deadline, update_status_file=False
+                    )
+                    if not ready and warn:
+                        schema_warn_msg = warn
+            except (TimeoutError, Exception) as exc:
+                schema_warn_msg = f"{type(exc).__name__}: {exc}"
+                print(f"MindIE OpenCode store schema prepare warning: {schema_warn_msg}", file=sys.stderr)
     else:
         consent_store.record_choice(cfile, "disabled")
         updated = settings_mod.write(comm_file, **write_kwargs)
 
     out = updated.as_dict()
+    if schema_warn_msg is not None:
+        out["schema_warning"] = schema_warn_msg
     if hasattr(consent_store, "activate_reporting"):
         try:
             consent_store.activate_reporting(cfile, config=diagnostics_config_path(cfg_file), roots=roots or None, ensure=False)

@@ -20,7 +20,8 @@ import {
     summaryEndpointPath,
 } from "./paths.mjs";
 import {
-    mayCaptureCommunitySession, parseModelSpec, renderSkillSystemBlock, safeGetSession,
+    isDirectoryInCommunityScope, loadActiveCommunityRoots,
+    parseModelSpec, renderSkillSystemBlock, safeGetSession,
 } from "./session_support.mjs";
 
 const MCP_WIRE_RE = /^(?:mcp[_:])?(?:mindie[-_]agent[-_:])?(mindie[-_]remote[-_]dev|mindie[-_]tools)[_:]([A-Za-z0-9_.-]+)$/;
@@ -367,14 +368,14 @@ export default {
         await refreshMcpSurfaces();
         maybeTriggerBackgroundPluginSync();
 
-        // 2. Session context hook: inject cached `SKILL.md` directly in pure Node.js (zero subprocesses per prompt).
+        // 2. Session context hook: inject cached `SKILL.md` directly in pure Node.js for confirmed top-level sessions.
         if (ctx?.session && typeof ctx.session.hook === "function") {
             ctx.session.hook("context", async ({ sessionID, system }) => {
                 if (!Array.isArray(system) || typeof sessionID !== "string" || !sessionID) {
                     return;
                 }
                 const info = await safeGetSession(ctx, sessionID);
-                if (info?.parentID || info?.forkSessionID) {
+                if (!info || info.parentID || info.forkSessionID) {
                     return;
                 }
                 await ensureSummaryServer();
@@ -537,10 +538,19 @@ export default {
                             if (evType === "session.execution.interrupted" && event?.data?.reason === "shutdown") continue;
                             const sessionID = event?.data?.sessionID ?? event?.properties?.sessionID;
                             if (typeof sessionID !== "string" || !sessionID) continue;
+                            const activeRoots = loadActiveCommunityRoots();
+                            if (!activeRoots) continue;
                             const info = await safeGetSession(ctx, sessionID);
-                            if (info?.parentID || info?.forkSessionID) continue;
-                            const sessionDir = info?.directory || defaultDirectory();
-                            if (!mayCaptureCommunitySession(sessionDir)) continue;
+                            if (
+                                !info
+                                || info.parentID
+                                || info.forkSessionID
+                                || typeof info.directory !== "string"
+                                || !path.isAbsolute(info.directory)
+                            ) {
+                                continue;
+                            }
+                            if (!isDirectoryInCommunityScope(info.directory, activeRoots)) continue;
                             const now = Date.now();
                             const explicitId = typeof event?.id === "string" && event.id ? event.id : null;
                             const prev = recentCaptureBySession.get(sessionID);
@@ -553,7 +563,7 @@ export default {
                             }
                             spawnDetachedCapture({
                                 sessionID,
-                                directory: sessionDir,
+                                directory: info.directory,
                                 eventID,
                                 eventType: evType,
                                 opencodeDb: opencodeDbPath(),

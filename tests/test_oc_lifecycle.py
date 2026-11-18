@@ -300,6 +300,21 @@ def test_first_opted_in_stop_prepares_store_schema_without_prior_query(
 
     ws = str(isolated_oc_env["workspace"])
     py = str(isolated_oc_env["python"])
+    bin_dir = isolated_oc_env["root"] / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    gl_sh = bin_dir / "gitleaks"
+    gl_sh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gl_sh.chmod(0o755)
+    gl_cmd = bin_dir / "gitleaks.cmd"
+    gl_cmd.write_bytes(b"@exit /b 0\r\n")
+    import os as _os
+
+    monkeypatch.setenv("PATH", f"{bin_dir}{_os.pathsep}{_os.environ.get('PATH', '')}")
+    pathext = _os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    if ".CMD" not in pathext.upper():
+        pathext = f"{pathext};.CMD"
+    monkeypatch.setenv("PATHEXT", pathext)
+
     cfg = config_path()
     oc_setup.ensure_default_profile(config=cfg, workspace_root=ws, python_exe=py, prepare_store=False)
     eng_doc = json.loads(engine_config_path(cfg).read_text(encoding="utf-8"))
@@ -339,9 +354,21 @@ def test_first_opted_in_stop_prepares_store_schema_without_prior_query(
         )
 
     real_receipt = handle_stop(
-        {"sessionID": "ses_first_turn_01", "directory": ws, "eventID": "evt_first_turn", "opencodeDb": str(db_file)},
+        {"sessionID": "ses_first_turn_01", "workspace_root": ws, "eventID": "evt_first_turn", "opencodeDb": str(db_file)},
         config=cfg,
     )
     assert real_receipt["stage"] in {"accepted-local", "accepted-runtime"}, real_receipt
     assert real_receipt.get("reason") != "store-not-ready"
     assert store_db.is_file()
+
+    # Also verify pending cold lease promotion in `ensure_default_lease` once `mindie_knowledge` becomes available!
+    import admission as adm_mod
+
+    with monkeypatch.context() as mp:
+        mp.setattr(adm_mod, "_has_mindie_knowledge", lambda: False)
+        pending_lease = ensure_default_lease("ses_pending_promo", ws, not_before=123.0, config=cfg)
+        assert not pending_lease.get("capture_schema")
+    promoted_lease = ensure_default_lease("ses_pending_promo", None, not_before=0.0, config=cfg)
+    assert promoted_lease.get("capture_schema") is True
+    assert float(promoted_lease["activated_at"]) == 123.0
+    assert Path(promoted_lease["project_root"]).resolve() == Path(ws).resolve()

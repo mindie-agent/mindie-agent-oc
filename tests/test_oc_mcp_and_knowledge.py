@@ -236,13 +236,51 @@ def test_default_on_knowledge_mcp_and_cli_without_prior_activation(
     assert sync_res["structuredContent"]["feeds"] == [{"domain": "vllm-ascend", "status": "synced"}]
     monkeypatch.setattr(loop_transport, "rpc", _fake_rpc)
 
-    # 4. Direct `knowledge_cli.invoke` without session arg falls back to `"oc-cli-default"` and auto-provisions lease.
+    # 4. Direct `knowledge_cli.invoke` without session arg falls back to `"oc-cli-default"`, never seeds
+    # `project_roots` on auto-profile init, and preserves existing lease's verified `project_root` when `project_root=None`!
     cli_res = knowledge_cli.invoke("knowledge_query", {"query": "HCCL"}, project_root=ws)
     assert cli_res["isError"] is False
+    from paths import community_config_path, read_json
+
+    comm_auto = read_json(community_config_path())
+    assert comm_auto["enabled"] is False
+    assert comm_auto["project_roots"] == []
     cli_lease = admission.knowledge_lease("oc-cli-default")
     assert cli_lease is not None and float(cli_lease["activated_at"]) == 0.0
+    assert Path(cli_lease["project_root"]).resolve() == Path(ws).resolve()
+    other_cwd = isolated_oc_env["root"] / "other-cwd"
+    other_cwd.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(other_cwd)
+    assert knowledge_cli.invoke("knowledge_query", {"query": "HCCL"}, project_root=None)["isError"] is False
+    assert Path(admission.knowledge_lease("oc-cli-default")["project_root"]).resolve() == Path(ws).resolve()
 
-    # 5. Explicit programmatic deactivation blocks subsequent calls on that session (`knowledge_inactive`).
+    # 5. `knowledge_sync` TimeoutError records `"unknown"` in RemoteReceipts!
+    monkeypatch.setattr(
+        loop_transport,
+        "rpc",
+        lambda *_a, **_kw: (_ for _ in ()).throw(TimeoutError("sync timed out")),
+    )
+    monkeypatch.undo() if False else None
+    t_receipts = mcp_server.RemoteReceipts(isolated_oc_env["root"] / "sync-timeout.sqlite3")
+    monkeypatch.setattr(mcp_server.RemoteReceipts, "finish", mcp_server.RemoteReceipts.finish)
+    # Restore real finish on a subclass to bypass earlier monkeypatch on RemoteReceipts.finish!
+    class _RealReceipts(mcp_server.RemoteReceipts):
+        def finish(self, call_id: str, status: str) -> None:
+            db = self._connect()
+            try:
+                with db:
+                    db.execute("UPDATE receipts SET status=? WHERE call_id=?", (status, call_id))
+            finally:
+                db.close()
+
+    real_rec = _RealReceipts(t_receipts.path)
+    t_out = mcp_server.call_tools_surface("knowledge_sync", {}, receipts=real_rec)
+    assert t_out["isError"] is True
+    with sqlite3.connect(real_rec.path) as db:
+        assert [r[0] for r in db.execute("SELECT status FROM receipts")] == ["unknown"]
+    monkeypatch.setattr(loop_transport, "rpc", _fake_rpc)
+
+    # 6. Explicit programmatic deactivation blocks subsequent calls on that session (`knowledge_inactive`).
     admission.deactivate("ses_explicit_off")
     off_res = mcp_server.call_tools_surface(
         "knowledge_query", {"query": "blocked"}, config=None

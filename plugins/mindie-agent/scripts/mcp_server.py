@@ -387,6 +387,33 @@ def _attach_accounting_warning(result: dict, warning_key: str, exc: Exception) -
     return result
 
 
+def _finish_accounting(
+    result: dict, succeeded: bool, *, receipt_store: RemoteReceipts | None = None,
+    call_id: str | None = None, outcome: str | None = None, bind_id: str | None = None, config=None,
+) -> dict:
+    if receipt_store is not None and call_id is not None:
+        try:
+            receipt_store.finish(call_id, outcome or ("succeeded" if succeeded else "failed"))
+        except TimeoutError as exc:
+            if not succeeded:
+                raise
+            result = _attach_accounting_warning(result, "receipt_warning", exc)
+        except (OSError, sqlite3.Error) as exc:
+            if succeeded:
+                result = _attach_accounting_warning(result, "receipt_warning", exc)
+    if bind_id is not None:
+        try:
+            finish_bind(bind_id, succeeded, config=config)
+        except TimeoutError as exc:
+            if not succeeded:
+                raise
+            result = _attach_accounting_warning(result, "bind_warning", exc)
+        except (OSError, sqlite3.Error) as exc:
+            if succeeded:
+                result = _attach_accounting_warning(result, "bind_warning", exc)
+    return result
+
+
 def call_tools_surface(
     name: str,
     arguments: dict | None = None,
@@ -431,31 +458,15 @@ def call_tools_surface(
             receipt_store = receipts or RemoteReceipts(remote_receipts_path(config))
             k_call_id = str(uuid.uuid4())
             receipt_store.begin(k_call_id, session, name, args)
-            proj_root = (
-                bound_cwd
-                if (isinstance(bound_cwd, str) and os.path.isabs(bound_cwd) and Path(bound_cwd).is_dir())
-                else None
-            )
+            proj_root = bound_cwd if (isinstance(bound_cwd, str) and os.path.isabs(bound_cwd) and Path(bound_cwd).is_dir()) else None
             try:
                 result = invoke_knowledge(name, args, session=session, project_root=proj_root, config=config)
                 succeeded = result.get("isError") is not True
-            except BaseException:
-                try:
-                    receipt_store.finish(k_call_id, "failed")
-                except TimeoutError:
-                    raise
-                except (OSError, sqlite3.Error):
-                    pass
+            except BaseException as k_exc:
+                err_out = "unknown" if (name in {"knowledge_distill", "knowledge_sync"} and isinstance(k_exc, (TimeoutError, ConnectionError))) else "failed"
+                _finish_accounting({}, False, receipt_store=receipt_store, call_id=k_call_id, outcome=err_out)
                 raise
-            try:
-                receipt_store.finish(k_call_id, "succeeded" if succeeded else "failed")
-            except TimeoutError as r_exc:
-                if not succeeded:
-                    raise
-                result = _attach_accounting_warning(result, "receipt_warning", r_exc)
-            except (OSError, sqlite3.Error) as r_exc:
-                if succeeded:
-                    result = _attach_accounting_warning(result, "receipt_warning", r_exc)
+            result = _finish_accounting(result, succeeded, receipt_store=receipt_store, call_id=k_call_id)
         elif name in COMPONENT_DESCRIPTIONS or name in {"diagnostics_status", "diagnostics_bundle"}:
             if name in COMPONENT_DESCRIPTIONS:
                 component = name
@@ -565,17 +576,7 @@ def call_tools_surface(
             isError=True,
         )
 
-    if bind_id is not None:
-        try:
-            finish_bind(bind_id, succeeded, config=config)
-        except TimeoutError as exc:
-            if not succeeded:
-                raise
-            result = _attach_accounting_warning(result, "bind_warning", exc)
-        except (OSError, sqlite3.Error) as exc:
-            if succeeded:
-                result = _attach_accounting_warning(result, "bind_warning", exc)
-    return result
+    return _finish_accounting(result, succeeded, bind_id=bind_id, config=config)
 
 
 def call_remote_surface(
@@ -661,27 +662,9 @@ def call_remote_surface(
             isError=True,
         )
 
-    try:
-        receipt_store.finish(call_id, outcome)
-    except TimeoutError as exc:
-        if not succeeded:
-            raise
-        result = _attach_accounting_warning(result, "receipt_warning", exc)
-    except (OSError, sqlite3.Error) as exc:
-        if succeeded:
-            result = _attach_accounting_warning(result, "receipt_warning", exc)
-
-    if bind_id is not None:
-        try:
-            finish_bind(bind_id, succeeded, config=config)
-        except TimeoutError as exc:
-            if not succeeded:
-                raise
-            result = _attach_accounting_warning(result, "bind_warning", exc)
-        except (OSError, sqlite3.Error) as exc:
-            if succeeded:
-                result = _attach_accounting_warning(result, "bind_warning", exc)
-    return result
+    return _finish_accounting(
+        result, succeeded, receipt_store=receipt_store, call_id=call_id, outcome=outcome, bind_id=bind_id, config=config,
+    )
 
 
 def _safe_trigger_background_update(config=None) -> None:

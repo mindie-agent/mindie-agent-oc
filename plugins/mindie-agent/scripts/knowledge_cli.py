@@ -57,35 +57,42 @@ def _reexec_timeout_seconds(cli_args: list[str]) -> float:
         summary_s = _positive_env_seconds("MINDIE_SUMMARY_TIMEOUT_SECONDS", 315.0)
         distill_rpc = (2.0 * redact_s) + 10.0 + summary_s + 30.0 + 5.0
         return max(90.0, distill_rpc + 60.0)
+    if cli_args and cli_args[0] == "knowledge_sync":
+        return max(375.0, KNOWLEDGE_SYNC_TIMEOUT + 60.0)
     return 90.0
 
 
-if importlib.util.find_spec("mindie_knowledge") is None and not os.environ.get("_MINDIE_KC_REEXEC"):
+def _maybe_reexec_for_cli(cli_args: list[str]) -> int | None:
+    if importlib.util.find_spec("mindie_knowledge") is not None or os.environ.get("_MINDIE_KC_REEXEC"):
+        return None
     from bounded import run_supervised_reexec
     from mindie_launch import _preferred_python
 
-    _target_py = _preferred_python()
-    if _target_py and Path(_target_py).is_file():
-        _env = dict(os.environ, _MINDIE_KC_REEXEC="1", PYTHONIOENCODING="utf-8")
-        try:
-            _rc = run_supervised_reexec(
-                [_target_py, "-I", str(Path(__file__).resolve()), *sys.argv[1:]],
-                timeout=_reexec_timeout_seconds(sys.argv[1:]),
-                env=_env,
+    target_py = _preferred_python()
+    if not target_py or not Path(target_py).is_file():
+        return None
+    env = dict(os.environ, _MINDIE_KC_REEXEC="1", PYTHONIOENCODING="utf-8")
+    try:
+        return int(
+            run_supervised_reexec(
+                [target_py, "-I", str(Path(__file__).resolve()), *cli_args],
+                timeout=_reexec_timeout_seconds(cli_args),
+                env=env,
                 stdin=sys.stdin,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
             )
-        except TimeoutError as _exc:
-            _err = {
-                "content": [{"type": "text", "text": str(_exc)}],
-                "structuredContent": {"code": "knowledge_timeout", "error": str(_exc), "automatic_retry": False},
-                "isError": True,
-            }
-            sys.stdout.buffer.write((json.dumps(_err, ensure_ascii=False) + "\n").encode("utf-8"))
-            sys.stdout.buffer.flush()
-            raise SystemExit(1) from _exc
-        raise SystemExit(_rc)
+        )
+    except TimeoutError as exc:
+        err = {
+            "content": [{"type": "text", "text": str(exc)}],
+            "structuredContent": {"code": "knowledge_timeout", "error": str(exc), "automatic_retry": False},
+            "isError": True,
+        }
+        sys.stdout.buffer.write((json.dumps(err, ensure_ascii=False) + "\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+        return 1
+
 
 from admission import _bounded_gate, ensure_default_lease, gate, is_deactivated
 from identity import reject_forged_identity_args, require_session
@@ -96,6 +103,7 @@ ensure_oc_native_support()
 
 MAX_INPUT_BYTES = 1024 * 1024
 KNOWLEDGE_RPC_TIMEOUT = 30.0
+KNOWLEDGE_SYNC_TIMEOUT = 315.0
 DEFAULT_CLI_SESSION_ID = "oc-cli-default"
 
 
@@ -271,7 +279,7 @@ def invoke(
     if operation not in KNOWLEDGE_NAMES:
         raise ValueError(f"unknown knowledge operation: {operation}")
 
-    eff_root = str(Path(project_root).resolve()) if project_root is not None else str(Path.cwd().resolve())
+    explicit_root = str(Path(project_root).resolve()) if project_root is not None else None
     cfg_file = config_path(config)
     if not cfg_file.is_file():
         from setup import _current_python_has_runtime, ensure_default_profile
@@ -279,12 +287,13 @@ def invoke(
         if _current_python_has_runtime():
             ensure_default_profile(
                 config=cfg_file,
-                workspace_root=eff_root,
+                workspace_root=None,
                 python_exe=sys.executable,
                 prepare_store=False,
             )
 
-    lease = ensure_default_lease(session_id, project_root=eff_root, not_before=0.0, config=config)
+    lease = ensure_default_lease(session_id, project_root=explicit_root, not_before=0.0, config=config)
+    lease_root = str(lease.get("project_root") or explicit_root or Path.cwd().resolve())
     args = dict(arguments or {})
     if operation in {"knowledge_query", "knowledge_explain"} and args.get("mode") == "standard":
         args["mode"] = "reuse"
@@ -303,7 +312,7 @@ def invoke(
                 dom_gate = _bounded_gate(dom_adm)
                 dom_gate.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 dom_lease = dom_gate.activate(
-                    session_id, project_root=eff_root, root_session=session_id, not_before=0.0
+                    session_id, project_root=lease_root, root_session=session_id, not_before=0.0
                 )
                 finish_gate = dom_gate
                 token = dom_lease.get("token")
@@ -315,7 +324,7 @@ def invoke(
     from mindie_knowledge.loop.cli import ensure_service
     from mindie_knowledge.loop.transport import RequestRejected, rpc
 
-    timeout = KNOWLEDGE_RPC_TIMEOUT
+    timeout = KNOWLEDGE_SYNC_TIMEOUT if operation == "knowledge_sync" else KNOWLEDGE_RPC_TIMEOUT
     if operation == "knowledge_distill":
         from mindie_knowledge.loop import summary_budget
 
@@ -409,6 +418,9 @@ def _format_failure(exc: Exception) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    reexec_rc = _maybe_reexec_for_cli(argv)
+    if reexec_rc is not None:
+        return reexec_rc
     try:
         if len(argv) != 1:
             raise ValueError("exactly one knowledge operation or 'describe' is required")

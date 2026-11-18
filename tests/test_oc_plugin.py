@@ -47,10 +47,13 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
     plugin_json = json.loads((REPO_ROOT / "plugins" / "mindie-agent" / "plugin.json").read_text(encoding="utf-8"))
     compat = json.loads((REPO_ROOT / "harness-compatibility.json").read_text(encoding="utf-8"))
 
+    import tomllib
+
+    expected_ver = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     assert pkg["name"] == "@mindie-agent/oc"
     assert pkg["type"] == "module"
     assert pkg["main"] == "./index.mjs"
-    assert pkg["version"] == contract["native_version"] == plugin_json["version"] == "0.1.10"
+    assert pkg["version"] == contract["native_version"] == plugin_json["version"] == expected_ver
     assert contract["harness"] == "opencode"
 
     validated = releases.validate_compatibility(compat, harness_name="opencode")
@@ -112,6 +115,8 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
 
     frontmatter = yaml.safe_load(skill_text.split("---", 2)[1])
     assert isinstance(frontmatter, dict) and frontmatter.get("name") == "mindie-agent"
+    assert "disable-model-invocation" not in frontmatter and frontmatter.get("disable-model-invocation") is not True
+    assert "disableModelInvocation" not in frontmatter and frontmatter.get("disableModelInvocation") is not True
     assert "disable-model-invocation" not in skill_text
     assert len(skill_text.splitlines()) <= 30, f"SKILL.md exceeds 30 lines ({len(skill_text.splitlines())})"
     for runtime_doc in (skill_dir / "SKILL.md", *sorted(refs_dir.glob("*.md"))):
@@ -227,7 +232,9 @@ const sessions = {{
     ses_otherB002: {{ id: "ses_otherB002", directory: {json.dumps(str(outside_ws))} }},
     ses_subC003: {{ id: "ses_subC003", directory: process.env.TEST_WORKSPACE, parentID: "ses_mainA001" }},
     ses_forkD004: {{ id: "ses_forkD004", directory: process.env.TEST_WORKSPACE, forkSessionID: "ses_mainA001" }},
+    ses_nodirE005: {{ id: "ses_nodirE005" }},
 }};
+let sessionGetCalls = 0;
 
 const eventQueue = [];
 let eventWaiter = null;
@@ -257,7 +264,10 @@ const mockCtx = {{
     }},
     session: {{
         hook(name, fn) {{ sessionHooks.set(name, fn); }},
-        async get({{ sessionID }}) {{ return sessions[sessionID] || null; }},
+        async get({{ sessionID }}) {{
+            sessionGetCalls += 1;
+            return sessions[sessionID] || null;
+        }},
     }},
     tool: {{
         hook(name, fn) {{ toolHooks.set(name, fn); }},
@@ -312,13 +322,16 @@ assert.ok(activeSys[0].text.includes("# MindIE Agent (OpenCode Unified Entry)"))
 assert.ok(!activeSys[0].text.includes("name: mindie-agent"));
 assert.ok(!fs.existsSync(path.join(process.env.MINDIE_DATA_HOME, "oc-state", "admission.sqlite3")));
 
-// Subagent & forked sessions receive zero SKILL.md system context.
+// Subagent, forked, and null-metadata sessions receive zero SKILL.md system context.
 const subSys = [];
 await sessionHooks.get("context")({{ sessionID: "ses_subC003", system: subSys }});
 assert.equal(subSys.length, 0);
 const forkSys = [];
 await sessionHooks.get("context")({{ sessionID: "ses_forkD004", system: forkSys }});
 assert.equal(forkSys.length, 0);
+const nullSys = [];
+await sessionHooks.get("context")({{ sessionID: "ses_unknown_null", system: nullSys }});
+assert.equal(nullSys.length, 0);
 
 // 3. Shell hook correlates OPENCODE_SESSION_ID strictly per session command.
 await toolHooks.get("execute.before")({{
@@ -368,11 +381,13 @@ assert.deepEqual(generateCalls[0].model, {{
     variant: "max",
 }});
 
-// 5. Pure-Node consent-first idle capture: zero subprocesses when off or out of scope!
+// 5. Pure-Node consent-first idle capture: checks local consent BEFORE session.get & never substitutes ctx.directory!
 if (process.platform !== "win32") {{
     process.env.MINDIE_OC_PYTHON = {json.dumps(str(capture_spy))};
+    const callsBeforeOff = sessionGetCalls;
     pushEvent({{ type: "session.idle", id: "ev_off_1", data: {{ sessionID: "ses_mainA001" }} }});
     await new Promise((r) => setTimeout(r, 80));
+    assert.equal(sessionGetCalls, callsBeforeOff);
     assert.equal(fs.existsSync({json.dumps(str(capture_log))}), false);
 
     // Enable consent + community strictly for TEST_WORKSPACE.
@@ -388,6 +403,12 @@ if (process.platform !== "win32") {{
         project_roots: [process.env.TEST_WORKSPACE],
         consent_config: consentPath,
     }}));
+
+    // Null session or session missing directory MUST NOT substitute ctx.location.directory!
+    pushEvent({{ type: "session.idle", id: "ev_null_1", data: {{ sessionID: "ses_unknown_null" }} }});
+    pushEvent({{ type: "session.idle", id: "ev_nodir_1", data: {{ sessionID: "ses_nodirE005" }} }});
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(fs.existsSync({json.dumps(str(capture_log))}), false);
 
     // Out-of-scope session (`ses_otherB002`) -> zero subprocess spawned!
     pushEvent({{ type: "session.idle", id: "ev_out_1", data: {{ sessionID: "ses_otherB002" }} }});

@@ -117,7 +117,7 @@ def _peek_session_meta_readonly(db_file: Path, session: str) -> tuple[str | None
 
 def _resolve_verified_project_root(event: dict, session: str, db_file: Path) -> tuple[str | None, bool]:
     """Resolve verified workspace strictly from the current event or `opencode.db` (never stale leases or cwd)."""
-    for key in ("directory", "workspaceRoot", "cwd", "project_root"):
+    for key in ("directory", "workspace_root", "workspaceRoot", "cwd", "project_root"):
         val = event.get(key)
         if isinstance(val, str) and os.path.isabs(val.strip()):
             return str(Path(val.strip()).resolve()), False

@@ -291,8 +291,22 @@ def ensure_default_lease(
     )
     if not os.path.isabs(raw_root):
         raise ValueError("project_root must be an absolute path")
-    if existing is not None and existing.get("project_root") == raw_root:
-        return existing
+    is_committed_sqlite = bool(existing and existing.get("capture_schema") is True)
+    if existing is not None and isinstance(existing.get("project_root"), str):
+        if Path(existing["project_root"]).resolve() == Path(raw_root).resolve():
+            if is_committed_sqlite or not _has_mindie_knowledge():
+                return existing
+    effective_not_before = (
+        float(existing["activated_at"])
+        if (
+            existing is not None
+            and not is_committed_sqlite
+            and isinstance(existing.get("activated_at"), (int, float))
+            and math.isfinite(float(existing["activated_at"]))
+            and float(existing["activated_at"]) >= 0
+        )
+        else float(not_before)
+    )
     rem_init = deadline - time.monotonic()
     if rem_init <= 0:
         raise TimeoutError("session lease provisioning exceeded its budget")
@@ -331,7 +345,7 @@ def ensure_default_lease(
         adm = gate(config)
         adm._deadline = deadline
         adm.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lease = adm.activate(session, project_root=raw_root, root_session=session, not_before=float(not_before))
+        lease = adm.activate(session, project_root=raw_root, root_session=session, not_before=effective_not_before)
         if not getattr(adm, "_write_committed", False) and time.monotonic() >= deadline:
             raise TimeoutError("session lease provisioning exceeded its budget")
         _pending_file(session, config).unlink(missing_ok=True)
