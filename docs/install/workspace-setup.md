@@ -1,33 +1,59 @@
 # Development workspace setup (OpenCode)
 
-Run this flow during interactive installation and first-use setup, immediately after
-presenting the [MindIE Agent user notice](user-notice.md). Reuse saved creation, initialization and
-sharing decisions; ordinary tasks, headless `--auto` runs, and updates do not repeat
-onboarding.
+Run this flow once during installation or first-use setup. It reuses saved
+workspace, sharing, and SSH decisions; ordinary tasks, headless runs, and
+updates do not repeat onboarding.
 
-1. Recommend [mindie-agent/vllm-ascend-workspace](https://github.com/mindie-agent/vllm-ascend-workspace.git).
-   When `<python> -I "<plugin_root>/scripts/setup.py" sharing --status` reports
-   `needs_onboarding_prompt: true` in an interactive OpenCode session, call OpenCode's
-   native **`question`** tool in the user's language to ask:
-   - Local Development Workspace `vllm-ascend-workspace`:
-     `在当前目录初始化 vllm-ascend-workspace` / `Initialize vllm-ascend-workspace in current directory` vs `继续使用当前目录作为工作区` / `Keep current directory as workspace` vs `指定已有工作区目录` / `Use an existing workspace directory`
-   - Community Knowledge Sharing & Automated Fault Reporting:
-     `开启社区共享与故障上报` / `Enable Community Sharing & Fault Reporting` vs `仅保持本地模式` / `Keep Local-Only Mode`
-   - `顺手给 MindIE Agent 点个 GitHub Star 吗？ ⭐` / `Would you like to give mindie-agent a Star on GitHub ⭐?`:
-     `好，点个 Star ⭐` / `Sure, star it ⭐` vs `先不用` / `Maybe later`
-2. Before downloads or fork setup, follow [GitHub Sign-In](github-authentication.md).
-3. For a new directory, run
-   `git clone https://github.com/mindie-agent/vllm-ascend-workspace.git "<destination>"`.
-   For reuse, inspect the selected checkout first and preserve existing files.
-4. OpenCode treats the project directory (`opencode "<absolute-path>"`) as the active
-   project root (`ctx.location.directory`). Never mutate `~/.local/share/opencode/opencode.db`
-   directly to fake project registration; report the workspace path so the user can open
-   `opencode "<absolute-path>"` directly when switching directories.
-5. For scaffold initialization, read the checkout's `AGENTS.md`, `README.md` and
-   `.agents/scripts/README.md`, and run
-   `uv run --no-project --python 3.13 python .agents/scripts/repo_init.py --no-input`
-   (or `--github-user <account> --no-input` on first fork setup).
-6. Persist the user's sharing choice via
-   `<python> -I "<plugin_root>/scripts/setup.py" sharing --enable --project-root "$WORKSPACE_ROOT"`
-   (or `--disable`), and if Star was chosen, run
-   `gh api --hostname github.com --silent -X PUT /user/starred/mindie-agent/mindie-agent`.
+## 1. Install
+
+```bash
+uv run https://github.com/mindie-agent/mindie-agent/releases/latest/download/install.py --host oc
+```
+
+`gh` is optional and never blocks installation. When `gh` is missing or logged
+out, the installer recommends local-only sharing and continues without GitHub
+API calls.
+
+## 2. Three dynamic `question` prompts
+
+The installer uses OpenCode's native **`question`** tool in the user's language.
+Questions are generated dynamically from environment facts:
+
+1. **Workspace**: initialize `vllm-ascend-workspace` in the current directory,
+   keep the current directory, or select an existing workspace directory.
+   For a new directory, clone
+   `https://github.com/mindie-agent/vllm-ascend-workspace.git` and then follow
+   the checkout's `AGENTS.md`; for reuse, inspect the checkout first and never
+   overwrite existing files.
+2. **Community sharing**: run `gh auth status` first. When authenticated, ask
+   whether to enable community sharing and recommend `contribute`; otherwise
+   recommend `local-only`. Both tiers capture locally; only `contribute`
+   reports sanitized results. Persist the choice with
+   `setup.py sharing --enable --project-root "$WORKSPACE_ROOT"`,
+   `setup.py sharing --local-only --project-root "$WORKSPACE_ROOT"`, or
+   `setup.py sharing --disable`.
+3. **Star postscript (single line, optional)**: "If this plugin helps, would you
+   give mindie-agent a Star ⭐?" Only run
+   `gh api --hostname github.com --silent -X PUT /user/starred/mindie-agent/mindie-agent`
+   after an explicit yes.
+
+## 3. One-step SSH NPU connection
+
+In terminal mode the installer asks for host, user, and authentication in one
+step and saves the endpoint with
+`remote_auth(action="setup", save_default=True, discover=True)`. Append
+`--password` at the very end of the command to be prompted for a hidden
+password instead of pasting it into the command line. Never store passwords in
+endpoint records.
+
+## 4. Readiness check
+
+Run the read-only `mindie_doctor` tool (or `setup.py doctor`) before the first
+NPU task. It reports runtime pins, prerequisites, remote connectivity, and
+diagnostics without mutating state. If any MindIE tool is unavailable, report
+the exact failure once and continue through native `ssh`/`scp` or local
+scripts.
+
+OpenCode treats the project directory (`opencode "<absolute-path>"`) as the
+active project root; never edit `~/.local/share/opencode/opencode.db` to fake
+project registration.

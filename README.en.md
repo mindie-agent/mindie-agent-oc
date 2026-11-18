@@ -5,54 +5,58 @@
 <h1 align="center">MindIE Agent for OpenCode (<code>mindie-agent-oc</code>)</h1>
 
 <p align="center">
-  <b>Native OpenCode (<code>v2.2.x+</code>) harness plugin featuring dual-channel GitHub &amp; npm distribution, 39 default-enabled Ascend remote, diagnostic, and graded L1–L4 knowledge MCP tools, and zero-overhead consent-gated turn capture</b>
+  <b>Native OpenCode (<code>v2.2.x+</code>) harness plugin: six thin host files, 14 default-enabled Ascend remote tools plus full diagnostic and graded L1-L4 knowledge MCP, pure-Node consent gates, and zero-overhead on-demand capture</b>
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.10-0F766E.svg" alt="Release v0.1.10"></a>
+  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.11-0F766E.svg" alt="Release v0.1.11"></a>
   &nbsp;
   <a href="./README.md">简体中文</a>
 </p>
 
 ---
 
+- [1. Architecture & Exposure Boundary](#1-architecture--exposure-boundary)
+- [2. Installation & Upgrades](#2-installation--upgrades)
+- [3. Community Sharing & Privacy](#3-community-sharing--privacy)
+- [4. Verification](#4-verification)
+
 ## 1. Architecture & Exposure Boundary
 
-`mindie-agent-oc` (npm package `@mindie-agent/oc`, current release [`v0.1.10`](https://github.com/mindie-agent/mindie-agent-oc/releases/tag/v0.1.10)) targets OpenCode's v2 Promise Plugin API (`@opencode-ai/plugin`) directly with all tools enabled on startup and zero manual activation commands:
+`mindie-agent-oc` (npm package `@mindie-agent/oc`, current release [`v0.1.11`](https://github.com/mindie-agent/mindie-agent-oc/releases/tag/v0.1.11)) targets OpenCode's v2 Promise Plugin API (`@opencode-ai/plugin`) directly. `v0.1.11` is the **Great Subtraction** thin-host release: the production surface is six files (`index.mjs`, `opencode_host.mjs`, `mindie_launch.py`, `mcp_server.py`, `opencode_transcript.py`, `setup.py`) totaling `< 1,200` lines, with all heavy lifting delegated to `mindie-harness`.
 
-1. **GitHub / Local Installation & Automatic Updates**: Supports `opencode plugin add github:mindie-agent/mindie-agent-oc` (OpenCode 2.2.7 rejects direct tarball URLs; release tarballs remain distribution artifacts), local directory URIs (`"plugin": ["file:///abs/path/to/mindie-agent-oc"]`), native `opencode plugin update`, and monotonic `300s` background updates (`max(installed, baseline, latest)`) for shared runtime components.
-2. **Default-Enabled MCP Tools (39 Tools Across Two Surfaces)**:
-   - `mindie-remote-dev`: 20 `remote_*` development and background job tools (`timeout.execution = 660000ms`).
-   - `mindie-tools`: 19 tools (`mindie_status`, `profiler`, `sim`, `coordinator`, `debugger`, `npu_top` + 6 live observation tools, `diagnostics_status`, `diagnostics_bundle`, plus the 5 default-enabled `knowledge_*` tools `knowledge_query`, `knowledge_explain`, `knowledge_feedback`, `knowledge_distill`, `knowledge_sync`), alongside direct `knowledge_cli.py` invocation without prior session activation.
-3. **Pure-Node Context Guidance & Consent-First `session.idle` Capture**:
-   - Top-level main sessions (`!parentID && !forkSessionID`) receive cached `SKILL.md` guidance (with YAML frontmatter stripped) directly from memory in Node.js via `session.hook("context")` (zero Python subprocess spawns per prompt), and `shell.hook("create.before")` binds `OPENCODE_SESSION_ID` into session shells.
-   - On `session.idle`, `opencode_host.mjs` checks community sharing consent (`mindie-community.json` + `mindie-consent.json`) and authorized `project_roots` in pure Node.js before spawning `capture_stop.py`: when sharing is off or outside authorized `project_roots`, zero subprocesses are spawned and zero `admission.sqlite3` files are created; when authorized and in scope, `capture_stop.py` auto-provisions the session lease (`not_before=0.0`) and spools sanitized public turns read-only from `opencode.db`.
+1. **Default-On Tools With Zero Manual Activation**:
+   - `mindie-remote-dev`: the 14-tool `oc` native `remote_*` profile (`timeout.execution = 660000ms`).
+   - `mindie-tools`: deterministic component tools, `mindie_status`, `mindie_doctor`, `diagnostics_status`/`diagnostics_bundle`, and the 5 default-enabled `knowledge_*` tools.
+2. **Zero Subprocess Per Prompt & Consent-First Capture**: top-level main sessions (`!parentID && !forkSessionID`) receive cached `SKILL.md` guidance (frontmatter stripped) directly from Node.js. Terminal events are gated in pure Node.js on `mindie-community.json`, `mindie-consent.json` (`contribute` or `local-only`), and canonical `project_roots`; when sharing is off or out of scope, zero subprocesses are spawned and zero SQLite files are created. Authorized turns coalesce within `250ms` and spawn `mindie_launch.py hook stop`.
+3. **Automatic Updates & Shared Runtime**: an on-demand `mindie_launch.py update --background` check, `mindie-harness-seed.pyz` verified cold provisioning, and all component updates and generation leases delegated to `mindie-harness`.
 
 ## 2. Installation & Upgrades
 
 ```bash
-# Channel 1: GitHub repository / release
-opencode plugin add github:mindie-agent/mindie-agent-oc
+uv run https://github.com/mindie-agent/mindie-agent/releases/latest/download/install.py --host oc
+```
 
-# Check and apply plugin updates
+`gh` is entirely optional: when it is missing or logged out, the installer recommends `local-only` and never blocks. It then asks three questions with OpenCode's native **`question`** tool: workspace choice, community sharing tier (`contribute` when `gh` is authenticated, otherwise `local-only`; both capture locally), and a single-line Star postscript ("If this plugin helps, would you give mindie-agent a Star? ⭐"). In terminal mode the SSH NPU connection is completed in one step; append `--password` at the end to enter it hidden. Finish with the read-only `mindie_doctor` readiness check.
+
+```bash
 opencode plugin check
 opencode plugin update
 ```
 
-For local checkout provisioning (without touching `~/.config/opencode` or `~/.local/share/opencode`):
+For local checkouts, mount `file:///abs/path/to/mindie-agent-oc` in the project `opencode.json` and run `uv run --no-project python plugins/mindie-agent/scripts/setup.py init --workspace-root "$PWD"`.
 
-```bash
-UV_SYSTEM_CERTS=true UV_NATIVE_TLS=true uv run --no-project --python 3.13 \
-  python plugins/mindie-agent/scripts/setup.py init --workspace-root "$PWD"
-```
+See [workspace setup](docs/install/workspace-setup.md), optional [GitHub sign-in](docs/install/github-authentication.md), and the [user notice](docs/install/user-notice.md).
 
-## 3. Community Sharing & Privacy Notice
+## 3. Community Sharing & Privacy
 
-Community sharing and sanitized fault reporting stay off by default; see the [user notice](docs/install/user-notice.md), [workspace setup guide](docs/install/workspace-setup.md), and [GitHub sign-in guide](docs/install/github-authentication.md) for initial configuration.
+Community sharing and sanitized fault reporting stay off by default; switch explicitly with `setup.py sharing --enable | --local-only | --disable` (`--status` is read-only). All state lives in MindIE-owned directories; `~/.config/opencode` and `~/.local/share/opencode` are never modified.
 
 ## 4. Verification
 
 ```bash
 UV_SYSTEM_CERTS=true UV_NATIVE_TLS=true uv sync --extra test --python 3.13
 .venv/bin/pytest tests -q
+python3 .github/scripts/check_lf_eol.py
+node --check index.mjs && node --check plugins/mindie-agent/opencode_host.mjs
 ```

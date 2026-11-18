@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -24,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="mindie-oc-bench-") as tmp:
     tmp_dir = Path(tmp)
     db_path = tmp_dir / "opencode.db"
     spool_dir = tmp_dir / "spool"
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.executescript(
             """
             CREATE TABLE session_v2 (

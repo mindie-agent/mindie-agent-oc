@@ -1,6 +1,6 @@
 {
   "name": "@mindie-agent/oc",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "OpenCode native harness plugin adapter for MindIE Agent: Ascend NPU remote-dev, deterministic profiling/simulation/coordination/debugging tools, and default-enabled graded L1-L4 knowledge retrieval.",
   "license": "MIT",
   "type": "module",

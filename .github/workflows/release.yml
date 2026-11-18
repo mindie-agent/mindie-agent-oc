@@ -15,7 +15,7 @@ jobs:
     secrets:
       MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
-      release-notes-path: docs/releases/mindie-agent-oc-0.1.10.md
+      release-notes-path: docs/releases/mindie-agent-oc-0.1.11.md
       node: true
       version-files: |
         package.json
@@ -28,8 +28,6 @@ jobs:
         .venv/bin/python .github/scripts/check_lf_eol.py
         .venv/bin/python -m pytest -q -m "not live_npu and not live_opencode"
         node --check index.mjs
-        node --check plugins/mindie-agent/paths.mjs
-        node --check plugins/mindie-agent/session_support.mjs
         node --check plugins/mindie-agent/opencode_host.mjs
       build-command: |
         stamp="$RUNNER_TEMP/diagnostic-build.json"
@@ -42,4 +40,4 @@ jobs:
           --prefix="mindie-agent-oc-$RELEASE_VERSION/plugins/mindie-agent/scripts/" --add-file="$stamp" \
           --prefix="mindie-agent-oc-$RELEASE_VERSION/" \
           --output="$RELEASE_ASSETS_DIR/mindie-agent-oc-$RELEASE_VERSION.tar.gz" "$GITHUB_SHA"
-        .venv/bin/python plugins/mindie-agent/scripts/release_metadata.py --source . --tests tests --revision "$GITHUB_SHA" > "$RELEASE_ASSETS_DIR/mindie-plugin-release.json"
+        .venv/bin/python plugins/mindie-agent/scripts/setup.py release-metadata --source . --tests tests --revision "$GITHUB_SHA" > "$RELEASE_ASSETS_DIR/mindie-plugin-release.json"

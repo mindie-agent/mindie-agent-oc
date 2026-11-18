@@ -43,10 +43,8 @@ jobs:
       - name: JavaScript syntax and release metadata checks
         run: |
           node --check index.mjs
-          node --check plugins/mindie-agent/paths.mjs
-          node --check plugins/mindie-agent/session_support.mjs
           node --check plugins/mindie-agent/opencode_host.mjs
-          uv run --no-sync python plugins/mindie-agent/scripts/release_metadata.py --source . --tests tests --revision "${{ github.sha }}" > "${{ runner.temp }}/mindie-plugin-release.json"
+          uv run --no-sync python plugins/mindie-agent/scripts/setup.py release-metadata --source . --tests tests --revision "${{ github.sha }}" > "${{ runner.temp }}/mindie-plugin-release.json"
 
   smoke:
     name: Out-of-Tree npm Pack & Cold Smoke
@@ -81,8 +79,8 @@ jobs:
           from pathlib import Path
           plugin_dir = Path(sys.argv[1])
           sys.path.insert(0, str(plugin_dir / "scripts"))
-          import host_adapter
-          lock = host_adapter.verify_seed_bundle(plugin_dir)
+          import mindie_launch
+          lock = mindie_launch.verify_seed_bundle(plugin_dir)
           assert lock["schema"] == "mindie-harness-seed/1"
           PY
 

@@ -1,44 +1,44 @@
 # MindIE Agent — OpenCode Native Host Plugin (`mindie-agent-oc`)
 
-`mindie-agent-oc` (`@mindie-agent/oc`) is a **`host-plugin`** repository implementing the OpenCode v2 native host plugin (`index.mjs`, `plugins/mindie-agent/opencode_host.mjs`, `plugins/mindie-agent/paths.mjs`, and `plugins/mindie-agent/scripts/`), backed by `mindie-harness` (`v0.1.0`) and the shared MindIE runtime components.
+`mindie-agent-oc` (`@mindie-agent/oc`) is a **`host-plugin`** repository implementing the OpenCode v2 native host plugin, backed by `mindie-harness` (`v0.1.3`) and the shared MindIE runtime components. `v0.1.11` is the **thin host** release: the entire production surface is six files (`index.mjs`, `plugins/mindie-agent/opencode_host.mjs`, and `scripts/{mindie_launch,mcp_server,opencode_transcript,setup}.py`) totaling `< 1,200` lines.
 
 ## 1. Core Architectural & Contract Rules
 
 - **Zero Pre-Call Session-Binding Gates & Default-Enabled Knowledge (`P2.7` / `AD-01`)**:
-  - Standard MCP `tools/call` on `mindie-remote-dev` (`remote_*`) and `mindie-tools` (`mindie_status`, `profiler`, `sim`, `coordinator`, `debugger`, `npu_top`, `diagnostics_*`, `knowledge_*`) MUST succeed with **zero `_meta`, zero `_mindie_bind_id`, zero `OPENCODE_SESSION_ID`, and zero prior `execute.before` JS hook**, falling back cleanly to `_CONNECTION_SESSION_ID` and auto-provisioning a default session lease (`not_before=0.0`) on demand.
-  - Never inject `_mindie_bind_id` into tool schemas (`tools_catalog`, `remote_catalog`) and never throw from `tool.hook("execute.before")` on `pre-tool-use` failures. Forged session keys inside model-supplied `arguments` remain rejected.
+  - Standard MCP `tools/call` on `mindie-remote-dev` (`remote_*`) and `mindie-tools` (`mindie_status`, `mindie_doctor`, component, diagnostics, and `knowledge_*` tools) MUST succeed with **zero `_meta`, zero `_mindie_bind_id`, zero `OPENCODE_SESSION_ID`, and zero prior JS hook**; `mindie_harness` owns the connection-scoped fallback and on-demand default lease (`not_before=0.0`).
+  - `opencode_host.mjs` strips forged `_mindie_bind_id` from MindIE MCP inputs in pure Node.js and never spawns a pre-tool-use subprocess.
 - **Consent-First Idle Capture & Session Context Isolation**:
-  - `session.hook("context")` injects cached `SKILL.md` guidance directly in pure Node.js (zero Python subprocess per prompt) for top-level sessions (`!parentID && !forkSessionID`), with zero user-facing command registration.
-  - `event.subscribe` (`session.idle`) checks `mindie-community.json`, `mindie-consent.json`, and `project_roots` in pure Node.js before spawning `capture_stop.py`; when sharing is off or out of scope, zero subprocesses are spawned and zero `admission.sqlite3` files are created. Subagent (`parentID`) and forked (`forkSessionID`) sessions never capture transcripts.
-- **Shared Remote State & Concurrent Stdio MCP (`AD-02` & `AD-03`)**:
-  - `REMOTE_DEV_STATE_DIR` resolves to the shared profile-level `state_dir()/remote` directory so OpenCode `task` subagents can inspect and stop parent `job_id`s.
-  - `mcp_server.py` and `host_adapter.py` (`OCHostAdapter`) serve `Content-Length` and JSONL frames concurrently across separate read/control (`16` workers) and mutation (`8` workers) pools while holding `.inuse` generation leases (`hold_combined_service_lease`).
+  - `session.hook("context")` injects cached `SKILL.md` in pure Node.js (zero Python subprocess per prompt) for top-level sessions (`!parentID && !forkSessionID`), with zero user-facing command registration.
+  - Terminal events (`session.idle`, `session.execution.*`) are gated in pure Node.js on `mindie-community.json` (`enabled === true`), `mindie-consent.json` (`contribute` or `local-only`), and canonical `project_roots`; disabled/out-of-scope/subagent/forked sessions spawn zero subprocesses and create zero SQLite files. Duplicate idle events coalesce within `250ms`, and the deterministic `eventID` becomes `turn_id`.
+- **Shared Remote State & Resident MCP (`AD-02` / `AD-03`)**:
+  - `OCManagedAdapter` defaults `REMOTE_DEV_HARNESS_PROFILE="oc"` (14 native remote tools) and `REMOTE_DEV_STATE_DIR=<state_dir>/remote`, so subagents can inspect/stop parent jobs.
+  - `serve_mcp` provides concurrent dual-framing stdio, deadlines, and generation leases; a `knowledge_unavailable` fallback uses `mindie_knowledge.loop.transport.rpc` with Receipt Honesty on `Admission.finish` `OSError`/`sqlite3.Error`.
 - **Pure-Stdlib Windows Supervision & Zero Console Popups (`P1.5`)**:
-  - `bounded.py` delegates to `mindie_harness.process.supervisor.run_owned` and uses pure-stdlib `ctypes` (`kernel32` Job Objects) with zero `pywin32` (`win32api`/`win32job`) dependencies.
-  - Every Node.js `spawn`/`spawnSync` call MUST pass `windowsHide: true` and `detached: process.platform !== "win32"`, and every Windows Python subprocess call MUST include `CREATE_NO_WINDOW` (never `DETACHED_PROCESS` or `CREATE_NEW_CONSOLE`).
-- **Symlink Compatibility, Clean Skill Prose & Receipt Honesty (`AD-07`, `AD-10`, Principle 14)**:
-  - Never use blanket `O_NOFOLLOW` in `diagnostic_support.py` or `fs.lstatSync` config rejection in `paths.mjs` (`AD-07`).
-  - Keep `SKILL.md` and `references/domain-skills.md` free of benchmark tuples (`(out_tensor, metrics_dict)`) and `experiment_ledger.py` / `PROGRESS.md` ceremonies (`AD-10`).
-  - Keep all JS/Python source modules `< 800` lines with `[Role]`, `[Invariants]`, `[Timeouts & Locks]`, and `[Side-Effect Policy]` in the top 30 lines; always precede `except OSError:` with `except TimeoutError: raise`; preserve `isError=False` + `receipt_warning` + `receipt_unconfirmed=True` when local SQLite accounting fails after a primary operation succeeds.
+  - Every Node.js `spawn` call passes `windowsHide: true` and `detached: process.platform !== "win32"`; every Python `subprocess.run` passes `creationflags=CREATE_NO_WINDOW`.
+  - Fast paths (`hook session-start`, `hook pre-tool-use`, passive `hook stop`) are pure stdlib and import no runtime packages or SQLite.
+- **Read-Only Transcript Projection & Receipt Honesty (`AD-10`, Principle 14)**:
+  - `opencode_transcript.py` opens `opencode.db` strictly `?mode=ro`, rejects subagent/forked sessions, projects only public `text`/`input_text`/`output_text`, redacts secrets and private paths, recovers torn tails, and bounds cold spools to `64` files.
+  - Keep runtime `skills/` free of benchmark tuples, onboarding files, user-facing activation commands, and `disable-model-invocation`.
 
 ## 2. Plugin Module Map
 
 | Module | Role |
 | :--- | :--- |
-| `index.mjs` / `opencode_host.mjs` / `paths.mjs` / `session_support.mjs` | OpenCode v2 ESM plugin entry, pure-Node cached `SKILL.md` context hook, non-blocking tool correlation, loopback summary server, and consent-gated `session.idle` capture trigger. |
-| `scripts/host_adapter.py` | `OCHostAdapter` (`mindie_harness.api.HostAdapter`), `verify_seed_bundle()`, and concurrent dual-framing stdio loop (`serve_concurrent_stdio`). |
-| `scripts/mcp_server.py` / `scripts/knowledge_cli.py` | Zero-binding MCP surfaces (`remote`, `tools` including default-on `knowledge_*`) and on-demand lease-backed knowledge CLI. |
-| `scripts/bridge.py` / `scripts/admission.py` / `scripts/identity.py` | On-demand session lease provisioning (`ensure_default_lease`) and optional one-shot `mcp-binds.sqlite3` correlation. |
-| `scripts/opencode_spool.py` / `scripts/opencode_transcript.py` / `scripts/capture_stop.py` | Read-only SQLite `opencode.db` (`mode=ro`) incremental transcript spooling and turn-end capture handoff. |
-| `scripts/setup.py` / `scripts/component_update.py` / `scripts/storage_gc.py` | Atomic `oc.json` / `oc-source` provisioning, single-venv candidate upgrades, and bounded generation/spool GC. |
-| `scripts/bounded.py` / `scripts/diagnostic_support.py` / `scripts/rsi_loop.py` | `mindie_harness.process` + pure-stdlib `ctypes` Windows Job runner, symlink-safe sanitized fault recording, and `mindie_harness.rsi` entrypoints. |
+| `index.mjs` | Root OpenCode v2 entry shim; resolves the recorded active host module (`source_root` as plugin dir or outer repo root) with clean local fallback. |
+| `plugins/mindie-agent/opencode_host.mjs` | Windowless MCP registration, background update check, cached `SKILL.md` context, loopback `/v1/summary`, MCP input sanitization, shell `OPENCODE_SESSION_ID` binding, consent-first capture spawn. |
+| `plugins/mindie-agent/scripts/mindie_launch.py` | Pure-stdlib fast paths, seed verification/cold provisioning, active-interpreter re-exec, in-runtime `hook stop` capture, `summary` bridge, and `mcp`/`setup` dispatch. |
+| `plugins/mindie-agent/scripts/mcp_server.py` | Thin `OCManagedAdapter` gateway with `oc` remote defaults and the knowledge RPC fallback. |
+| `plugins/mindie-agent/scripts/opencode_transcript.py` | Read-only SQLite spool projector, `FileIdentity`, `sync_session_spool`, `capture_source`, `read_material` / `read_increment`. |
+| `plugins/mindie-agent/scripts/setup.py` | `init` profile writer, `sharing`/`doctor`/`update` harness delegation, `--dry-run`, and `release-metadata`. |
 
 ## 3. Local Verification
 
 ```bash
 python3 .github/scripts/check_lf_eol.py
 node --check index.mjs
-node --check plugins/mindie-agent/paths.mjs
 node --check plugins/mindie-agent/opencode_host.mjs
-pytest -q -m "not live_npu and not live_opencode"
+python3 -m pytest -q -m "not live_npu and not live_opencode"
+wc -l index.mjs plugins/mindie-agent/*.mjs plugins/mindie-agent/scripts/*.py
 ```
+
+`benchmarks/release.py` calls `sync_session_spool` and `read_material` directly and must always pass.

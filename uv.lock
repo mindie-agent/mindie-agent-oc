@@ -17,13 +17,13 @@ resolution-markers = [
 overrides = [
     { name = "mindie-coordinator", git = "https://github.com/mindie-agent/coordinator?rev=a3c7336faa0bc14ebdb8f2fd75606c82e96422e9" },
     { name = "mindie-debugger", git = "https://github.com/mindie-agent/debugger?rev=e15c2ed38d8f928db67c5bb1a94269f62207227c" },
-    { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=54ac7c03c78f9e02f379051d1613a4427559e10d" },
-    { name = "mindie-harness", git = "https://github.com/mindie-agent/harness?rev=f05569947dbf0131061d8698bb779d024df0c43b" },
-    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=8fe8455669e88ef6963314332422653841518900" },
+    { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=7464cbb4381e9dc996871d192eb3f05f61dfdb28" },
+    { name = "mindie-harness", git = "https://github.com/mindie-agent/harness?rev=14313b8ba58c888b20c9c216ec41d14f5e62f4f7" },
+    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=9f48272a3ba87248bfda0e4068692511aac4dfa4" },
     { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=b702893129724b852c5abcb8971724b8b0a6e870" },
     { name = "mindie-sim", git = "https://github.com/mindie-agent/sim?rev=83fb8288aa998e0a6ad345ca7a16269f0181545b" },
     { name = "npu-top", git = "https://github.com/mindie-agent/npu-top?rev=72654fe6047df6ccc67746c242b3ce18bcabc945" },
-    { name = "remote-dev", git = "https://github.com/mindie-agent/remote-dev?rev=64c5a8d0ca9fe344e7af05f89fc0de6249f2368a" },
+    { name = "remote-dev", git = "https://github.com/mindie-agent/remote-dev?rev=b33ca60baac81c237dd1bd6e7a8068945820727b" },
 ]
 
 [[package]]
@@ -2078,7 +2078,7 @@ wheels = [
 
 [[package]]
 name = "mindie-agent-oc"
-version = "0.1.10"
+version = "0.1.11"
 source = { editable = "." }
 dependencies = [
     { name = "mindie-coordinator" },
@@ -2103,14 +2103,14 @@ requires-dist = [
     { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4" },
     { name = "mindie-coordinator", git = "https://github.com/mindie-agent/coordinator?rev=a3c7336faa0bc14ebdb8f2fd75606c82e96422e9" },
     { name = "mindie-debugger", git = "https://github.com/mindie-agent/debugger?rev=e15c2ed38d8f928db67c5bb1a94269f62207227c" },
-    { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=54ac7c03c78f9e02f379051d1613a4427559e10d" },
-    { name = "mindie-harness", git = "https://github.com/mindie-agent/harness?rev=f05569947dbf0131061d8698bb779d024df0c43b" },
-    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=8fe8455669e88ef6963314332422653841518900" },
+    { name = "mindie-diagnostics", git = "https://github.com/mindie-agent/diagnostics?rev=7464cbb4381e9dc996871d192eb3f05f61dfdb28" },
+    { name = "mindie-harness", git = "https://github.com/mindie-agent/harness?rev=14313b8ba58c888b20c9c216ec41d14f5e62f4f7" },
+    { name = "mindie-knowledge", git = "https://github.com/mindie-agent/knowledge?rev=9f48272a3ba87248bfda0e4068692511aac4dfa4" },
     { name = "mindie-profiler", git = "https://github.com/mindie-agent/profiler?rev=b702893129724b852c5abcb8971724b8b0a6e870" },
     { name = "mindie-sim", git = "https://github.com/mindie-agent/sim?rev=83fb8288aa998e0a6ad345ca7a16269f0181545b" },
     { name = "npu-top", git = "https://github.com/mindie-agent/npu-top?rev=72654fe6047df6ccc67746c242b3ce18bcabc945" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
-    { name = "remote-dev", git = "https://github.com/mindie-agent/remote-dev?rev=64c5a8d0ca9fe344e7af05f89fc0de6249f2368a" },
+    { name = "remote-dev", git = "https://github.com/mindie-agent/remote-dev?rev=b33ca60baac81c237dd1bd6e7a8068945820727b" },
 ]
 provides-extras = ["components", "test"]
 
@@ -2131,21 +2131,22 @@ source = { git = "https://github.com/mindie-agent/debugger?rev=e15c2ed38d8f928db
 
 [[package]]
 name = "mindie-diagnostics"
-version = "0.5.16"
-source = { git = "https://github.com/mindie-agent/diagnostics?rev=54ac7c03c78f9e02f379051d1613a4427559e10d#54ac7c03c78f9e02f379051d1613a4427559e10d" }
+version = "0.5.17"
+source = { git = "https://github.com/mindie-agent/diagnostics?rev=7464cbb4381e9dc996871d192eb3f05f61dfdb28#7464cbb4381e9dc996871d192eb3f05f61dfdb28" }
 
 [[package]]
 name = "mindie-harness"
-version = "0.1.0"
-source = { git = "https://github.com/mindie-agent/harness?rev=f05569947dbf0131061d8698bb779d024df0c43b#f05569947dbf0131061d8698bb779d024df0c43b" }
+version = "0.1.4"
+source = { git = "https://github.com/mindie-agent/harness?rev=14313b8ba58c888b20c9c216ec41d14f5e62f4f7#14313b8ba58c888b20c9c216ec41d14f5e62f4f7" }
 
 [[package]]
 name = "mindie-knowledge"
-version = "0.13.23"
-source = { git = "https://github.com/mindie-agent/knowledge?rev=8fe8455669e88ef6963314332422653841518900#8fe8455669e88ef6963314332422653841518900" }
+version = "0.13.24"
+source = { git = "https://github.com/mindie-agent/knowledge?rev=9f48272a3ba87248bfda0e4068692511aac4dfa4#9f48272a3ba87248bfda0e4068692511aac4dfa4" }
 dependencies = [
     { name = "langmem" },
     { name = "mindie-diagnostics" },
+    { name = "mindie-harness" },
     { name = "packaging" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "pyyaml" },
@@ -3621,8 +3622,8 @@ as = [
 
 [[package]]
 name = "remote-dev"
-version = "0.11.13"
-source = { git = "https://github.com/mindie-agent/remote-dev?rev=64c5a8d0ca9fe344e7af05f89fc0de6249f2368a#64c5a8d0ca9fe344e7af05f89fc0de6249f2368a" }
+version = "0.11.14"
+source = { git = "https://github.com/mindie-agent/remote-dev?rev=b33ca60baac81c237dd1bd6e7a8068945820727b#b33ca60baac81c237dd1bd6e7a8068945820727b" }
 dependencies = [
     { name = "mindie-diagnostics" },
 ]
