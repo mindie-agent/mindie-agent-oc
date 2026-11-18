@@ -90,7 +90,7 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
     assert mcp["mindie-tools"]["args"][-2:] == ["mcp", "tools"]
 
     lock = mindie_launch.verify_seed_bundle(PLUGIN_ROOT)
-    assert lock["schema"] == "mindie-harness-seed/1" and lock["version"] == "0.1.3"
+    assert lock["schema"] == "mindie-harness-seed/1" and lock["version"] == "0.1.4"
 
     skill = (PLUGIN_ROOT / "skills" / "mindie-agent" / "SKILL.md").read_text(encoding="utf-8")
     frontmatter = skill.split("---", 2)[1]
