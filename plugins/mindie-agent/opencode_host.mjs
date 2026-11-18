@@ -1,12 +1,12 @@
 /**
  * [Role] Native OpenCode v2 (`@opencode-ai/plugin` >= 2.2.0) host adapter for MindIE Agent (`oc`).
  * [Invariants]
- * - Default MCP (`mindie-remote-dev`, `mindie-tools`) registers zero `knowledge_*` tools; MCP execution budget is 660000ms (>= 600s + 60s cleanup grace).
- * - Passive Default: unactivated sessions incur zero subprocess spawns on ordinary prompts/contexts (`!fs.existsSync(admission.sqlite3)` fast-path) and zero system-prompt additions.
- * - Session Isolation: `SKILL.md` system guidance, `OPENCODE_SESSION_ID` shell env, and `session.idle` capture activate strictly per-`sessionID` after an explicit `/mindie-agent` or `$mindie-agent` gesture in a top-level session (`!parentID && !forkSessionID`).
+ * - Default MCP (`mindie-remote-dev`, `mindie-tools`) exposes all deterministic and `knowledge_*` tools on startup; MCP execution budget is 660000ms (>= 600s + 60s cleanup grace).
+ * - Zero Subprocess Per Prompt: `session.hook("context")` injects cached `SKILL.md` guidance directly in pure Node.js for top-level sessions (`!parentID && !forkSessionID`) with zero user-facing command registration.
+ * - Consent-First Idle Capture: `event.subscribe` evaluates `mindie-community.json` + `mindie-consent.json` + `project_roots` in pure Node.js before spawning `capture_stop.py` (0ms / zero subprocesses when sharing is off or out of scope).
  * - Zero Console Popup (P1.5): every `spawn` uses `windowsHide: true`, and Windows background spawns never combine `detached: true` with `windowsHide: true`.
  * [Timeouts & Locks] Hook subprocess calls enforce a 15000ms outer Node deadline (`>= HOOK_SUPERVISOR_BUDGET 10.0s + HOOK_CLEANUP_GRACE 2.0s + 3.0s grace`); loopback summary server binds `127.0.0.1:0` with `unref()`.
- * [Side-Effect Policy] Delegates state mutations to MindIE Python scripts (`mindie_launch.py`, `capture_stop.py`) and writes only `summary-endpoint.json` under MindIE `stateDir()`.
+ * [Side-Effect Policy] Delegates optional tool-bind correlation and authorized turn-end capture to MindIE Python scripts (`mindie_launch.py`, `capture_stop.py`) and writes only `summary-endpoint.json` under MindIE `stateDir()`.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -20,10 +20,9 @@ import {
     summaryEndpointPath,
 } from "./paths.mjs";
 import {
-    admissionMtimeSignature, parseModelSpec, renderSkillSystemBlock, safeGetSession,
+    mayCaptureCommunitySession, parseModelSpec, renderSkillSystemBlock, safeGetSession,
 } from "./session_support.mjs";
 
-const GESTURE_PREFIX_RE = /^\uFEFF?\s*(?:\/mindie-agent(?::mindie-agent)?|\$mindie-agent(?::mindie-agent)?)(?=\s|$)/;
 const MCP_WIRE_RE = /^(?:mcp[_:])?(?:mindie[-_]agent[-_:])?(mindie[-_]remote[-_]dev|mindie[-_]tools)[_:]([A-Za-z0-9_.-]+)$/;
 const SHELL_TOKEN_INLINE_RE = /\r?\n# __mindie_oc_sid:([0-9a-f]{24})(?=$|['"\s])/;
 const TERMINAL_SESSION_EVENTS = new Set([
@@ -235,20 +234,12 @@ function spawnDetachedCapture(payload) {
     child.unref();
 }
 
-function extractGestureTaskPrompt(rawText) {
-    const rem = String(rawText || "").replace(GESTURE_PREFIX_RE, "").trim();
-    if (!rem) return "";
-    const first = rem.split(/\s+/, 2)[0].toLowerCase();
-    return rem === first && (first === "activate" || first === "deactivate" || first === "status") ? "" : rem;
-}
-
 export default {
     id: "mindie-agent",
     async setup(ctx) {
         let disposed = false;
         let summaryServer = null;
         let summaryServerPromise = null;
-        const sessionStateCache = new Map();
         const pendingShellQueue = [];
         const pendingShellTokens = new Map();
         const recentCaptureBySession = new Map();
@@ -345,7 +336,7 @@ export default {
             return await summaryServerPromise;
         }
 
-        // 1. Register deterministic MCP surfaces (`mindie-remote-dev` & `mindie-tools`).
+        // 1. Register MCP surfaces (`mindie-remote-dev` & `mindie-tools`).
         async function refreshMcpSurfaces() {
             if (disposed || !ctx?.mcp || typeof ctx.mcp.transform !== "function") {
                 return;
@@ -373,135 +364,19 @@ export default {
             }
         }
 
-        let bootstrapPollTimer = null;
-        function watchBootstrapReady() {
-            if (disposed || bootstrapPollTimer) return;
-            const startedAt = Date.now();
-            const cfgFile = configPath();
-            bootstrapPollTimer = setInterval(async () => {
-                if (disposed || Date.now() - startedAt > 560000) {
-                    clearInterval(bootstrapPollTimer);
-                    bootstrapPollTimer = null;
-                    return;
-                }
-                if (fs.existsSync(cfgFile)) {
-                    clearInterval(bootstrapPollTimer);
-                    bootstrapPollTimer = null;
-                    try {
-                        await refreshMcpSurfaces();
-                    } catch {
-                        // Ignore reload error during shutdown.
-                    }
-                }
-            }, 1500);
-            if (typeof bootstrapPollTimer.unref === "function") {
-                bootstrapPollTimer.unref();
-            }
-        }
-
         await refreshMcpSurfaces();
         maybeTriggerBackgroundPluginSync();
 
-        // 2. Register `/mindie-agent` native slash command.
-        if (ctx?.command && typeof ctx.command.transform === "function") {
-            await ctx.command.transform((editor) => {
-                editor.add({
-                    name: "mindie-agent",
-                    description: "Activate, inspect, or deactivate the MindIE Agent knowledge flywheel for this OpenCode session",
-                    execute: async ({ sessionID, prompt, delivery }) => {
-                        const rawArg = typeof prompt?.text === "string" ? prompt.text.trim() : "";
-                        const gestureText = GESTURE_PREFIX_RE.test(rawArg) ? rawArg : rawArg ? `/mindie-agent ${rawArg}` : "/mindie-agent";
-                        const info = await safeGetSession(ctx, sessionID);
-                        let res;
-                        try {
-                            res = await runHook("gesture", { sessionID, directory: info?.directory || defaultDirectory(), parentID: info?.parentID, forkSessionID: info?.forkSessionID, prompt: gestureText });
-                        } catch (err) {
-                            const errMsg = `MindIE session control unavailable: ${err?.message || err}`;
-                            process.stderr.write(`MindIE OpenCode command gesture failed (${sessionID}): ${err?.message || err}\n`);
-                            if (typeof ctx?.session?.synthetic === "function") await ctx.session.synthetic({ sessionID, text: errMsg, resume: false });
-                            const fallbackTask = extractGestureTaskPrompt(gestureText);
-                            if (fallbackTask && typeof ctx?.session?.prompt === "function") {
-                                await ctx.session.prompt({ ...prompt, sessionID, text: fallbackTask, ...(delivery ? { delivery } : {}) });
-                            }
-                            return;
-                        }
-                        sessionStateCache.delete(sessionID);
-                        if (res.activated) {
-                            await ensureSummaryServer();
-                            if (res.bootstrapping) watchBootstrapReady();
-                        }
-                        if (res.action === "activate" && typeof res.task_prompt === "string" && res.task_prompt.trim()) {
-                            if ((res.schema_warning || res.status === "degraded") && typeof ctx?.session?.synthetic === "function" && res.message) {
-                                await ctx.session.synthetic({ sessionID, text: res.message, resume: false });
-                            }
-                            await ctx.session.prompt({ ...prompt, sessionID, text: res.task_prompt, ...(delivery ? { delivery } : {}) });
-                            return;
-                        }
-                        if (typeof ctx?.session?.synthetic === "function" && res.message) {
-                            await ctx.session.synthetic({ sessionID, text: res.message, resume: false });
-                        }
-                    },
-                });
-            });
-            if (typeof ctx.command.reload === "function") await ctx.command.reload();
-        }
-
-        // 3. Session prompt hook for `/mindie-agent` or `$mindie-agent` prefixes in direct prompts.
+        // 2. Session context hook: inject cached `SKILL.md` directly in pure Node.js (zero subprocesses per prompt).
         if (ctx?.session && typeof ctx.session.hook === "function") {
-            ctx.session.hook("prompt", async ({ sessionID, prompt }) => {
-                const rawText = typeof prompt?.text === "string" ? prompt.text : "";
-                if (!GESTURE_PREFIX_RE.test(rawText)) return;
-                const info = await safeGetSession(ctx, sessionID);
-                let res;
-                try {
-                    res = await runHook("gesture", { sessionID, directory: info?.directory || defaultDirectory(), parentID: info?.parentID, forkSessionID: info?.forkSessionID, prompt: rawText });
-                } catch (err) {
-                    process.stderr.write(`MindIE OpenCode prompt gesture failed (${sessionID}): ${err?.message || err}\n`);
-                    const fallbackTask = extractGestureTaskPrompt(rawText);
-                    prompt.text = fallbackTask
-                        ? `${fallbackTask}\n\n[MindIE Unavailable: ${err?.message || err}]`
-                        : `[MindIE Session Control] MindIE session control unavailable: ${err?.message || err}\nAcknowledge this status in one short sentence without calling tools.`;
-                    return;
-                }
-                sessionStateCache.delete(sessionID);
-                if (!res.matched) return;
-                if (res.activated) {
-                    await ensureSummaryServer();
-                    if (res.bootstrapping) watchBootstrapReady();
-                }
-                if (typeof res.task_prompt === "string" && res.task_prompt.trim()) {
-                    prompt.text = res.schema_warning ? `${res.task_prompt}\n\n[MindIE Warning: ${res.schema_warning}]` : res.task_prompt;
-                } else if (res.message) {
-                    prompt.text = `[MindIE Session Control] ${res.message}\nAcknowledge this status in one short sentence without calling tools.`;
-                }
-            });
-
-            // 4. Session context hook: inject `SKILL.md` strictly into activated sessions.
             ctx.session.hook("context", async ({ sessionID, system }) => {
-                const sig = admissionMtimeSignature(sessionID);
-                if (sig === null) {
-                    sessionStateCache.clear();
+                if (!Array.isArray(system) || typeof sessionID !== "string" || !sessionID) {
                     return;
                 }
-                let state = null;
-                const cached = sessionStateCache.get(sessionID);
-                if (cached && cached.sig === sig) {
-                    state = cached.state;
-                } else {
-                    const info = await safeGetSession(ctx, sessionID);
-                    try {
-                        state = await runHook("session-state", { sessionID, directory: info?.directory || defaultDirectory(), parentID: info?.parentID, forkSessionID: info?.forkSessionID });
-                        if (state?.status === "unavailable") {
-                            process.stderr.write(`MindIE OpenCode session-state unavailable (${sessionID}): ${state.error || state.reason || "unavailable"}\n`);
-                        } else {
-                            sessionStateCache.set(sessionID, { sig, state });
-                        }
-                    } catch (err) {
-                        process.stderr.write(`MindIE OpenCode session-state hook failed (${sessionID}): ${err?.message || err}\n`);
-                        return;
-                    }
+                const info = await safeGetSession(ctx, sessionID);
+                if (info?.parentID || info?.forkSessionID) {
+                    return;
                 }
-                if (!state?.activated || !Array.isArray(system)) return;
                 await ensureSummaryServer();
                 const marker = `<mindie-agent-skill session="${sessionID}">`;
                 const alreadyPresent = system.some(
@@ -510,13 +385,13 @@ export default {
                 if (!alreadyPresent) {
                     system.push({
                         type: "text",
-                        text: renderSkillSystemBlock(sessionID, state),
+                        text: renderSkillSystemBlock(sessionID),
                     });
                 }
             });
         }
 
-        // 5. Tool hook: publish optional non-blocking MCP binds (P2.7) & correlate shell commands with `sessionID`.
+        // 3. Tool hook: publish optional non-blocking MCP binds (P2.7) & correlate shell commands with `sessionID`.
         if (ctx?.tool && typeof ctx.tool.hook === "function") {
             ctx.tool.hook("execute.before", async ({ tool, sessionID, id, input }) => {
                 if (typeof tool === "string" && MCP_WIRE_RE.test(tool)) {
@@ -583,7 +458,7 @@ export default {
             });
         }
 
-        // 6. Shell hook: inject `OPENCODE_SESSION_ID` into session-scoped child shells.
+        // 4. Shell hook: inject `OPENCODE_SESSION_ID` into session-scoped child shells.
         if (ctx?.shell && typeof ctx.shell.hook === "function") {
             ctx.shell.hook("create.before", (shellInit) => {
                 const env = shellInit?.env;
@@ -644,7 +519,7 @@ export default {
             });
         }
 
-        // 7. Event stream subscription: await subscription setup synchronously so zero standalone turn events race startup.
+        // 5. Event stream subscription: pure-Node consent + scope gate before spawning `capture_stop.py`.
         if (ctx?.event && typeof ctx.event.subscribe === "function") {
             let stream = null;
             try {
@@ -661,7 +536,11 @@ export default {
                             if (!TERMINAL_SESSION_EVENTS.has(evType)) continue;
                             if (evType === "session.execution.interrupted" && event?.data?.reason === "shutdown") continue;
                             const sessionID = event?.data?.sessionID ?? event?.properties?.sessionID;
-                            if (typeof sessionID !== "string" || admissionMtimeSignature(sessionID) === null) continue;
+                            if (typeof sessionID !== "string" || !sessionID) continue;
+                            const info = await safeGetSession(ctx, sessionID);
+                            if (info?.parentID || info?.forkSessionID) continue;
+                            const sessionDir = info?.directory || defaultDirectory();
+                            if (!mayCaptureCommunitySession(sessionDir)) continue;
                             const now = Date.now();
                             const explicitId = typeof event?.id === "string" && event.id ? event.id : null;
                             const prev = recentCaptureBySession.get(sessionID);
@@ -672,7 +551,13 @@ export default {
                                 const oldestKey = recentCaptureBySession.keys().next().value;
                                 if (oldestKey !== undefined) recentCaptureBySession.delete(oldestKey);
                             }
-                            spawnDetachedCapture({ sessionID, eventID, eventType: evType, opencodeDb: opencodeDbPath() });
+                            spawnDetachedCapture({
+                                sessionID,
+                                directory: sessionDir,
+                                eventID,
+                                eventType: evType,
+                                opencodeDb: opencodeDbPath(),
+                            });
                         }
                     } catch (err) {
                         if (!disposed) {
@@ -685,11 +570,6 @@ export default {
 
         return async () => {
             disposed = true;
-            if (bootstrapPollTimer) {
-                clearInterval(bootstrapPollTimer);
-                bootstrapPollTimer = null;
-            }
-            sessionStateCache.clear();
             pendingShellQueue.length = 0;
             pendingShellTokens.clear();
             recentCaptureBySession.clear();

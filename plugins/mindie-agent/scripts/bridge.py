@@ -1,28 +1,27 @@
-"""OpenCode (`oc`) lifecycle hook bridge (`gesture`, `session-state`, `pre-tool-use`, `stop`).
+"""OpenCode (`oc`) lifecycle hook bridge (`session-state`, `pre-tool-use`, `stop`).
 
 [Role]
-Bridges `opencode_host.mjs` hook callbacks (`command.transform`, `session.hook('prompt')`,
-`session.hook('context')`, `tool.hook('execute.before')`, and `event.subscribe`
-`session.idle`) into MindIE's session lease store (`admission.sqlite3`), one-shot
-MCP bind table (`mcp-binds.sqlite3`), and turn-end transcript capture.
+Bridges `opencode_host.mjs` callbacks (`tool.hook('execute.before')` and
+`event.subscribe` `session.idle`) into MindIE's optional one-shot MCP bind table
+(`mcp-binds.sqlite3`), on-demand session lease store (`admission.sqlite3`), and
+consent-gated turn-end transcript capture.
 
 [Invariants]
-- Passive Default: ordinary prompts without `/mindie-agent` or `$mindie-agent`
-  return `{"matched": false}` immediately without creating `admission.sqlite3`,
-  starting background services, or capturing transcripts.
+- Passive Default: `handle_session_state` is strictly read-only and never creates
+  `admission.sqlite3` or starts background services.
 - Non-Inheritance: subagent (`parentID`) and forked (`forkSessionID`) sessions
   are rejected before activating a lease or capturing transcripts.
-- Lease Honesty: if `Admission.activate` succeeds on `/mindie-agent` but default
-  profile setup degrades, the active lease is preserved (`status="degraded"`).
+- Lease Honesty: if `Admission.activate` succeeds during programmatic session
+  control while default profile setup degrades, the active lease is preserved
+  (`status="degraded"`).
 
 [Timeouts & Locks]
 - Executes within `mindie_launch.py`'s `HOOK_TOTAL = 10.0s` budget; SQLite WAL
   writes use `5.0s` busy timeout.
 
 [Side-Effect Policy]
-- Mutates `admission.sqlite3` only on explicit `/mindie-agent` gestures, writes
-  one-shot binds to `mcp-binds.sqlite3` on MindIE MCP `execute.before`, and
-  delegates `stop` capture to `capture_stop.py`.
+- Writes optional one-shot binds to `mcp-binds.sqlite3` on MindIE MCP
+  `execute.before` and delegates `stop` capture to `capture_stop.py`.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ import subprocess
 import sys
 import time
 
-from admission import activate, deactivate, knowledge_lease, status_facts
+from admission import activate, deactivate, is_deactivated, knowledge_lease, status_facts
 from component_update import trigger_background_update_if_due
 from identity import (
     is_eligible_main_session,
@@ -76,6 +75,7 @@ def handle_session_state(event: dict | None = None, *, config=None) -> dict:
     except ValueError:
         return dict(activated=False, eligible=False, reason="invalid_session")
     try:
+        deactivated = is_deactivated(session, config=config)
         lease = knowledge_lease(session, config=config)
     except TimeoutError:
         raise
@@ -90,7 +90,7 @@ def handle_session_state(event: dict | None = None, *, config=None) -> dict:
             error=err_text,
             session_id=session,
         )
-    if lease is None:
+    if deactivated:
         return dict(activated=False, eligible=True, session_id=session)
     scripts_dir = Path(__file__).resolve().parent
     skill_file = plugin_root() / "skills" / "mindie-agent" / "SKILL.md"
@@ -98,8 +98,8 @@ def handle_session_state(event: dict | None = None, *, config=None) -> dict:
         activated=True,
         eligible=True,
         session_id=session,
-        project_root=lease.get("project_root"),
-        activated_at=lease.get("activated_at"),
+        project_root=lease.get("project_root") if lease else None,
+        activated_at=lease.get("activated_at") if lease else None,
         skill_path=str(skill_file),
         knowledge_cli=str(scripts_dir / "knowledge_cli.py"),
         rsi_loop=str(scripts_dir / "rsi_loop.py"),
@@ -191,7 +191,7 @@ def _spawn_background_schema_prepare(cfg_file: Path, python_exe: str) -> bool:
 
 
 def handle_gesture(event: dict | None = None, *, config=None) -> dict:
-    """Handle explicit `/mindie-agent` or `$mindie-agent` commands and prompt prefixes."""
+    """Programmatic compatibility handler for legacy session-control callers."""
     hook_deadline = time.monotonic() + 7.5
     event = _read_stdin_event() if event is None else event
     try:

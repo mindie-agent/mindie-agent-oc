@@ -49,6 +49,14 @@ export function configPath(explicit = null) {
     return path.join(configHome(), "oc.json");
 }
 
+export function communityConfigPath(explicit = null) {
+    return path.join(path.dirname(configPath(explicit)), "mindie-community.json");
+}
+
+export function consentPath(explicit = null) {
+    return path.join(path.dirname(configPath(explicit)), "mindie-consent.json");
+}
+
 export function parseSemverTuple(raw) {
     if (typeof raw !== "string") return null;
     const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());

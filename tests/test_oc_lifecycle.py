@@ -1,13 +1,16 @@
-"""Lifecycle, manual `/mindie-agent` lease, MCP bind, and `session.idle` tests (`test_oc_lifecycle.py`).
+"""Lifecycle, on-demand session lease, MCP bind, and consent-first `session.idle` tests (`test_oc_lifecycle.py`).
 
 [Role]
 Tests `bridge.py`, `admission.py`, `identity.py`, and `capture_stop.py` across
-ordinary prompts, subagent/forked sessions, `/mindie-agent` gestures, one-shot
-MCP tool binds, and read-only SQLite `session.idle` capture handoff.
+top-level vs. subagent/forked sessions, case-sensitive OpenCode session leases,
+one-shot MCP tool binds, and consent-gated read-only SQLite `session.idle`
+capture handoff.
 
 [Invariants]
-- Ordinary prompts and subagent/forked sessions never create `admission.sqlite3`
-  or capture transcripts.
+- Unconfigured/disabled community sharing, out-of-scope workspaces, and
+  subagent/forked sessions never create `admission.sqlite3` or capture transcripts.
+- Authorized in-scope `session.idle` auto-provisions a default lease (`not_before=0.0`)
+  and spools only post-`enabled_at` public turns.
 - One-shot binds in `mcp-binds.sqlite3` reject replays and forged identity args.
 
 [Timeouts & Locks]
@@ -24,10 +27,10 @@ from pathlib import Path
 import sqlite3
 import pytest
 
-from admission import knowledge_lease
-from bridge import handle_gesture, handle_pre_tool_use, handle_session_state, handle_stop
+from admission import deactivate, ensure_default_lease, knowledge_lease, status_facts
+from bridge import handle_pre_tool_use, handle_session_state, handle_stop
 from identity import claim_bind, finish_bind
-from paths import admission_path, community_config_path, config_path, engine_config_path, transcript_spool_dir
+from paths import admission_path, config_path, engine_config_path, transcript_spool_dir
 
 
 def _seed_opencode_v2_db(db_path: Path, session_id: str, directory: str) -> None:
@@ -82,80 +85,56 @@ def _seed_opencode_v2_db(db_path: Path, session_id: str, directory: str) -> None
         db.close()
 
 
-def test_passive_ordinary_prompt_and_subagent_non_inheritance(isolated_oc_env: dict[str, Path]) -> None:
+def test_passive_session_state_and_subagent_non_inheritance(isolated_oc_env: dict[str, Path]) -> None:
     ws = str(isolated_oc_env["workspace"])
-    res = handle_gesture({"sessionID": "ses_passive01", "directory": ws, "prompt": "Explain RMSNorm on Ascend"})
-    assert res == {"matched": False}
+    state = handle_session_state({"sessionID": "ses_passive01", "directory": ws})
+    assert state["activated"] is True
+    assert state["eligible"] is True
     assert not admission_path().exists()
 
-    state = handle_session_state({"sessionID": "ses_passive01", "directory": ws})
-    assert state["activated"] is False
-
-    # Subagent (`parentID`) and forked (`forkSessionID`) sessions cannot activate a lease.
-    sub = handle_gesture(
+    # Subagent (`parentID`) and forked (`forkSessionID`) sessions are rejected without touching SQLite.
+    sub = handle_session_state(
         {
             "sessionID": "ses_sub001",
             "parentID": "ses_passive01",
             "directory": ws,
-            "prompt": "/mindie-agent optimize matmul",
         }
     )
-    assert sub["matched"] is True
     assert sub["activated"] is False
+    assert sub["eligible"] is False
     assert sub["reason"] == "subagent_session"
     assert not admission_path().exists()
 
-    forked = handle_gesture(
+    forked = handle_session_state(
         {
             "sessionID": "ses_fork001",
             "forkSessionID": "ses_passive01",
             "directory": ws,
-            "prompt": "$mindie-agent",
         }
     )
-    assert forked["matched"] is True
     assert forked["activated"] is False
+    assert forked["eligible"] is False
     assert forked["reason"] == "forked_session"
+    assert not admission_path().exists()
 
 
-def test_explicit_mindie_agent_gesture_activates_and_deactivates_lease(isolated_oc_env: dict[str, Path]) -> None:
+def test_on_demand_case_sensitive_lease_and_deactivation(isolated_oc_env: dict[str, Path]) -> None:
     ws = str(isolated_oc_env["workspace"])
-    act = handle_gesture(
-        {
-            "sessionID": "ses_CaseSensitive_01",
-            "directory": ws,
-            "prompt": "/mindie-agent analyze Ascend A3 HCCL topology",
-        }
-    )
-    assert act["matched"] is True
-    assert act["activated"] is True
-    assert act["action"] == "activate"
-    assert act["task_prompt"] == "analyze Ascend A3 HCCL topology"
+    lease = ensure_default_lease("ses_CaseSensitive_01", ws, not_before=0.0)
+    assert lease["session"] == "ses_CaseSensitive_01"
+    assert float(lease["activated_at"]) == 0.0
     assert knowledge_lease("ses_CaseSensitive_01") is not None
     # Case-sensitive OpenCode IDs must NOT match lowercased variants.
     assert knowledge_lease("ses_casesensitive_01") is None
 
-    status = handle_gesture(
-        {
-            "sessionID": "ses_CaseSensitive_01",
-            "directory": ws,
-            "prompt": "/mindie-agent status",
-        }
-    )
-    assert status["action"] == "status"
-    assert status["facts"]["harness"] == "opencode"
-    assert status["facts"]["activated"] is True
+    facts = status_facts("ses_CaseSensitive_01")
+    assert facts["harness"] == "opencode"
+    assert facts["activated"] is True
 
-    deact = handle_gesture(
-        {
-            "sessionID": "ses_CaseSensitive_01",
-            "directory": ws,
-            "prompt": "/mindie-agent deactivate",
-        }
-    )
-    assert deact["action"] == "deactivate"
-    assert deact["activated"] is False
+    deact = deactivate("ses_CaseSensitive_01")
+    assert deact["status"] == "inactive"
     assert knowledge_lease("ses_CaseSensitive_01") is None
+    assert status_facts("ses_CaseSensitive_01")["activated"] is False
 
 
 def test_pre_tool_use_binds_mcp_call_and_rejects_replay(isolated_oc_env: dict[str, Path]) -> None:
@@ -195,21 +174,22 @@ def test_pre_tool_use_binds_mcp_call_and_rejects_replay(isolated_oc_env: dict[st
         )
 
 
-def test_stop_requires_manual_lease_and_spools_public_transcript(
+def test_stop_checks_consent_before_sqlite_and_auto_leases_when_enabled(
     isolated_oc_env: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ws = str(isolated_oc_env["workspace"])
+    outside_ws = str(isolated_oc_env["root"] / "unscoped-dir")
+    Path(outside_ws).mkdir(parents=True, exist_ok=True)
     db_file = isolated_oc_env["opencode_db"]
     _seed_opencode_v2_db(db_file, "ses_capture01", ws)
 
-    # 1. Without manual lease, stop returns inert and creates no transcript spool.
-    inert = handle_stop({"sessionID": "ses_capture01", "opencodeDb": str(db_file)})
-    assert inert == {"stage": "inert", "reason": "no_manual_lease"}
+    # 1. With community sharing unconfigured, stop returns inert and creates ZERO admission.sqlite3 or spool!
+    inert = handle_stop({"sessionID": "ses_capture01", "directory": ws, "opencodeDb": str(db_file)})
+    assert inert == {"stage": "inert", "reason": "community_unconfigured"}
+    assert not admission_path().exists()
     assert not (transcript_spool_dir() / "ses_capture01.jsonl").exists()
 
-    # 2. Activate lease and seed community consent + engine config, then verify spool + handoff.
-    handle_gesture({"sessionID": "ses_capture01", "directory": ws, "prompt": "/mindie-agent"})
     config_path().parent.mkdir(parents=True, exist_ok=True)
     if not config_path().is_file():
         config_path().write_text(json.dumps({"harness": "opencode"}) + "\n", encoding="utf-8")
@@ -218,12 +198,22 @@ def test_stop_requires_manual_lease_and_spools_public_transcript(
 
     import setup as oc_setup
 
+    # 2. Community sharing explicitly disabled -> still ZERO admission.sqlite3 created!
+    oc_setup.configure_community(enabled=False, project_root=ws)
+    disabled_res = handle_stop({"sessionID": "ses_capture01", "directory": ws, "opencodeDb": str(db_file)})
+    assert disabled_res["stage"] == "inert"
+    assert not admission_path().exists()
+
+    # 3. Enable community sharing for `ws`, then check out-of-scope directory -> still ZERO admission.sqlite3!
     oc_setup.configure_community(
         enabled=True,
         fork="test-user/knowledge-vllm-ascend",
         account="test-user",
         project_root=ws,
     )
+    out_of_scope = handle_stop({"sessionID": "ses_capture01", "directory": outside_ws, "opencodeDb": str(db_file)})
+    assert out_of_scope == {"stage": "inert", "reason": "out_of_scope"}
+    assert not admission_path().exists()
 
     captured_calls: list[tuple[str, dict]] = []
     import mindie_knowledge.loop.cli as loop_cli
@@ -234,7 +224,14 @@ def test_stop_requires_manual_lease_and_spools_public_transcript(
 
     monkeypatch.setattr(loop_cli, "capture_hook", _fake_capture_hook)
 
-    # 3. Pre-activation messages (from _seed_opencode_v2_db, timestamp 1700000000100) must NOT be spooled!
+    # 4. Simulate an earlier zero-cwd MCP call creating a lease at an out-of-scope dir; Stop MUST re-bind to verified `ws`!
+    ensure_default_lease("ses_capture01", outside_ws, not_before=0.0)
+    assert Path(knowledge_lease("ses_capture01")["project_root"]).resolve() == Path(outside_ws).resolve()
+    # Event without verified directory AND session missing from opencode.db -> missing_project_root (never guesses from stale lease!).
+    no_dir_res = handle_stop({"sessionID": "ses_unknown_nodir", "opencodeDb": str(db_file)})
+    assert no_dir_res == {"stage": "inert", "reason": "missing_project_root"}
+
+    # In-scope authorized stop re-activates lease with verified `ws` (`not_before=0.0`), while pre-consent turns (`1700000000100`) are skipped!
     pre_auth_receipt = handle_stop(
         {
             "sessionID": "ses_capture01",
@@ -244,8 +241,11 @@ def test_stop_requires_manual_lease_and_spools_public_transcript(
     )
     assert pre_auth_receipt == {"stage": "inert", "reason": "transcript_unavailable"}
     assert len(captured_calls) == 0
+    auto_lease = knowledge_lease("ses_capture01")
+    assert auto_lease is not None and float(auto_lease["activated_at"]) == 0.0
+    assert Path(auto_lease["project_root"]).resolve() == Path(ws).resolve()
 
-    # 4. Append a post-authorization turn (`now_ms`) and verify only authorized public text is spooled.
+    # 5. Append a post-consent turn (`now_ms`) and verify only authorized public text is spooled (no reasoning).
     import time as _time
 
     now_ms = int(_time.time() * 1000) + 100
@@ -282,12 +282,66 @@ def test_stop_requires_manual_lease_and_spools_public_transcript(
     )
     assert receipt["stage"] == "queued"
     assert len(captured_calls) == 1
-    _, forwarded = captured_calls[0]
-    assert forwarded["harness"] == "opencode"
-    assert forwarded["session_id"] == "ses_capture01"
-    spool_file = Path(forwarded["transcript_path"])
-    assert spool_file.is_file()
-    spool_text = spool_file.read_text(encoding="utf-8")
-    assert "ACL error 507015" in spool_text
-    assert "How do I decode ACL 507015?" not in spool_text
-    assert "internal chain of thought" not in spool_text
+    spooled = (transcript_spool_dir() / "ses_capture01.jsonl").read_text(encoding="utf-8")
+    assert "Verify post-auth ACL 507015" in spooled
+    assert "ACL error 507015 indicates a kernel execution failure." in spooled
+    assert "internal chain of thought" not in spooled
+    assert "How do I decode ACL 507015?" not in spooled
+
+
+def test_first_opted_in_stop_prepares_store_schema_without_prior_query(
+    isolated_oc_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First opted-in `Stop` turn before any `knowledge_query` must not drop with `store-not-ready`."""
+    import setup as oc_setup
+    import mindie_knowledge.loop.handoff as handoff_mod
+    import time as _time
+
+    ws = str(isolated_oc_env["workspace"])
+    py = str(isolated_oc_env["python"])
+    cfg = config_path()
+    oc_setup.ensure_default_profile(config=cfg, workspace_root=ws, python_exe=py, prepare_store=False)
+    eng_doc = json.loads(engine_config_path(cfg).read_text(encoding="utf-8"))
+    store_db = handoff_mod._store_path(eng_doc)
+    store_db.unlink(missing_ok=True)
+    assert not store_db.exists()
+
+    oc_setup.configure_community(
+        config=cfg,
+        enabled=True,
+        fork="test-user/knowledge-vllm-ascend",
+        account="test-user",
+        project_root=ws,
+    )
+    # Remove uninitialized domain directory cleanly to test `capture_stop.py`'s `_ensure_capture_store_ready` guard directly!
+    import shutil as _shutil
+
+    _shutil.rmtree(store_db.parent.parent, ignore_errors=True)
+    assert not store_db.exists()
+
+    monkeypatch.setattr(
+        handoff_mod,
+        "request_wake",
+        lambda *_a, **_kw: {"wake": "requested", "runtime": "starting", "reason": "waking"},
+    )
+    db_file = isolated_oc_env["opencode_db"]
+    _seed_opencode_v2_db(db_file, "ses_first_turn_01", ws)
+    now_ms = int(_time.time() * 1000) + 200
+    with sqlite3.connect(db_file) as db:
+        db.execute(
+            "INSERT INTO session_message VALUES (?, ?, 2, 'user', ?, ?, ?)",
+            ("msg_ft_u", "ses_first_turn_01", now_ms, now_ms, json.dumps({"time": {"created": now_ms}, "text": "First opted-in turn"})),
+        )
+        db.execute(
+            "INSERT INTO session_message VALUES (?, ?, 3, 'assistant', ?, ?, ?)",
+            ("msg_ft_a", "ses_first_turn_01", now_ms + 5, now_ms + 10, json.dumps({"time": {"created": now_ms + 5, "completed": now_ms + 10}, "text": "Resolved cleanly."})),
+        )
+
+    real_receipt = handle_stop(
+        {"sessionID": "ses_first_turn_01", "directory": ws, "eventID": "evt_first_turn", "opencodeDb": str(db_file)},
+        config=cfg,
+    )
+    assert real_receipt["stage"] in {"accepted-local", "accepted-runtime"}, real_receipt
+    assert real_receipt.get("reason") != "store-not-ready"
+    assert store_db.is_file()

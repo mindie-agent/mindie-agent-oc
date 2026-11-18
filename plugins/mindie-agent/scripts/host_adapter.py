@@ -11,8 +11,9 @@ Implements `OCHostAdapter` conforming to `mindie_harness.api.HostAdapter` (`host
 - Pure Python stdlib at module import time (`< 15ms`, zero device context, zero network).
 - `extract_session_identity` reads verified host metadata or `OPENCODE_SESSION_ID` only—never
   model-supplied tool `arguments` (`P2.7`).
-- Deterministic `remote` and `tools` surfaces never inject `_mindie_bind_id` or expose
-  `knowledge_*` tools (`P2.1` & `P2.7`).
+- `remote` and `tools` surfaces never inject `_mindie_bind_id` (`P2.7`), and `mindie-tools`
+  exposes all deterministic and `knowledge_*` tools on startup (`knowledge_query` and
+  `knowledge_explain` routed to `read_pool`).
 
 [Timeouts & Locks]
 - Seed verification streams `64 KiB` chunks in `< 5ms`; resident stdio serving uses separate
@@ -51,6 +52,7 @@ _FAST_REMOTE_SUFFIXES = (
 _FAST_TOOLS = frozenset({
     "mindie_status", "diagnostics_status", "npu_top", "npu_status", "server_status",
     "list_mounts", "find_npu_capacity", "npu_telemetry_window", "list_npu_servers",
+    "knowledge_query", "knowledge_explain",
 })
 
 

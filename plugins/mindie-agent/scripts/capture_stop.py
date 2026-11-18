@@ -2,26 +2,30 @@
 """Detached OpenCode (`oc`) turn-end (`session.execution.*` / `session.idle`) capture helper.
 
 [Role]
-Verifies manual session lease eligibility, projects any newly appended public
+Verifies community sharing consent and `project_roots` scope before opening SQLite,
+auto-provisions a default session lease (`not_before=0.0`) with the verified session
+workspace, prepares `state-v4.sqlite3` if uninitialized, projects newly appended public
 `session_message` rows from OpenCode's read-only `opencode.db` into
 `<state_dir>/transcripts/<session_id>.jsonl`, and hands off the turn receipt to
 `mindie_knowledge.loop.cli.capture_hook`.
 
 [Invariants]
-- Unactivated, subagent (`parentID`), or forked (`forkSessionID`) sessions
-  short-circuit immediately without touching transcripts or starting background
-  services.
+- Unconfigured/disabled community sharing, missing or out-of-scope workspaces, subagent
+  (`parentID`), or forked (`forkSessionID`) sessions short-circuit immediately without
+  creating `admission.sqlite3`, touching transcripts, or starting services.
+- Never guesses `project_root` from a stale lease or `os.getcwd()`.
 - Never emits to stdout when run as detached background helper; rotates
   `capture.log` atomically via `os.replace()` at `1 MiB`.
-- Explicitly re-raises `TimeoutError` before any `except OSError:` branch.
 
 [Timeouts & Locks]
 - Bounded by 2.0s read-only SQLite spool sync and `capture_hook`'s local SQLite
   WAL handoff.
 
 [Side-Effect Policy]
-- Appends to MindIE-owned `<state_dir>/transcripts/<session_id>.jsonl`, writes at
-  most one `captures` row via `capture_hook`, and logs receipt to `capture.log`.
+- When community sharing is enabled and in scope, ensures a session lease in
+  `admission.sqlite3`, prepares `state-v4.sqlite3` if absent, appends to
+  `<state_dir>/transcripts/<session_id>.jsonl`, writes at most one `captures`
+  row via `capture_hook`, and logs to `capture.log`.
 """
 
 from __future__ import annotations
@@ -29,15 +33,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import sys
 import time
+from urllib.parse import quote
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from admission import knowledge_lease
+from admission import ensure_default_lease, is_deactivated
 from identity import is_eligible_main_session, session_from_hook
 from oc_native_compat import ensure_oc_native_support
 from opencode_transcript import capture_source, sync_session_spool
@@ -46,6 +52,7 @@ from paths import (
     config_path,
     engine_config_path,
     opencode_db_path,
+    read_json,
     state_dir,
     transcript_spool_dir,
 )
@@ -77,21 +84,6 @@ def append_log(value: dict, *, config=None) -> None:
         )
 
 
-def _allows_community_capture(project_root: str, *, config=None) -> tuple[bool, str, float]:
-    from mindie_knowledge.loop import settings as settings_mod
-
-    comm_file = community_config_path(config)
-    if not comm_file.is_file():
-        return False, "community_unconfigured", 0.0
-    settings = settings_mod.load(comm_file)
-    if not settings.allows_capture():
-        return False, settings.capture_block_kind() or "disabled", 0.0
-    if not settings.in_scope(project_root):
-        return False, "out_of_scope", 0.0
-    enabled_at = float(settings.enabled_at) if isinstance(getattr(settings, "enabled_at", None), (int, float)) else 0.0
-    return True, "ok", enabled_at
-
-
 def _has_regular_file(path: Path) -> bool:
     try:
         st = os.lstat(path)
@@ -102,8 +94,64 @@ def _has_regular_file(path: Path) -> bool:
     return stat.S_ISREG(st.st_mode)
 
 
+def _peek_session_meta_readonly(db_file: Path, session: str) -> tuple[str | None, bool]:
+    """Read `(directory, is_subagent_or_forked)` from `opencode.db` without mutating it."""
+    uri = f"file:{quote(db_file.resolve().as_posix())}?mode=ro"
+    db = sqlite3.connect(uri, uri=True, timeout=2.0)
+    try:
+        row = db.execute(
+            "SELECT directory, parent_id, fork_session_id FROM session_v2 WHERE id = ?",
+            (session,),
+        ).fetchone()
+        if row is None:
+            return None, False
+        directory, parent_id, fork_id = row
+        if (isinstance(parent_id, str) and parent_id.strip()) or (isinstance(fork_id, str) and fork_id.strip()):
+            return None, True
+        if isinstance(directory, str) and os.path.isabs(directory.strip()):
+            return str(Path(directory.strip()).resolve()), False
+        return None, False
+    finally:
+        db.close()
+
+
+def _resolve_verified_project_root(event: dict, session: str, db_file: Path) -> tuple[str | None, bool]:
+    """Resolve verified workspace strictly from the current event or `opencode.db` (never stale leases or cwd)."""
+    for key in ("directory", "workspaceRoot", "cwd", "project_root"):
+        val = event.get(key)
+        if isinstance(val, str) and os.path.isabs(val.strip()):
+            return str(Path(val.strip()).resolve()), False
+    if _has_regular_file(db_file):
+        try:
+            db_dir, is_child = _peek_session_meta_readonly(db_file, session)
+            if is_child:
+                return None, True
+            if db_dir is not None:
+                return db_dir, False
+        except TimeoutError:
+            raise
+        except sqlite3.Error:
+            pass
+    return None, False
+
+
+def _ensure_capture_store_ready(eng_file: Path) -> None:
+    try:
+        eng_doc = read_json(eng_file)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return
+    if not (isinstance(eng_doc.get("root"), str) and isinstance(eng_doc.get("domain"), str)):
+        return
+    from mindie_knowledge.loop.handoff import _store_path, prepare_schema
+
+    if not _store_path(eng_doc).is_file():
+        prepare_schema(str(eng_file))
+
+
 def capture_event(event: dict, *, config=None) -> dict:
-    """Validate and hand off one turn-end OpenCode event to `capture_hook`."""
+    """Validate consent + verified scope first, ensure session lease & store, and hand off to `capture_hook`."""
     eligible, reason = is_eligible_main_session(event)
     if not eligible:
         return dict(stage="inert", reason=reason)
@@ -112,30 +160,56 @@ def capture_event(event: dict, *, config=None) -> dict:
     except ValueError:
         return dict(stage="inert", reason="invalid_session")
 
-    lease = knowledge_lease(session, config=config)
-    if lease is None:
-        return dict(stage="inert", reason="no_manual_lease")
-    if not config_path(config).is_file() or not engine_config_path(config).is_file():
-        return dict(stage="unavailable", reason="profile_unconfigured")
+    comm_file = community_config_path(config)
+    if not comm_file.is_file():
+        return dict(stage="inert", reason="community_unconfigured")
 
-    allowed, block_reason, enabled_at = _allows_community_capture(lease["project_root"], config=config)
-    if not allowed:
+    from mindie_knowledge.loop import settings as settings_mod
+
+    settings = settings_mod.load(comm_file)
+    if not settings.allows_capture():
+        block_reason = settings.capture_block_kind() or "disabled"
         if block_reason == "fault":
             return dict(stage="unavailable", reason="authority-unavailable")
         return dict(stage="inert", reason=block_reason)
 
+    db_candidate = event.get("opencodeDb") or event.get("opencode_db")
+    db_file = Path(db_candidate) if (isinstance(db_candidate, str) and os.path.isabs(db_candidate)) else opencode_db_path(config)
+    explicit_transcript = event.get("transcriptPath") or event.get("transcript_path")
+    has_explicit_transcript = (
+        isinstance(explicit_transcript, str)
+        and os.path.isabs(explicit_transcript)
+        and _has_regular_file(Path(explicit_transcript))
+    )
+
+    project_root, is_child = _resolve_verified_project_root(event, session, db_file)
+    if is_child:
+        return dict(stage="inert", reason="subagent_or_forked")
+    if project_root is None:
+        if not has_explicit_transcript and not _has_regular_file(db_file):
+            return dict(stage="unavailable", reason="transcript_unavailable")
+        return dict(stage="inert", reason="missing_project_root")
+
+    if not settings.in_scope(project_root):
+        return dict(stage="inert", reason="out_of_scope")
+
+    eng_file = engine_config_path(config)
+    if not config_path(config).is_file() or not eng_file.is_file():
+        return dict(stage="unavailable", reason="profile_unconfigured")
+    if is_deactivated(session, config=config):
+        return dict(stage="inert", reason="deactivated")
+
+    enabled_at = float(settings.enabled_at) if isinstance(getattr(settings, "enabled_at", None), (int, float)) else 0.0
+    lease = ensure_default_lease(session, project_root, not_before=0.0, config=config)
     activated_at = lease.get("activated_at")
     auth_boundary = max(
         enabled_at,
         float(activated_at) if isinstance(activated_at, (int, float)) else 0.0,
     )
 
-    explicit_transcript = event.get("transcriptPath") or event.get("transcript_path")
-    if isinstance(explicit_transcript, str) and os.path.isabs(explicit_transcript) and _has_regular_file(Path(explicit_transcript)):
-        transcript_file = Path(explicit_transcript)
+    if has_explicit_transcript:
+        transcript_file = Path(str(explicit_transcript))
     else:
-        db_candidate = event.get("opencodeDb") or event.get("opencode_db")
-        db_file = Path(db_candidate) if (isinstance(db_candidate, str) and os.path.isabs(db_candidate)) else opencode_db_path(config)
         if not _has_regular_file(db_file):
             return dict(stage="unavailable", reason="transcript_unavailable")
         try:
@@ -144,7 +218,7 @@ def capture_event(event: dict, *, config=None) -> dict:
                 db_path=db_file,
                 spool_dir=transcript_spool_dir(config),
                 not_before=auth_boundary if auth_boundary > 0 else None,
-                private_paths=(str(lease.get("project_root") or ""), str(Path.home())),
+                private_paths=(str(lease.get("project_root") or project_root), str(Path.home())),
                 config=config,
             )
         except TimeoutError:
@@ -157,6 +231,7 @@ def capture_event(event: dict, *, config=None) -> dict:
             return dict(stage="inert", reason="transcript_unavailable")
         transcript_file = synced
 
+    _ensure_capture_store_ready(eng_file)
     source = capture_source(transcript_file, session, binding=lease)
     event_id = event.get("eventID") or event.get("turn_id") or f"{session}:idle:{int(time.time() * 1000)}"
     forwarded = dict(
@@ -170,7 +245,7 @@ def capture_event(event: dict, *, config=None) -> dict:
     )
     from mindie_knowledge.loop.cli import capture_hook
 
-    receipt = capture_hook(str(engine_config_path(config)), forwarded)
+    receipt = capture_hook(str(eng_file), forwarded)
     return receipt if isinstance(receipt, dict) else dict(stage="accepted")
 
 

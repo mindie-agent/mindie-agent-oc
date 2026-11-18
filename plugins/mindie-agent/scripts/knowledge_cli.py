@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
-"""Private knowledge entry loaded only by the explicitly invoked `/mindie-agent` Skill.
+"""Default-enabled knowledge schemas and execution backend for OpenCode (`oc`).
 
 [Role]
-Exposes the private knowledge tool catalog (`describe`) and executes authorized
-knowledge operations (`knowledge_query`, `knowledge_explain`, `knowledge_feedback`,
-`knowledge_distill`, `knowledge_sync`) for a manually activated OpenCode session.
+Defines the 5 `knowledge_*` schemas (`knowledge_query`, `knowledge_explain`,
+`knowledge_feedback`, `knowledge_distill`, `knowledge_sync`) exposed on
+`mindie-tools` MCP and executes authorized knowledge operations via MCP or CLI.
 
 [Invariants]
-- Neither this catalog nor its tool descriptions ever appear in default MCP
-  discovery (`mcp_server.py`).
-- Native session identity comes strictly from `OPENCODE_SESSION_ID` in the
-  environment (or `--session` verified against `Admission.knowledge_lease`),
-  never from model-supplied tool arguments.
-- Both `describe` and every `knowledge_*` operation require an active manual
-  session lease (`entry_enabled == 1`), raising `KnowledgeInactive`
-  (`code="knowledge_inactive"`) when unactivated.
+- Native session identity comes from `execute.before` / `OPENCODE_SESSION_ID`
+  or falls back to connection/CLI scope (`"oc-cli-default"`), never from
+  model-supplied tool arguments.
+- `describe` is purely read-only; `knowledge_*` operations auto-provision a
+  default session lease (`not_before=0.0`) on demand unless explicitly
+  deactivated (`KnowledgeInactive`).
 - Receipt Honesty: if a knowledge RPC succeeds and local lease outcome accounting
-  fails, `isError` stays `False` and an `accounting` warning is attached.
+  fails, `isError` stays `False` and `receipt_warning` + `receipt_unconfirmed=True`
+  are attached.
 
 [Timeouts & Locks]
 - Standard knowledge RPCs use `30.0s`; `knowledge_distill` uses
   `summary_budget.distill_rpc_timeout()`. Input arguments are bounded to `1 MiB`.
 
 [Side-Effect Policy]
-- `describe` is purely read-only (`Admission.knowledge_lease` + static schema).
-  Tool calls connect to the configured `mindie_knowledge` service only after
-  verifying the manual lease.
+- `describe` is strictly read-only. `knowledge_*` calls provision a default lease
+  on demand and connect to the configured `mindie_knowledge` service.
 """
 
 from __future__ import annotations
@@ -89,19 +87,20 @@ if importlib.util.find_spec("mindie_knowledge") is None and not os.environ.get("
             raise SystemExit(1) from _exc
         raise SystemExit(_rc)
 
-from admission import gate, knowledge_lease
+from admission import _bounded_gate, ensure_default_lease, gate, is_deactivated
 from identity import reject_forged_identity_args, require_session
 from oc_native_compat import ensure_oc_native_support
-from paths import config_path, engine_config_path, read_json
+from paths import admission_path, config_path, engine_config_path, read_json
 
 ensure_oc_native_support()
 
 MAX_INPUT_BYTES = 1024 * 1024
 KNOWLEDGE_RPC_TIMEOUT = 30.0
+DEFAULT_CLI_SESSION_ID = "oc-cli-default"
 
 
 class KnowledgeInactive(ValueError):
-    """The current OpenCode session has not manually activated `/mindie-agent`."""
+    """Knowledge has been explicitly deactivated for the current OpenCode session."""
 
     code = "knowledge_inactive"
 
@@ -225,7 +224,9 @@ KNOWLEDGE_NAMES = {item["name"] for item in KNOWLEDGE_TOOL_SCHEMAS}
 
 def native_session() -> str:
     raw = os.environ.get("OPENCODE_SESSION_ID", "")
-    return require_session(raw)
+    if isinstance(raw, str) and raw.strip():
+        return require_session(raw)
+    return DEFAULT_CLI_SESSION_ID
 
 
 def _select_engine_path(config: str | Path | None, arguments: dict) -> Path:
@@ -258,25 +259,58 @@ def invoke(
     arguments: dict | None = None,
     *,
     session: str | None = None,
+    project_root: str | Path | None = None,
     config: str | Path | None = None,
 ) -> dict:
     reject_forged_identity_args(arguments)
     session_id = require_session(session) if session is not None else native_session()
-    lease = knowledge_lease(session_id, config=config)
-    if lease is None:
-        raise KnowledgeInactive(
-            "Knowledge requires manual /mindie-agent activation in this OpenCode session"
-        )
+    if is_deactivated(session_id, config=config):
+        raise KnowledgeInactive("Knowledge has been deactivated for this OpenCode session")
     if operation == "describe":
         return dict(tools=KNOWLEDGE_TOOL_SCHEMAS, isError=False)
     if operation not in KNOWLEDGE_NAMES:
         raise ValueError(f"unknown knowledge operation: {operation}")
 
+    eff_root = str(Path(project_root).resolve()) if project_root is not None else str(Path.cwd().resolve())
+    cfg_file = config_path(config)
+    if not cfg_file.is_file():
+        from setup import _current_python_has_runtime, ensure_default_profile
+
+        if _current_python_has_runtime():
+            ensure_default_profile(
+                config=cfg_file,
+                workspace_root=eff_root,
+                python_exe=sys.executable,
+                prepare_store=False,
+            )
+
+    lease = ensure_default_lease(session_id, project_root=eff_root, not_before=0.0, config=config)
     args = dict(arguments or {})
     if operation in {"knowledge_query", "knowledge_explain"} and args.get("mode") == "standard":
         args["mode"] = "reuse"
     target_engine = _select_engine_path(config, args)
+    finish_gate = gate(config)
     token = lease.get("token")
+    if target_engine.is_file():
+        try:
+            eng_doc = read_json(target_engine)
+            dom_adm = eng_doc.get("admission_path")
+            if (
+                isinstance(dom_adm, str)
+                and Path(dom_adm).is_absolute()
+                and Path(dom_adm).resolve() != admission_path(config).resolve()
+            ):
+                dom_gate = _bounded_gate(dom_adm)
+                dom_gate.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                dom_lease = dom_gate.activate(
+                    session_id, project_root=eff_root, root_session=session_id, not_before=0.0
+                )
+                finish_gate = dom_gate
+                token = dom_lease.get("token")
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
+            pass
 
     from mindie_knowledge.loop.cli import ensure_service
     from mindie_knowledge.loop.transport import RequestRejected, rpc
@@ -310,9 +344,10 @@ def invoke(
 
                 value, is_error = result_view(value)
             succeeded = not is_error
+            structured_val = value if isinstance(value, dict) else {"feeds": value}
             result = dict(
                 content=[dict(type="text", text=json.dumps(value, ensure_ascii=False))],
-                structuredContent=value,
+                structuredContent=structured_val,
                 isError=is_error,
             )
         except RequestRejected as exc:
@@ -340,15 +375,20 @@ def invoke(
             neutral = True
         if token is not None and not neutral:
             try:
-                gate(config).finish(session_id, token, succeeded)
+                finish_gate.finish(session_id, token, succeeded)
             except Exception as exc:
                 if pending is None:
+                    warn_msg = f"{type(exc).__name__}: {exc}"
                     result["accounting"] = dict(
                         status="failed",
                         error_type=type(exc).__name__,
                         execution="completed",
                         automatic_retry=False,
                     )
+                    structured = dict(result.get("structuredContent") or {})
+                    structured.setdefault("receipt_warning", warn_msg)
+                    structured["receipt_unconfirmed"] = True
+                    result["structuredContent"] = structured
                     result.setdefault("content", []).append(
                         dict(
                             type="text",

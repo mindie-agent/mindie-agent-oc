@@ -15,7 +15,7 @@ jobs:
     secrets:
       MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
-      release-notes-path: docs/releases/mindie-agent-oc-0.1.9.md
+      release-notes-path: docs/releases/mindie-agent-oc-0.1.10.md
       node: true
       version-files: |
         package.json
@@ -29,6 +29,7 @@ jobs:
         .venv/bin/python -m pytest -q -m "not live_npu and not live_opencode"
         node --check index.mjs
         node --check plugins/mindie-agent/paths.mjs
+        node --check plugins/mindie-agent/session_support.mjs
         node --check plugins/mindie-agent/opencode_host.mjs
       build-command: |
         stamp="$RUNNER_TEMP/diagnostic-build.json"

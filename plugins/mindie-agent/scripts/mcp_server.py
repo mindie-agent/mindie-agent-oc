@@ -3,16 +3,17 @@
 [Role]
 Serves public MCP discovery (`tools/list`) and execution (`tools/call`) for
 `mindie-remote-dev` (20 `remote_*` tools) and `mindie-tools` (`mindie_status`,
-`profiler`, `sim`, `coordinator`, `debugger`, `npu_top*`, `diagnostics_*`).
+`profiler`, `sim`, `coordinator`, `debugger`, `npu_top*`, `diagnostics_*`, and
+the 5 default-enabled `knowledge_*` tools).
 
 [Invariants]
-- `tools/list` NEVER exposes `knowledge_*` names, descriptions, or schemas.
-- Deterministic tools work in ordinary sessions without requiring a knowledge lease.
-- Session identity comes only from one-shot `claim_bind` or `OPENCODE_SESSION_ID`;
-  model-supplied session keys in `params.arguments` are rejected.
-- Receipt Honesty: once a primary remote/component call succeeds, local receipt or
-  `finish_bind` `OSError`/`sqlite3.Error` keeps `isError=False` and attaches
-  `receipt_warning` + `receipt_unconfirmed=True`.
+- All `remote_*`, component, diagnostic, and `knowledge_*` tools work on startup
+  without requiring a prior manual activation gesture or pre-call `_mindie_bind_id`.
+- Session identity resolves from optional one-shot `claim_bind`, `OPENCODE_SESSION_ID`,
+  or `_CONNECTION_SESSION_ID`; model-supplied session keys in `params.arguments` are rejected.
+- Receipt Honesty: once a primary remote/component/knowledge call succeeds, local
+  receipt, lease, or `finish_bind` `OSError`/`sqlite3.Error` keeps `isError=False`
+  and attaches `receipt_warning` + `receipt_unconfirmed=True`.
 
 [Timeouts & Locks]
 - SQLite WAL + `busy_timeout=5000` (`timeout=5.0`) on `remote-receipts.sqlite3`.
@@ -45,6 +46,7 @@ from admission import status_facts
 from bounded import run as bounded_run
 from component_update import trigger_background_update_if_due
 from identity import claim_bind, finish_bind, reject_forged_identity_args, require_session
+from knowledge_cli import KNOWLEDGE_NAMES, KNOWLEDGE_TOOL_SCHEMAS, invoke as invoke_knowledge
 from oc_native_compat import ensure_oc_native_support
 from paths import bind_db_path, config_path, diagnostics_config_path, plugin_root, read_json, remote_receipts_path, state_dir
 
@@ -228,7 +230,7 @@ class RemoteReceipts:
 
 
 def tools_catalog() -> list[dict]:
-    """Return the deterministic `mindie-tools` MCP catalog (zero knowledge tools, zero bind injection)."""
+    """Return the `mindie-tools` MCP catalog (deterministic tools + 5 default-on `knowledge_*` tools)."""
     limits = {
         "cwd": dict(type="string", description="Optional absolute working directory."),
         "timeout_ms": dict(type="integer", minimum=1, maximum=600000, default=120000, description="Execution deadline in milliseconds; bounded within OpenCode's 660s MCP ceiling."),
@@ -273,6 +275,18 @@ def tools_catalog() -> list[dict]:
             annotations=dict(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
         )
     )
+    for schema in KNOWLEDGE_TOOL_SCHEMAS:
+        kname = schema["name"]
+        items.append(
+            dict(
+                **schema,
+                annotations=dict(
+                    readOnlyHint=kname in {"knowledge_query", "knowledge_explain"},
+                    destructiveHint=False,
+                    openWorldHint=kname == "knowledge_sync",
+                ),
+            )
+        )
     return items
 
 
@@ -413,6 +427,35 @@ def call_tools_surface(
         elif name in NPU_TOP_OBSERVATION_NAMES:
             result = _execute_npu_top_observation(name, args)
             succeeded = result.get("isError") is not True
+        elif name in KNOWLEDGE_NAMES:
+            receipt_store = receipts or RemoteReceipts(remote_receipts_path(config))
+            k_call_id = str(uuid.uuid4())
+            receipt_store.begin(k_call_id, session, name, args)
+            proj_root = (
+                bound_cwd
+                if (isinstance(bound_cwd, str) and os.path.isabs(bound_cwd) and Path(bound_cwd).is_dir())
+                else None
+            )
+            try:
+                result = invoke_knowledge(name, args, session=session, project_root=proj_root, config=config)
+                succeeded = result.get("isError") is not True
+            except BaseException:
+                try:
+                    receipt_store.finish(k_call_id, "failed")
+                except TimeoutError:
+                    raise
+                except (OSError, sqlite3.Error):
+                    pass
+                raise
+            try:
+                receipt_store.finish(k_call_id, "succeeded" if succeeded else "failed")
+            except TimeoutError as r_exc:
+                if not succeeded:
+                    raise
+                result = _attach_accounting_warning(result, "receipt_warning", r_exc)
+            except (OSError, sqlite3.Error) as r_exc:
+                if succeeded:
+                    result = _attach_accounting_warning(result, "receipt_warning", r_exc)
         elif name in COMPONENT_DESCRIPTIONS or name in {"diagnostics_status", "diagnostics_bundle"}:
             if name in COMPONENT_DESCRIPTIONS:
                 component = name
@@ -509,6 +552,9 @@ def call_tools_surface(
         import diagnostic_support
 
         err_struct = dict(error=str(exc), error_type=type(exc).__name__)
+        if getattr(exc, "code", None):
+            err_struct["code"] = exc.code
+            err_struct["automatic_retry"] = False
         if diagnostic_support.is_internal_mcp_exception(exc):
             err_struct["diagnostic"] = diagnostic_support.failure(
                 "mcp.tools", str(name or "dispatch"), "internal", exception=exc, config=config
