@@ -1,6 +1,6 @@
 # MindIE Agent — OpenCode Native Host Plugin (`mindie-agent-oc`)
 
-`mindie-agent-oc` (`@mindie-agent/oc`) is a **`host-plugin`** repository implementing the OpenCode v2 native host plugin, backed by `mindie-harness` (`v0.1.3`) and the shared MindIE runtime components. `v0.1.11` is the **thin host** release: the entire production surface is six files (`index.mjs`, `plugins/mindie-agent/opencode_host.mjs`, and `scripts/{mindie_launch,mcp_server,opencode_transcript,setup}.py`) totaling `< 1,200` lines.
+`mindie-agent-oc` (`@mindie-agent/oc`) is a **`host-plugin`** repository implementing the OpenCode v2 native host plugin, backed by `mindie-harness` (`v0.1.4`) and the shared MindIE runtime components. `v0.1.11` is the **thin host** release: the entire production surface is six files (`index.mjs`, `plugins/mindie-agent/opencode_host.mjs`, `plugins/mindie-agent/scripts/mindie_launch.py`, `plugins/mindie-agent/scripts/mcp_server.py`, `plugins/mindie-agent/scripts/opencode_transcript.py`, and `plugins/mindie-agent/scripts/setup.py`) totaling `< 1,200` lines.
 
 ## 1. Core Architectural & Contract Rules
 

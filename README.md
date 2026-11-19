@@ -28,7 +28,7 @@
 
 1. **启动默认开放全部工具且零手工激活**：
    - `mindie-remote-dev`（14 项 `oc` 原生 `remote_*` 工具，`timeout.execution = 660000ms`）
-   - `mindie-tools`（确定性组件工具、`mindie_status`、`mindie_doctor`、`diagnostics_status`/`diagnostics_bundle`，以及默认启用的 5 项 `knowledge_*` 工具）
+   - `mindie-tools`（确定性组件与 RSI 工具、`mindie_status`、`mindie_doctor`、`diagnostics_status`/`diagnostics_bundle`，以及默认启用的 5 项 `knowledge_*` 工具）
 2. **零子进程/提示词与授权优先采集**：顶层主会话（非 Subagent、非 Fork）由纯 Node.js 从内存缓存注入剥离 YAML Frontmatter 的 `SKILL.md`；`session.idle` / `session.execution.*` 在纯 Node.js 中校验 `mindie-community.json`、`mindie-consent.json`（`contribute` 或 `local-only`）与规范化 `project_roots`，未开启或越界时零子进程、零 SQLite 文件；命中时按 `250ms` 去重并派生 `mindie_launch.py hook stop`。
 3. **无感升级与共享运行时**：后台按需执行 `mindie_launch.py update --background`，冷启动经 `mindie-harness-seed.pyz` 校验后提供运行时，所有组件更新与代际租约交由 `mindie-harness`。
 
@@ -37,7 +37,7 @@
 | 通道 | 表面 | 工具列表 |
 | :--- | :--- | :--- |
 | **默认公开 MCP** | `mindie-remote-dev` | `remote_auth`, `remote_probe`, `remote_read`, `remote_write`, `remote_edit`, `remote_bash`, `remote_glob`, `remote_grep`, `remote_list`, `remote_artifact_pull`, `remote_artifact_push`, `remote_job_status`, `remote_job_output`, `remote_job_stop`（14 项 `oc` 档案工具） |
-| **默认公开 MCP** | `mindie-tools` | `mindie_status`, `mindie_doctor`, `profiler`, `sim`, `coordinator`, `debugger`, `npu_top`, `diagnostics_status`, `diagnostics_bundle`, `knowledge_query`, `knowledge_explain`, `knowledge_feedback`, `knowledge_distill`, `knowledge_sync` |
+| **默认公开 MCP** | `mindie-tools` | `mindie_status`, `mindie_doctor`, `profiler`, `sim`, `coordinator`, `debugger`, `npu_top`, `rsi_loop`, `experiment_ledger`, `diagnostics_status`, `diagnostics_bundle`, `knowledge_query`, `knowledge_explain`, `knowledge_feedback`, `knowledge_distill`, `knowledge_sync` |
 
 ## 3. 安装、升级与初始化
 
@@ -47,13 +47,13 @@
 uv run https://github.com/mindie-agent/mindie-agent/releases/latest/download/install.py --host oc
 ```
 
-`gh` 完全可选：未安装或未登录时安装器自动推荐 `local-only`，不会阻塞安装。安装器随后用 OpenCode 原生 **`question`** 工具询问三个问题：
+`gh` 完全可选：未安装或未登录时，`install.py --host oc` 自动在终端输出的 JSON 回执中给出 `recommended_tier: "local-only"` 与结构化 `next_questions`（`workspace_roots`、`privacy_tier`、`optional_ssh_npu_host`），绝不阻塞共享运行时预置。随后在 OpenCode 会话中，Agent 按安装指引调用原生 **`question`** 工具依次确认：
 
 1. **工作区**：在当前目录初始化 Ascend 工作区，或继续使用当前目录，或指定已有目录。
-2. **社区共享**：检测到 `gh` 已登录时推荐 `contribute`，否则推荐 `local-only`；两档都启用本地采集，仅 `contribute` 上报脱敏结果。
-3. **Star（单行后记）**：如果这个插件帮到了你，欢迎给 mindie-agent 点一个 Star ⭐。
+2. **社区共享**：根据回执中的 `recommended_tier` 推荐 `contribute`（`gh` 已登录时）或 `local-only`（两档均启用本地脱敏沉淀，仅 `contribute` 外发脱敏结果）。
+3. **可选 SSH NPU 连接与单行 Star 后记**：按需一步式配置 SSH NPU 连接（终端模式下可在命令末尾追加 `--password` 隐藏输入），并在收尾时附带单行后记（如果这个插件帮到了你，欢迎给 `mindie-agent` 点一个 Star ⭐）。
 
-终端模式下按提示一次完成 SSH NPU 连接；需要隐藏输入时在命令末尾追加 `--password` 后回车。安装完成后运行只读就绪检查：
+安装完成后可调用只读就绪检查工具：
 
 ```text
 mindie_doctor
