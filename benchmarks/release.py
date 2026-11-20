@@ -129,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="mindie-oc-bench-") as tmp:
         assert sentinel not in raw_spool
         assert sentinel not in result["text"]
 
-Path(os.environ["MINDIE_BENCH_RESULT_PATH"]).write_text(
+payload = (
     json.dumps(
         {
             "status": "pass",
@@ -143,7 +143,9 @@ Path(os.environ["MINDIE_BENCH_RESULT_PATH"]).write_text(
             ],
         }
     )
-    + "\n",
-    encoding="utf-8",
-    newline="\n",
+    + "\n"
 )
+if result_path := os.environ.get("MINDIE_BENCH_RESULT_PATH"):
+    Path(result_path).write_text(payload, encoding="utf-8", newline="\n")
+else:
+    sys.stdout.write(payload)

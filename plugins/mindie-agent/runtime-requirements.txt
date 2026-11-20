@@ -1,9 +1,9 @@
 # Component runtime pins for `mindie-harness-seed.pyz` installs (must match pyproject.toml).
-mindie-harness @ git+https://github.com/mindie-agent/harness@14313b8ba58c888b20c9c216ec41d14f5e62f4f7
-mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@9f48272a3ba87248bfda0e4068692511aac4dfa4
-remote-dev @ git+https://github.com/mindie-agent/remote-dev@b33ca60baac81c237dd1bd6e7a8068945820727b
+mindie-harness @ git+https://github.com/mindie-agent/harness@440b8bd3dfa47f3c2e2131259c391c8cee14f13d
+mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@9befde292ea0e6c79e9e5f475c266cbcf845d59a
+remote-dev @ git+https://github.com/mindie-agent/remote-dev@784fc2ca1db172f683889a6d47543c37141b3278
 mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@7464cbb4381e9dc996871d192eb3f05f61dfdb28
-mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@a3c7336faa0bc14ebdb8f2fd75606c82e96422e9
+mindie-coordinator @ git+https://github.com/mindie-agent/coordinator@79df7c373bf35fda2a94907d1f3beb51c6462357
 mindie-debugger @ git+https://github.com/mindie-agent/debugger@e15c2ed38d8f928db67c5bb1a94269f62207227c
 mindie-profiler @ git+https://github.com/mindie-agent/profiler@b702893129724b852c5abcb8971724b8b0a6e870
 mindie-sim @ git+https://github.com/mindie-agent/sim@83fb8288aa998e0a6ad345ca7a16269f0181545b

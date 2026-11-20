@@ -84,9 +84,14 @@ jobs:
           assert lock["schema"] == "mindie-harness-seed/1"
           PY
 
+  host-acceptance:
+    uses: mindie-agent/mindie-bench/.github/workflows/verify-host-plugin.yml@main
+    with:
+      host: oc
+
   release-ready:
     name: release-ready
-    needs: [contract, smoke]
+    needs: [contract, smoke, host-acceptance]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

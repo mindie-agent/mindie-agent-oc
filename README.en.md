@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.11-0F766E.svg" alt="Release v0.1.11"></a>
+  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.12-0F766E.svg" alt="Release v0.1.12"></a>
   &nbsp;
   <a href="./README.md">简体中文</a>
 </p>
@@ -24,7 +24,7 @@
 
 ## 1. Architecture & Exposure Boundary
 
-`mindie-agent-oc` (npm package `@mindie-agent/oc`, current release [`v0.1.11`](https://github.com/mindie-agent/mindie-agent-oc/releases/tag/v0.1.11)) targets OpenCode's v2 Promise Plugin API (`@opencode-ai/plugin`) directly. `v0.1.11` is the **Great Subtraction** thin-host release: the production surface is six files (`index.mjs`, `opencode_host.mjs`, `mindie_launch.py`, `mcp_server.py`, `opencode_transcript.py`, `setup.py`) totaling `< 1,200` lines, with all heavy lifting delegated to `mindie-harness`.
+`mindie-agent-oc` (npm package `@mindie-agent/oc`, current release [`v0.1.12`](https://github.com/mindie-agent/mindie-agent-oc/releases/tag/v0.1.12)) targets OpenCode's v2 Promise Plugin API (`@opencode-ai/plugin`) directly. `v0.1.12` is the **Great Subtraction** thin-host release: the production surface is six files (`index.mjs`, `opencode_host.mjs`, `mindie_launch.py`, `mcp_server.py`, `opencode_transcript.py`, `setup.py`) totaling `< 1,200` lines, with all heavy lifting delegated to `mindie-harness`.
 
 1. **Default-On Tools With Zero Manual Activation**:
    - `mindie-remote-dev`: the 14-tool `oc` native `remote_*` profile (`timeout.execution = 660000ms`).

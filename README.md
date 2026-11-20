@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.11-0F766E.svg" alt="Release v0.1.11"></a>
+  <a href="https://github.com/mindie-agent/mindie-agent-oc/releases"><img src="https://img.shields.io/badge/release-v0.1.12-0F766E.svg" alt="Release v0.1.12"></a>
   &nbsp;
   <a href="./README.en.md">English</a>
 </p>
@@ -24,7 +24,7 @@
 
 ## 1. 架构特性与暴露边界
 
-`mindie-agent-oc`（npm 包标识 `@mindie-agent/oc`，当前正式版本为 `v0.1.11`）基于 OpenCode v2 Promise Plugin API（`@opencode-ai/plugin`）原生构建，`v0.1.11` 是 **Great Subtraction** 瘦宿主版本：生产面仅 6 个文件（`index.mjs`、`opencode_host.mjs`、`mindie_launch.py`、`mcp_server.py`、`opencode_transcript.py`、`setup.py`），合计 `< 1,200` 行，全部重逻辑下沉到 `mindie-harness` 共享组件。
+`mindie-agent-oc`（npm 包标识 `@mindie-agent/oc`，当前正式版本为 `v0.1.12`）基于 OpenCode v2 Promise Plugin API（`@opencode-ai/plugin`）原生构建，`v0.1.12` 是 **Great Subtraction** 瘦宿主版本：生产面仅 6 个文件（`index.mjs`、`opencode_host.mjs`、`mindie_launch.py`、`mcp_server.py`、`opencode_transcript.py`、`setup.py`），合计 `< 1,200` 行，全部重逻辑下沉到 `mindie-harness` 共享组件。
 
 1. **启动默认开放全部工具且零手工激活**：
    - `mindie-remote-dev`（14 项 `oc` 原生 `remote_*` 工具，`timeout.execution = 660000ms`）
