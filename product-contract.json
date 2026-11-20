@@ -11,7 +11,7 @@
     "verified_commit": "9a614ccda3a82ab863be72edec92ada219af5112"
   },
   "components": {
-    "mindie-harness": "0.1.7",
+    "mindie-harness": "0.1.8",
     "mindie-knowledge": "0.13.25",
     "remote-dev": "0.11.15",
     "mindie-diagnostics": "0.5.17",
