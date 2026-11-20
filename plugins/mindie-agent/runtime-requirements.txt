@@ -1,5 +1,5 @@
 # Component runtime pins for `mindie-harness-seed.pyz` installs (must match pyproject.toml).
-mindie-harness @ git+https://github.com/mindie-agent/harness@f403ea9166752383175af64644c3f5d401db85cf
+mindie-harness @ git+https://github.com/mindie-agent/harness@4ff15e23075247e45d726c7e0006b465c3fa78ab
 mindie-knowledge @ git+https://github.com/mindie-agent/knowledge@9befde292ea0e6c79e9e5f475c266cbcf845d59a
 remote-dev @ git+https://github.com/mindie-agent/remote-dev@784fc2ca1db172f683889a6d47543c37141b3278
 mindie-diagnostics @ git+https://github.com/mindie-agent/diagnostics@7464cbb4381e9dc996871d192eb3f05f61dfdb28
