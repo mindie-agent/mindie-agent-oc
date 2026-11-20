@@ -61,11 +61,11 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
     pyproject_doc = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     version = pyproject_doc["version"]
     assert pyproject_doc["requires-python"] == ">=3.11,<3.15"
-    assert "mindie-harness>=0.1.4" in pyproject_doc["dependencies"]
+    assert "mindie-harness>=0.1.6" in pyproject_doc["dependencies"]
     assert pkg["name"] == "@mindie-agent/oc" and pkg["main"] == "./index.mjs"
     assert pkg["version"] == contract["native_version"] == plugin_json["version"] == version == "0.1.12"
     assert contract["harness"] == compat["harness"] == "opencode"
-    assert contract["components"]["mindie-harness"] == "0.1.5"
+    assert contract["components"]["mindie-harness"] == "0.1.6"
     assert len(contract["components"]) == 9
 
     from mindie_knowledge.releases import validate_compatibility
@@ -111,7 +111,7 @@ def test_plugin_manifests_and_opencode_v2_loading(isolated_oc_env: dict[str, Pat
     assert mcp["mindie-remote-dev"]["env"]["REMOTE_DEV_HARNESS_PROFILE"] == "oc"
 
     lock = mindie_launch.verify_seed_bundle(PLUGIN_ROOT)
-    assert lock["schema"] == "mindie-harness-seed/1" and lock["version"] == "0.1.4"
+    assert lock["schema"] == "mindie-harness-seed/1" and lock["version"] == "0.1.6"
 
     skill = (PLUGIN_ROOT / "skills" / "mindie-agent" / "SKILL.md").read_text(encoding="utf-8")
     frontmatter = skill.split("---", 2)[1]
